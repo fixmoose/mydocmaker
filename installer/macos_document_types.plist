@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Document types this app can open via Finder's "Open With" submenu.
+  PyInstaller doesn't expose a clean way to inject CFBundleDocumentTypes, so
+  build.yml uses `plutil -replace` to splice this array into Info.plist
+  after the .app is built. The handler that actually receives the files is
+  registered in mydocmaker.py via root.createcommand('::tk::mac::OpenDocument').
+-->
+<plist version="1.0">
+<array>
+  <dict>
+    <key>CFBundleTypeName</key><string>Image</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>CFBundleTypeExtensions</key>
+    <array>
+      <string>png</string><string>jpg</string><string>jpeg</string>
+      <string>gif</string><string>bmp</string><string>tif</string>
+      <string>tiff</string><string>webp</string><string>heic</string>
+      <string>heif</string><string>avif</string><string>ico</string>
+    </array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key><string>PDF</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>CFBundleTypeExtensions</key>
+    <array><string>pdf</string></array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key><string>Text</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>CFBundleTypeExtensions</key>
+    <array>
+      <string>txt</string><string>md</string><string>csv</string>
+      <string>log</string><string>html</string><string>htm</string>
+      <string>css</string><string>json</string><string>xml</string>
+      <string>yaml</string><string>yml</string><string>py</string>
+      <string>js</string><string>ts</string><string>sh</string>
+    </array>
+  </dict>
+  <dict>
+    <key>CFBundleTypeName</key><string>Office document</string>
+    <key>CFBundleTypeRole</key><string>Viewer</string>
+    <key>LSHandlerRank</key><string>Alternate</string>
+    <key>CFBundleTypeExtensions</key>
+    <array>
+      <string>doc</string><string>docx</string><string>odt</string>
+      <string>rtf</string><string>xls</string><string>xlsx</string>
+      <string>ods</string><string>ppt</string><string>pptx</string>
+      <string>odp</string>
+    </array>
+  </dict>
+</array>
+</plist>

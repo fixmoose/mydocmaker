@@ -1,0 +1,8 @@
+# CODEOWNERS — auto-assigns reviewers when PRs are opened.
+# Format: <path-pattern>  <owner>
+# Wildcard "*" means every file in every PR pings the listed user.
+# Combined with branch protection (Settings → Rules → Rulesets → main),
+# this guarantees the maintainer is notified of every incoming change
+# before it can land.
+
+*  @fixmoose

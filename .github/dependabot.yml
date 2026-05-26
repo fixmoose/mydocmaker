@@ -1,0 +1,45 @@
+# Dependabot config — weekly PRs that bump our Python deps and the
+# action versions used by .github/workflows/. Each PR re-runs the full
+# matrix build so we know the bump didn't break anything before merging.
+#
+# Why this exists: bundled Python libs (Pillow, pypdf, playwright, etc)
+# get baked into the PyInstaller installers, so users only see new
+# versions when we cut a release. Dependabot keeps the inputs fresh.
+
+version: 2
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+      - "python"
+    # Group patch + minor bumps into one PR per ecosystem so we don't get
+    # a wall of separate PRs. Majors still come through individually.
+    groups:
+      python-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"
+    groups:
+      actions-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

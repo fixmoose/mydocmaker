@@ -1,0 +1,18 @@
+pypdf>=4.0
+pypdfium2>=4.20
+reportlab>=4.0
+Pillow>=10.0
+pillow-heif>=0.13
+tkinterdnd2>=0.4
+playwright>=1.40
+qrcode>=7.4
+# Windows-only: enables the Microsoft Office (Word/Excel/PowerPoint) COM
+# backend for Office→PDF conversion in v1.22+. Skipped on Linux/macOS by
+# the platform marker; PyInstaller's Windows build job picks it up.
+pywin32>=306; sys_platform == 'win32'
+# v1.28+ e-signature: pyhanko produces PAdES-compliant signed PDFs that
+# Adobe Acrobat shows as real signatures. cryptography is a pyhanko
+# dependency that we pin explicitly so we can also use it for the one-
+# time self-signed cert generation at first launch.
+pyhanko>=0.25
+cryptography>=42.0
