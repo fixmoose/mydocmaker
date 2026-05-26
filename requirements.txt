@@ -15,4 +15,4 @@ pywin32>=306; sys_platform == 'win32'
 # dependency that we pin explicitly so we can also use it for the one-
 # time self-signed cert generation at first launch.
 pyhanko>=0.25
-cryptography>=42.0
+cryptography>=48.0.0
