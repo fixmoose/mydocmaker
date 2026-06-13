@@ -5556,6 +5556,9 @@ class App:
         self._restored_dropped = 0         # files that vanished between sessions
 
         root.title(f"{APP_NAME}  v{APP_VERSION}")
+        # Initial size; the width is re-fit to the actual content at the end of
+        # __init__ (see _fit_start_width) so the long Flatten label never gets
+        # clipped behind the bottom-right logo on wider-font systems.
         root.geometry("700x720")
         root.minsize(560, 560)
 
@@ -5912,6 +5915,19 @@ class App:
         # Save state on window close, and also intercept window close to
         # ensure the final state is flushed before the process exits.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        # Fit the start width to the actual content so nothing gets clipped
+        # behind the bottom-right logo (the long Flatten label is the widest
+        # line, and its width varies with the system font/DPI). Floored at the
+        # original 700, capped to the screen so it always fits on-screen.
+        try:
+            root.update_idletasks()
+            req_w = root.winfo_reqwidth()
+            screen_w = root.winfo_screenwidth()
+            start_w = max(700, min(req_w + 16, screen_w - 80))
+            root.geometry(f"{start_w}x720")
+        except Exception:
+            pass
 
         # Background, throttled update check (~monthly). Delayed a few seconds
         # so it never competes with startup; silent unless a newer release
