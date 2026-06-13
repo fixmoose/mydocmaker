@@ -102,12 +102,18 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.59"
+APP_VERSION = "1.60"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.60": [
+        "The per-page ⟳ flip now responds the instant you click — the button "
+        "lights up and the page spins and resizes in a smooth little animation, "
+        "right where it sits, then snaps to the crisp final image. No more "
+        "lag or needing to click twice.",
+    ],
     "1.59": [
         "The Order tab now always reflects the current orientation/size — change "
         "anything in Pages or Preview and the Order thumbnails update to match "
@@ -6473,9 +6479,11 @@ class OrderTab:
 
         # State
         self._thumb_refs = {}     # key -> PhotoImage (kept from GC)
+        self._thumb_pils = {}     # key -> PIL.Image of the thumbnail (for flip anim)
         self._cards = {}          # key -> card Frame widget
         self._img_labels = {}     # key -> the thumbnail Label (for in-place updates)
         self._flip_btns = {}      # key -> the ⟳ flip Button (for colour updates)
+        self._flip_after = {}     # key -> pending flip-animation after() id
         self._card_ids = {}       # key -> canvas window id
         self._order = []          # current visual order of keys
         self._labels = {}         # key -> source item label
@@ -6613,6 +6621,7 @@ class OrderTab:
                 scale = max(0.1, min(2.0, inner_w / max(1.0, pw)))
                 pil = page.render(scale=scale).to_pil().convert("RGB")
                 pil.thumbnail((inner_w, inner_h))
+                self._thumb_pils[key] = pil
                 self._thumb_refs[key] = _ImageTk.PhotoImage(pil)
                 self._make_card(key, i + 1)
         finally:
@@ -6694,30 +6703,66 @@ class OrderTab:
             pil = page.render(scale=scale).to_pil().convert("RGB")
             pil.thumbnail((inner_w, inner_h))
             doc.close()
+            self._thumb_pils[key] = pil
             return _ImageTk.PhotoImage(pil)
         except Exception:
             return None
 
     def _flip_page(self, key):
-        """Per-page orientation override: rotate this one page +90° (cycles
-        through 4 turns). Ephemeral — cleared if the global size/orientation
-        changes. Updates ONLY this card's thumbnail in place (no full rebuild,
-        so nothing else blinks); the Preview updates when next shown."""
+        """Per-page orientation override: rotate this page +90° (clockwise),
+        cycling through 4 turns. Responds INSTANTLY: the ⟳ recolours and a
+        smooth rotate-and-resize animation of this one thumbnail starts on the
+        same frame, then settles on the accurate re-render. Nothing else
+        redraws. Ephemeral — cleared if the global size/orientation changes."""
         self.app.page_rotate[key] = (self.app.page_rotate.get(key, 0) + 1) % 4
         if self.app.page_rotate[key] == 0:
             self.app.page_rotate.pop(key, None)
-        # Re-render just this page and swap its thumbnail + button colour.
-        thumb = self._single_page_thumb(key)
-        if thumb is not None:
-            self._thumb_refs[key] = thumb
-            lbl = self._img_labels.get(key)
-            if lbl is not None:
-                lbl.config(image=thumb)
+        # Instant acknowledgement: recolour the button this frame.
         btn = self._flip_btns.get(key)
         if btn is not None:
             btn.config(fg=("#2b6cb0" if self.app.page_rotate.get(key) else "#444"))
-        # Preview reflects it on next show (don't force a rebuild now — that's
-        # what caused the whole document to blink).
+        # Cancel any in-flight animation for this card and start fresh.
+        pending = self._flip_after.pop(key, None)
+        if pending is not None:
+            try:
+                self.frame.after_cancel(pending)
+            except (tk.TclError, ValueError):
+                pass
+        base = self._thumb_pils.get(key)
+        lbl = self._img_labels.get(key)
+        if base is None or lbl is None:
+            # Fallback: no PIL to spin — just swap to the accurate render.
+            self._settle_flip(key)
+            return
+        self._animate_flip(key, base, lbl, 1, frames=6)
+
+    def _animate_flip(self, key, base, lbl, step, frames):
+        """One frame of the flip spin: rotate `base` toward -90° (clockwise),
+        fit it in the card, show it. Last frame hands off to _settle_flip."""
+        angle = -90.0 * step / frames
+        try:
+            img = base.rotate(angle, expand=True, fillcolor=(255, 255, 255))
+            img.thumbnail((self.CARD_W - 12, self.CARD_H - 34))
+            photo = _ImageTk.PhotoImage(img)
+            self._thumb_refs[key] = photo      # keep alive
+            lbl.config(image=photo)
+        except tk.TclError:
+            return
+        if step < frames:
+            self._flip_after[key] = self.frame.after(
+                16, lambda: self._animate_flip(key, base, lbl, step + 1, frames))
+        else:
+            self._flip_after.pop(key, None)
+            self._settle_flip(key)
+
+    def _settle_flip(self, key):
+        """Replace the spinning thumbnail with the accurate re-rendered one and
+        nudge the Preview (lazily — no forced rebuild)."""
+        thumb = self._single_page_thumb(key)
+        lbl = self._img_labels.get(key)
+        if thumb is not None and lbl is not None:
+            self._thumb_refs[key] = thumb
+            lbl.config(image=thumb)
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
             if self.app._tab_is("Preview"):
@@ -6958,6 +7003,12 @@ class OrderTab:
             except (tk.TclError, ValueError):
                 pass
             self._anim_id = None
+        for aid in self._flip_after.values():
+            try:
+                self.frame.after_cancel(aid)
+            except (tk.TclError, ValueError):
+                pass
+        self._flip_after = {}
         self._targets = {}
         self.canvas.delete("all")
         for card in self._cards.values():
@@ -6970,6 +7021,7 @@ class OrderTab:
         self._img_labels = {}
         self._flip_btns = {}
         self._thumb_refs = {}
+        self._thumb_pils = {}
         self._placeholder = None
 
 

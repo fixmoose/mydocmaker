@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.60
+- **Instant, animated per-page flip.** Clicking ⟳ now responds on the same
+  frame: the button recolours immediately and a short rotate-and-resize spin of
+  that one thumbnail plays (`_animate_flip`, ~6 frames of PIL rotation of the
+  cached thumbnail image), then settles on the accurate re-render
+  (`_settle_flip`). The previous version re-rendered synchronously on click,
+  which felt laggy and sometimes needed a second click to register. Thumbnails
+  now cache their PIL image (`_thumb_pils`) so the spin needs no PDF work;
+  rapid clicks cancel the in-flight animation and restart.
+
 ## v1.59
 - **Order tab always matches the current layout.** `on_show` now rebuilds the
   grid every time the tab is shown (instead of only when marked dirty), so an
