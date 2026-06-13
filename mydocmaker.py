@@ -97,30 +97,571 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.0"
+APP_VERSION = "1.46"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
-    "1.0": [
-        "First public release of MyDocMaker. Drop in files, paste a "
-        "website link, reorder everything, click Create PDF.",
-        "Supported inputs: PDFs, images (PNG/JPG/BMP/GIF/TIFF/WebP/ICO/PPM/TGA), iPhone photos, webpages (URL paste, full-page "
-        "capture), text/code files, Office documents (Word, Excel, "
-        "PowerPoint, ODF — with LibreOffice or MS Office installed).",
-        "DocuSign-style e-signatures — three modes: Digital (business-detail stamp auto-rendered from your name), Typed, Drawn.",
-        "Signatures are baked into the page content + a visible "
-        "cryptographic widget on top + first-signature FILL_FORMS "
-        "certification, so basic PDF editors can't quietly delete "
-        "the visual and any tampering invalidates the signature seal.",
-        "Optional Archive folder: auto-save a flattened copy of "
-        "every signed PDF to a folder you choose, for long-term "
-        "recordkeeping.",
-        "Flatten checkbox to rasterize the output for a smaller, "
-        "lock-it-in PDF.",
-        "Cross-platform: Windows installer + portable, macOS .app, "
-        "Linux .deb + portable .tar.gz.",
+    "1.46": [
+        "Sign dialog now has a visible signature picker — when you have more "
+        "than one saved signature, choose which one each placed signature "
+        "uses, instead of relying on a hidden per-window right-click menu "
+        "(which silently applied the first signature everywhere).",
+        "Remove individual pages from the combined document before building "
+        "— including single pages inside multi-page input PDFs — via a "
+        "per-page Remove button plus a Restore control. Honoured by both "
+        "Create PDF and the Sign & Create flow.",
+        "The MyDocMaker logo now appears in the window header.",
+        "macOS: fixed the 'MyDocMaker.app is damaged and can't be opened' "
+        "Gatekeeper error — the .app is ad-hoc re-signed after its Info.plist "
+        "is finalised and packaged with ditto, so the signature stays valid.",
+    ],
+    "1.45": [
+        "▼ New 'Archive' button in the footer (next to My Signatures). "
+        "Click it once to pick a folder where every signed PDF gets "
+        "auto-saved as a flattened copy — a separate backup, in "
+        "addition to wherever you save the signed file yourself. The "
+        "button reads 'Set up Archive…' until you configure it, then "
+        "switches to 'Archive' (click to open the folder, change it, "
+        "or close).",
+        "Until you choose a folder, no archiving happens — it's "
+        "opt-in. The archive is per-machine and stored next to your "
+        "session prefs in ~/.config/mydocmaker/state.json.",
+        "Archived copies are flattened (rasterized) so they're "
+        "self-contained snapshots that any PDF viewer can render — "
+        "great for long-term recordkeeping.",
+    ],
+    "1.44": [
+        "🔒 Signed PDFs are now tamper-protected end-to-end. The "
+        "signature visual is baked DIRECTLY into the page's content "
+        "stream (raster overlay) — basic PDF editors like Foxit and "
+        "Master PDF can no longer quietly delete the widget and have "
+        "the visual disappear, because the visual is part of the page "
+        "itself, not a removable annotation.",
+        "A visible Acrobat-style signature widget is still added on "
+        "top so Acrobat shows the clickable signature badge and "
+        "verification panel works as expected.",
+        "The first signature on a document now certifies it with "
+        "FILL_FORMS permission — Acrobat marks the signature 'invalid' "
+        "as soon as anyone modifies the page content, while still "
+        "allowing other signers to fill any empty signature fields you "
+        "left for them in Prepare mode.",
+        "Sign dialog shows a small explainer line about the lock-in "
+        "behavior so recipients (and you) know the protection model.",
+    ],
+    "1.43": [
+        "Signature stamp shrunk to 220 × 66 pt (was 240 × 72) — less "
+        "page real estate, less wasted space inside.",
+        "Internal padding tightened: text now sits close to the edges "
+        "of the stamp instead of floating in the middle with whitespace "
+        "all around. The cursive name is also bbox-cropped before "
+        "placement so its actual content fills the left half.",
+        "New ✓ SHA-256 · timestamp badge on the bottom line — signals "
+        "the cryptographic protection type AND when the document was "
+        "signed in one compact element.",
+        "Long company names and addresses now pixel-wrap by width "
+        "instead of guessing at character count, so the lines never "
+        "overflow the right pane.",
+    ],
+    "1.42": [
+        "Fixed: long names no longer get clipped in the cursive "
+        "signature image. Names like 'Dejan Obradovic' or "
+        "'Christopher Featherstone-Smith' were getting truncated at "
+        "the edges of the 960×280 canvas because the 140 px font "
+        "rendered them too wide. The renderer now auto-shrinks the "
+        "font size until the full name fits with margin on each side.",
+        "My Signatures manager preview now shows the FULL composed "
+        "DocuSign-style stamp (signature image + name + company + "
+        "address + tax ID + license + timestamp) — same renderer the "
+        "signed PDF uses. Previously it only showed the raw cursive "
+        "PNG with metadata listed as plain text below, which didn't "
+        "reflect what the actual signature would look like.",
+    ],
+    "1.41": [
+        "Signature preview is bigger now — 560 × 200 px in the dialog "
+        "(was 420 × 130), which is a 1.4× upscale and makes the "
+        "supporting lines (address, tax ID, license, timestamp) "
+        "actually readable. Previously these lines were rendered at "
+        "~10 px on screen and disappeared into noise.",
+        "Bumped supporting-line fonts within the appearance composer "
+        "too: name 42→48 px, company 30→32 px, captions 26→28 px, "
+        "timestamp 24→26 px. On the rendered PDF the text now sits "
+        "at roughly 12 pt (name), 8 pt (company), 7 pt (lines), "
+        "6.5 pt (timestamp) — every line is comfortably legible.",
+        "Stamp box stays at the v1.40 DocuSign size (240 × 72 pt).",
+    ],
+    "1.40": [
+        "Signature box right-sized to match real DocuSign stamps. "
+        "Default is now 240 × 72 pt (about 3.3″ × 1″), down from v1.39's "
+        "320 × 100 pt which felt oversized on the page.",
+        "Appearance layout tightened — dropped the 'Signed by' header "
+        "(the cursive sig on the left implies it), reduced internal "
+        "padding, and packed the metadata into single-line rows. The "
+        "name is bold and dominant at the top, with company / address "
+        "/ tax / license / timestamp stacked below.",
+        "Net result: same readable text density, less wasted white "
+        "space, signature stamp is no longer the size of a credit card.",
+    ],
+    "1.39": [
+        "🔏 Digital signatures are now actually readable. The default "
+        "stamp box is bumped from 200pt × 60pt to 320pt × 100pt (DocuSign-"
+        "ish proportions) so the signature has real estate on the page, "
+        "not a postage stamp.",
+        "Appearance image rendered at 1280×400 (was 600×180) with 52px "
+        "name font and 30px+ supporting text — fonts now land at "
+        "8–14pt on the page, readable instead of squinty.",
+        "Auto-rendered cursive name in Digital mode is now generated at "
+        "960×280 with a 140px font, so the signature image stays crisp "
+        "even at 200% zoom in Acrobat.",
+        "Cursive font selection now reaches for actual script faces — "
+        "Apple Chancery / Snell Roundhand on macOS, Monotype Corsiva / "
+        "Segoe Script on Windows — and falls back to italic serif only "
+        "when nothing else is installed.",
+    ],
+    "1.38": [
+        "Fix: the chosen mode (Digital / Typed / Drawn) is now actually "
+        "persisted with each saved signature. v1.32–v1.37 set "
+        "creator_mode on the meta dict but the JSON-write filter "
+        "stripped it because the field wasn't whitelisted — so on edit, "
+        "the dialog always reverted to the inferred default (usually "
+        "Typed for Digital signatures). Now creator_mode is whitelisted, "
+        "and as a belt-and-suspenders the mode is also inferred from "
+        "style for any signatures saved before this fix.",
+    ],
+    "1.37": [
+        "🔏 Actually applies the DocuSign-style stamp to the signed PDF "
+        "now. v1.36 wired the composed appearance through pyhanko's "
+        "StaticStampStyle but pre-created the signature field via "
+        "append_signature_field — pyhanko silently ignores stamp_style "
+        "when the widget already exists. Fixed by letting PdfSigner "
+        "create the field itself via new_field_spec, which is the only "
+        "code path that actually applies the stamp.",
+        "Pillow forward-compat: switched Image.LANCZOS references to a "
+        "module-level LANCZOS constant probed via Image.Resampling so "
+        "Pillow 11+ (which removed the bare Image.LANCZOS) keeps "
+        "working in the bundled build.",
+        "Signature preview no longer disappears silently on errors — "
+        "any exception in the preview pipeline now surfaces as a red "
+        "one-line error in the preview area instead of a blank box.",
+    ],
+    "1.36": [
+        "🔏 Fixed: signed PDFs now show your FULL identity on the visible "
+        "stamp — name, company, address, Tax ID, License — not just the "
+        "name + timestamp. Two bugs combined to suppress everything: the "
+        "composed appearance PNG was never actually applied to pyhanko's "
+        "signature widget (stamp_style=None made pyhanko fall back to its "
+        "minimal default), and the metadata wasn't being passed into the "
+        "composer in the first place. Both fixed.",
+        "📐 WYSIWYG preview in the signature creator — every mode now "
+        "shows a live preview of EXACTLY what the signed stamp will look "
+        "like on the PDF (left: signature image; right: identity + "
+        "timestamp). Type in Digital mode and watch the company / "
+        "address / license appear in the preview in real time.",
+        "Digital mode auto-renders your Name in a cursive script as the "
+        "signature image — no typing or drawing UI needed.",
+    ],
+    "1.35": [
+        "Signature creator: three distinct signature types, each with "
+        "its own self-contained UI — no more mixing widgets.",
+        "  • Digital — DocuSign-style: fill in your business details "
+        "(name, company, address, VAT/EIN/Tax/License). The visible "
+        "signature image is auto-rendered from your Name in a cursive "
+        "script. NO type or draw widgets in this mode.",
+        "  • Typed — type your name, pick a font style. Just that.",
+        "  • Drawn — draw your signature freehand. Just that.",
+        "Existing signatures created with v1.31–v1.34's 'Create signature "
+        "— full details' mode keep working and now show under Digital.",
+    ],
+    "1.34": [
+        "Fixed: in 'Create signature — full details' mode, the dialog was "
+        "stacking BOTH the Type and Draw visual frames + the Details "
+        "fields at once, which made the dialog enormous (especially when "
+        "editing an existing signature). Now that mode shows a compact "
+        "Type/Draw sub-chooser at the top — pick one, fill it in, fill "
+        "in your details, click Save. Only one visual is visible at a "
+        "time, so the dialog stays a reasonable size.",
+    ],
+    "1.33": [
+        "Signature creator: each of the three modes (Create signature / "
+        "Type your name / Draw your signature) now has its OWN Save "
+        "button at the bottom of that mode's panel — 'Save typed "
+        "signature', 'Save drawn signature', 'Save signature with "
+        "details'. Click your mode's Save, the signature is created and "
+        "the dialog closes. No more global Save button. One signature = "
+        "one type; if you want a different style, create another via "
+        "My Signatures and apply it via the right-click 'Sign as' menu.",
+    ],
+    "1.32": [
+        "✎ My Signatures button moved to the bottom-right of the footer — "
+        "out of the way until you need it (it's a setup-once action, not "
+        "a per-PDF one).",
+        "🔏 Signature creator restructured: 3 clear options at the top — "
+        "'Create signature — full details' (best for business and legal "
+        "documents, includes name + company + address + VAT/EIN/Tax/"
+        "License), 'Type your name' (quick cursive signature), and "
+        "'Draw your signature' (with much higher-quality rendering — "
+        "4× oversampling + LANCZOS smoothing, so the final stamp looks "
+        "polished instead of pixelated).",
+        "Right-click context menu is now mode-aware: in Sign mode it's "
+        "'Sign as ▸ <your saved signatures>' (as in v1.31); in Prepare "
+        "mode it switches to 'Assign to ▸ Person 1 / Person 2 / ...' "
+        "with optional Name + Email per person.",
+        "Prepare mode now shows a Persons editor where you can name each "
+        "person who will sign and add their email. Those names land in "
+        "the PDF as 'Signature 2 - Alice Smith <alice@example.com>' "
+        "instead of an anonymous slot number — much easier for the "
+        "recipient to identify their field in Acrobat.",
+        "Prepare-mode signature windows are coloured one per person "
+        "(amber / green / purple / red / blue / cyan) so visually you "
+        "can tell who's signing where.",
+    ],
+    "1.31": [
+        "🔏 Multiple saved signatures. New 'My Signatures' button "
+        "(top-right) opens a manager where you can create, edit, and "
+        "delete as many signatures as you want — each with name, "
+        "company, address, and VAT/EIN/Tax/License fields. Useful when "
+        "you sign personally AND on behalf of a company, or for "
+        "different clients.",
+        "Right-click a signature window in the Sign dialog → 'Sign as ▸ "
+        "<signature>' picks which one to use. Each window can be a "
+        "different signature, so one PDF can carry multiple identities.",
+        "Or leave a window empty: it becomes a clickable signature "
+        "field for someone else to fill in later in Acrobat / Foxit. "
+        "Visible blue dashed rectangles now appear ON the PDF page so "
+        "recipients can SEE where to sign, not just where the cursor "
+        "happens to hit a hidden widget.",
+        "Signature windows are now outline-only (no fill colour) — you "
+        "can see the page content underneath. Amber outline = will be "
+        "signed; grey dashed outline = empty (for someone else); blue = "
+        "currently selected.",
+        "v1.28's single saved signature is auto-migrated into the new "
+        "store the first time v1.31 launches — nothing to do, your "
+        "existing signature is preserved as the first entry.",
+    ],
+    "1.30": [
+        "Sign dialog rectangles are now actually visible: opaque amber/"
+        "green/purple/red fills (one color per signer), solid 2px "
+        "outline, big 'Signature window #N' label centered inside, "
+        "plus 'Person #M — page X' subtitle. v1.29's invisible boxes "
+        "were a Tk alpha-channel bug; fixed by switching to pure RGB.",
+        "Click position is now the CENTER of the new spot, not its "
+        "top-left corner. So when you click, the window appears where "
+        "the cursor is.",
+        "Simpler mouse model: left-click on empty page = place new; "
+        "left-click on a spot = select; left-drag = move it. No more "
+        "right-click-then-click. Drop overlapping any other spot is "
+        "still rejected.",
+        "Right-click on a spot = context menu with 'Assign to Person N',"
+        " 'Size' presets (Small / Default / Wide / Tall), and 'Delete'.",
+        "Multi-signer workflow: each spot has an owner (Person 1..N). "
+        "When you sign, only YOUR spots get signed; the others are "
+        "kept in the PDF as empty (clickable) signature fields, "
+        "labeled 'Signature N (Person M)' so the next signer can fill "
+        "them in Acrobat / Foxit / etc.",
+        "Auto-renumber: delete a spot in the middle and the rest "
+        "shift down — Signature 1, 2, 3 stays sequential.",
+        "Empty fields in saved PDFs carry descriptive names "
+        "('Signature 1 (Person 2)') so the next signer knows which "
+        "field is theirs.",
+    ],
+    "1.29": [
+        "Sign dialog is now a proper signature designer: drop multiple "
+        "signature spots, select them, move them, delete them.",
+        "Left-click on empty area places a new spot (with overlap "
+        "rejection — can't drop two on top of each other). Left-click "
+        "on an existing spot selects it.",
+        "Right-click on a spot enters move mode (cursor changes); next "
+        "left-click relocates it. Right-click empty / Escape cancels.",
+        "Delete or Backspace removes the selected spot.",
+        "Two save modes: 'Sign with my signature' (the v1.28 flow, now "
+        "supporting multiple spots) or 'Prepare for others to sign' "
+        "(produces a PDF with empty signature fields you can send "
+        "elsewhere — no signing happens).",
+        "Signed appearance redesigned: signature image on the left, "
+        "signer name + timestamp on the right of the stamp. No more "
+        "overlapping the signature.",
+    ],
+    "1.28": [
+        "New: 🔏 Sign and Create PDF — fully offline e-signing. "
+        "Click the button → if you don't have a signature yet, the "
+        "Create Signature dialog opens (Type your name in a cursive "
+        "font, OR draw your signature freehand on a pad). Save it "
+        "once, reuse it forever.",
+        "After the build, the Sign dialog opens with a scrollable "
+        "preview of every page. Click on any page to drop your "
+        "signature stamp; click somewhere else to move it. Hit "
+        "Sign & Save.",
+        "Result: a PDF with embedded PKCS#7 signature (PAdES-compliant; "
+        "Adobe Acrobat shows the signature panel) + a companion "
+        ".audit.json sidecar listing the SHA256, your machine + user, "
+        "timestamp, and certificate fingerprint for independent "
+        "verification.",
+        "First sign auto-generates a self-signed RSA-2048 certificate "
+        "stored at ~/.config/mydocmaker/signing/ — never "
+        "leaves your machine. Recipients see 'self-signed' until they "
+        "trust the certificate (same as code-signing without a paid CA).",
+        "v1.29 will add image-upload signatures, multiple saved sigs, "
+        "and a Verify dialog. v1.28 is intentionally tight: one "
+        "signature, one position per PDF, end-to-end working.",
+    ],
+    "1.27": [
+        "Header text refreshed: 'Drop any file(s) below — or paste a "
+        "website URL — and create a combined PDF.' Reads better and "
+        "spells out what the app actually does.",
+    ],
+    "1.26": [
+        "Nautilus right-click 'Add to D&D PDF Creator' entry now "
+        "shows the red D&D PDF icon next to the text — easier to "
+        "spot in the menu.",
+    ],
+    "1.25": [
+        "Preview tab now does continuous vertical scrolling — every "
+        "page stacked in one view, mouse-wheel works, Prev/Next jump "
+        "between page boundaries.",
+        "Window/taskbar icon is now crisp at every size (16/24/32/48/"
+        "64/128/256 pre-rendered with Pillow's LANCZOS filter).",
+        "'Sign and Create PDF' button added next to Create PDF — "
+        "currently grayed out as a placeholder; v1.26 wires up actual "
+        "PAdES e-signature on top of it.",
+        "Flatten savings estimate moved from the under-list strip to "
+        "right next to the Flatten checkbox so the trade-off is "
+        "visible where the toggle is.",
+        "Clicking the empty-list 'Drag & Drop any file here' placeholder "
+        "now opens the file browser (same as the + Browse files button).",
+        "Tiny tweak: dropped the exclamation point from the ♡ sponsor "
+        "tooltip — reads less salesy.",
+    ],
+    "1.24": [
+        "Small ♡ sponsor button added to the footer. Hover for the "
+        "tooltip 'Support this project from Dejan & Claudia!'. The "
+        "click is a no-op for now — the link will be wired up once "
+        "the GitHub Sponsors profile (currently in review) is approved.",
+    ],
+    "1.23": [
+        "New Preview tab — a live, page-by-page viewer of the combined "
+        "PDF, built on top of a per-item render cache. Switch tabs any "
+        "time to see what your output looks like.",
+        "Background rendering: every file or URL you add is rendered to "
+        "PDF in the background as soon as it lands in the list, so the "
+        "preview is usually ready when you open it. Webpage captures "
+        "still take a few seconds each, but they happen concurrently "
+        "while you keep adding more files.",
+        "Per-item status indicators in the page list: '…' queued, '⏳' "
+        "rendering now, '✓' ready, '✗' failed.",
+        "Reordering items and removing them is instant in the preview — "
+        "cached bytes get re-stitched, no re-render.",
+        "Changing the page-size (Original/A4/Letter) invalidates cached "
+        "renders and re-queues them so the preview reflects the new "
+        "setting.",
+        "Foundation for v1.24's e-signature feature — the viewer is "
+        "what you'll click to drop signature stamps onto.",
+    ],
+    "1.22": [
+        "Office → PDF conversion now picks the best backend you have "
+        "installed: Microsoft Office (Windows, via COM) first for "
+        "highest fidelity, OnlyOffice DocumentBuilder second, "
+        "LibreOffice as the universal fallback.",
+        "Windows users with Microsoft Office no longer need LibreOffice "
+        "installed at all — Word/Excel/PowerPoint convert directly via "
+        "the real Office apps in the background.",
+        "OnlyOffice DocumentBuilder support: install it once, the app "
+        "uses it automatically. Cross-platform (Win/Mac/Linux).",
+        "If one backend chokes on a specific file, the next one in line "
+        "is tried automatically — so a glitchy .docx in Word doesn't "
+        "block conversion when LibreOffice would handle it fine.",
+    ],
+    "1.21": [
+        "Byline added to the What's New dialog — every version's "
+        "release notes now end with 'by Dejan Obradovic (& Claudia)'.",
+    ],
+    "1.20": [
+        "Each item in the page list now shows its size: filename.ext "
+        "(12.3 MB), so you can spot big files at a glance.",
+        "New running-totals strip under the list: number of items, "
+        "total size on disk, and an estimate of the output size if "
+        "you tick Flatten. The flatten estimate tells you how much "
+        "you'd save — handy for deciding whether to bother.",
+        "Webpages in the list now show '(webpage)' since their final "
+        "size isn't known until Chromium renders them.",
+    ],
+    "1.19": [
+        "Fix: locale-aware default page size from v1.18 was being "
+        "overridden by old saved state — anyone who'd ever launched "
+        "v1.16–v1.18 had 'Original' stuck as their default regardless "
+        "of locale. State files now carry a schema version; v1 saves "
+        "are read for the page list but ignored for page-size and "
+        "flatten preferences so the locale default wins.",
+        "Hint added to the .deb post-install banner: if the menu icon "
+        "looks generic, log out + back in once (Wayland caches app "
+        "icons in memory and can't live-reload).",
+    ],
+    "1.18": [
+        "Custom red D&D PDF icon now used across the board — Tk window, "
+        "Linux app menu, Windows taskbar + installer + uninstaller, "
+        "macOS Dock + .app bundle.",
+        "Page size defaults to Letter for US/CA/MX (etc.) and A4 for "
+        "everyone else, based on your locale. 'Original (images)' is "
+        "still available — just no longer the default for mixed input.",
+        "No more nag to install LibreOffice if you already have any "
+        "Office suite — OnlyOffice, MS Office, or Apple iWork detected = "
+        "no banner.",
+        "When nothing is installed, the install banner now leads with "
+        "OnlyOffice as the recommended free choice (best Microsoft-"
+        "format fidelity); LibreOffice listed as the universal "
+        "alternative.",
+        "Heads-up: actual headless conversion via OnlyOffice / MS Office "
+        "still requires their batch tools (DocumentBuilder, Word/Excel "
+        "COM). Full multi-backend support shipping in v1.19.",
+    ],
+    "1.17": [
+        "Empty Pages list now shows a friendly 'Drag & Drop any file "
+        "here' hint instead of just being blank.",
+        "App icon swapped to the system 'application-pdf' icon (the "
+        "look v1.01 had) so it blends with the rest of your icon "
+        "theme instead of being a custom blue square.",
+        "Smaller .deb (no more bundled PNG icon).",
+    ],
+    "1.16": [
+        "New top-level right-click entry: 'Add to D&D PDF Creator' "
+        "(Linux + Nautilus). One click, silent — files are appended to "
+        "the open window or launch a new one. No more digging through "
+        "the Open With submenu. Needs python3-nautilus, which the .deb "
+        "now declares as a Recommends.",
+        "Persistent file list — your page list is saved automatically "
+        "to ~/.config/mydocmaker/state.json and restored next "
+        "time you open the app. Page size + Flatten preferences are "
+        "remembered too.",
+        "Files that no longer exist on disk (moved or deleted between "
+        "sessions) are quietly dropped from the restored list; a status "
+        "message reports the count.",
+        "Use 'Clear all' to start a fresh list when you want — it's "
+        "the same button as before, just more useful now that the list "
+        "persists across launches.",
+    ],
+    "1.15": [
+        "Right-click 'Open With MyDocMaker' now appears in the "
+        "main file-manager menu on Linux — previously hidden because the "
+        ".desktop file had no Icon= field, so Nautilus/GNOME Files "
+        "demoted us to 'Other Application…' only.",
+        "Linux build now ships a 256×256 PNG icon (generated at build "
+        "time with Pillow), GenericName, and Keywords for better menu "
+        "search results.",
+        "postinst refreshes the icon cache + MIME database too, so the "
+        "right-click entry appears the moment apt finishes — no logout "
+        "needed.",
+    ],
+    "1.14": [
+        "Spreadsheet hint — when you add a .xlsx / .xls / .ods file, a "
+        "one-time tip explains how to set Print Area + Fit to Page + "
+        "orientation in your spreadsheet for clean PDF output. (We use "
+        "whatever print settings the file was saved with — LibreOffice "
+        "doesn't override them, and most users have never set them.)",
+        "Better Windows missing-LibreOffice messaging — direct download "
+        "link and a three-step install path, plus an explanation of why "
+        "we don't bundle LibreOffice (~600 MB).",
+        "README now has a per-platform Uninstall section.",
+    ],
+    "1.13": [
+        "Friendlier .deb install feedback — after `sudo apt install …` "
+        "finishes you now get a clear green ✓ banner with the exact "
+        "command and menu name to launch, instead of just dpkg's wall "
+        "of technical 'Setting up… / Processing triggers…' output.",
+        "Same treatment on uninstall: a one-line confirmation tells you "
+        "the package is gone and shows how to reinstall.",
+    ],
+    "1.12": [
+        "Friendly missing-component banner at startup — if LibreOffice "
+        "or SANE (Linux scanner tools) aren't installed, a small notice "
+        "appears with an Install… button.",
+        "One-click install dialog: per-component Install buttons. Uses "
+        "pkexec + apt/dnf/pacman/zypper on Linux (polkit auth prompt), "
+        "Homebrew on macOS if present, or opens the official download "
+        "page everywhere else.",
+        "Dependabot enabled: weekly PRs bump Python dependencies "
+        "(Pillow, pypdf, playwright, …) and GitHub Action versions, so "
+        "each release ships with the latest security fixes baked in.",
+    ],
+    "1.11": [
+        "Hotfix: Linux builds (v1.06–v1.10) crashed at startup on systems "
+        "with glibc < 2.38 (Pop!_OS 22.04, Ubuntu 22.04, Debian 12, Mint "
+        "21) — 'GLIBC_2.38 not found' loading libpython3.12.so.1.0.",
+        "Fix: pin the Linux build runner to ubuntu-22.04 so the bundle "
+        "links against glibc 2.35, which covers every Debian/Ubuntu "
+        "derivative released since April 2022.",
+    ],
+    "1.10": [
+        "One-click auto-update — Check for updates now offers Download & "
+        "install for installer-style installs (Windows .exe installer, "
+        "Linux .deb). A progress bar shows download MB/total and, when "
+        "finished, the OS's installer takes over.",
+        "Detects how the app is installed (Windows installer vs. portable "
+        "zip, macOS .app, Linux .deb vs. tarball) and downloads the right "
+        "artifact for the user's environment.",
+        "For portable installs (Windows zip, macOS app, Linux tarball) the "
+        "downloaded archive opens in your file manager so you can replace "
+        "the old copy manually — auto-replacing running executables isn't "
+        "safe without an installer wrapper.",
+    ],
+    "1.09": [
+        "Windows installer .exe is now actually included in the release "
+        "(the v1.08 build step compiled it but dropped it in the wrong "
+        "directory — fixed, plus a verification step now fails the build "
+        "if the .exe isn't produced).",
+    ],
+    "1.08": [
+        "Windows installer (.exe) — proper Inno Setup installer with right-click "
+        "'Open With MyDocMaker' integration, optional Send To "
+        "shortcut, Start Menu + Desktop icons, and a real uninstaller.",
+        "macOS Finder integration — right-click any supported file and "
+        "MyDocMaker shows up under 'Open With'. Multi-file "
+        "selections are routed via Apple Events so they all land in one "
+        "window.",
+        "Scan button now does something useful on Windows + macOS — opens "
+        "Windows Fax & Scan / Image Capture so you can scan, save, and drag "
+        "the file in. Linux still uses one-click SANE scanning.",
+    ],
+    "1.07": [
+        "Click the version label (bottom-left) to see what's new in this release.",
+        "Close button added to the footer, alongside Check for updates.",
+        "Add-source buttons (Browse, From phone, Scan) moved to their own row "
+        "so the Scan button is no longer clipped on narrower windows.",
+    ],
+    "1.06": [
+        "Create and open PDF + Create and print PDF buttons — build, then "
+        "auto-open in your viewer or send to the default printer.",
+        "📱 Add from phone (QR) — scan a QR with your phone and upload "
+        "photos/PDFs over Wi-Fi.",
+        "🖨 Scan (Linux today via SANE) — one-click scan into the list.",
+        "Check for updates footer button — checks GitHub for newer releases.",
+        "Live flatten progress bar + 'Saved X.X MB' meter in the result.",
+        "Save dialog defaults to ~/Desktop.",
+        "Webpage capture fix — forces print media + light scheme + clears "
+        "selection, eliminating the all-gray output some sites produced.",
+    ],
+    "1.05": [
+        "Right-click context menu on the page list (Remove / Move to top / "
+        "Move to bottom).",
+        "THIRD-PARTY-LICENSES.md catalogue for bundled libraries.",
+    ],
+    "1.04": [
+        "Flatten output option (rasterizes each page — shrinks image-heavy "
+        "PDFs significantly).",
+        "120 MB per-file size cap with friendly batch warning.",
+    ],
+    "1.03": [
+        "Right-click 'Open With MyDocMaker' integration on Linux.",
+        "Single-instance mode — second invocation appends files to the "
+        "running window instead of opening another one.",
+    ],
+    "1.02": [
+        ".deb package for Linux + source tarball artifact.",
+        "Fixed Windows artifact naming, URL validation, LibreOffice precheck.",
+    ],
+    "1.01": [
+        "First cross-platform release (Windows / macOS / Linux).",
+        "Paste a website URL to capture a full webpage as PDF pages.",
+        "iPhone HEIC photos work out of the box.",
     ],
 }
 
@@ -4946,23 +5487,10 @@ class App:
         pad = {"padx": 10, "pady": 6}
 
         # --- Header --------------------------------------------------------
-        # Brand banner (logoMDM.png) at the top, scaled to a fixed height.
-        # Falls back silently to just the text line if the logo or Pillow
-        # isn't available.
-        self._header_logo_ref = None
-        logo_path = _find_app_logo()
-        if logo_path and PIL_TK_OK:
-            try:
-                src = Image.open(logo_path)
-                target_h = 72
-                w = max(1, round(src.width * target_h / src.height))
-                resized = src.resize((w, target_h), LANCZOS)
-                self._header_logo_ref = _ImageTk.PhotoImage(resized)
-                ttk.Label(root, image=self._header_logo_ref).pack(
-                    anchor="w", padx=10, pady=(8, 0)
-                )
-            except Exception:
-                self._header_logo_ref = None
+        # The brand logo lives in the bottom-right of the Pages tab (next to
+        # the add-source buttons), not the header — see the controls row
+        # below. We keep its PhotoImage reference alive on self.
+        self._brand_logo_ref = None
 
         head = ttk.Label(
             root,
@@ -5087,9 +5615,34 @@ class App:
         ttk.Button(btns, text="Remove", command=self.remove_sel).pack(side="left")
         ttk.Button(btns, text="Clear all", command=self.clear_all).pack(side="left", padx=4)
 
-        # Row 2: add-from-source buttons. Their own line so the Scan button
+        # Row 2+: the add-source buttons, page-size and flatten options sit in
+        # a left column; the brand logo fills the empty space to their right
+        # (bottom-right of the Pages tab), per the logo-position spec.
+        controls = ttk.Frame(pages_tab)
+        controls.pack(fill="x")
+        left = ttk.Frame(controls)
+
+        # Brand logo — transparent PNG (logoMDM.png). Packed before the left
+        # column so it keeps its width when the column expands to fill the
+        # rest of the row. Anchored bottom-right; blends with the window bg.
+        logo_path = _find_app_logo()
+        if logo_path and PIL_TK_OK:
+            try:
+                src = Image.open(logo_path)
+                target_h = 84
+                w = max(1, round(src.width * target_h / src.height))
+                self._brand_logo_ref = _ImageTk.PhotoImage(
+                    src.resize((w, target_h), LANCZOS))
+                ttk.Label(controls, image=self._brand_logo_ref).pack(
+                    side="right", anchor="se", padx=(8, 14), pady=(2, 8))
+            except Exception:
+                self._brand_logo_ref = None
+
+        left.pack(side="left", fill="x", expand=True)
+
+        # Add-from-source buttons. Their own line so the Scan button
         # doesn't get clipped on narrower windows.
-        add_row = ttk.Frame(pages_tab)
+        add_row = ttk.Frame(left)
         add_row.pack(fill="x", **pad)
         ttk.Button(add_row, text="+ Browse files…",
                    command=self.browse).pack(side="left")
@@ -5099,7 +5652,7 @@ class App:
                    command=self.add_from_scanner).pack(side="left")
 
         # --- Page size + Create -------------------------------------------
-        opt = ttk.Frame(pages_tab)
+        opt = ttk.Frame(left)
         opt.pack(fill="x", **pad)
         ttk.Label(opt, text="Page size:").pack(side="left")
         # Default page size: Letter for US/CA/MX/etc., A4 for the rest of
@@ -5128,7 +5681,7 @@ class App:
         flatten_text = "Flatten output (smaller file — page becomes image, text not selectable)"
         if not FLATTEN_OK:
             flatten_text = "Flatten output (unavailable — install pypdfium2)"
-        flatten_row = ttk.Frame(pages_tab)
+        flatten_row = ttk.Frame(left)
         flatten_row.pack(fill="x", **pad)
         self.flatten_chk = ttk.Checkbutton(
             flatten_row,
@@ -6600,10 +7153,10 @@ def _find_app_icon():
 
 
 def _find_app_logo():
-    """Locate the wide banner logo (logoMDM.png) shown in the window header.
-    Bundled next to the executable via PyInstaller --add-data; in dev mode it
-    sits beside this file. Returns None if not found (header falls back to a
-    plain text title)."""
+    """Locate the brand logo (logoMDM.png) shown in the bottom-right of the
+    Pages tab. Bundled next to the executable via PyInstaller --add-data; in
+    dev mode it sits beside this file. Returns None if not found (the UI
+    simply omits the logo)."""
     candidates = []
     meipass = getattr(sys, "_MEIPASS", None)
     if meipass:

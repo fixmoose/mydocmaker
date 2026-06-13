@@ -26,5 +26,8 @@ dist/
 .claude/
 
 # Design scratch / source images kept locally but not shipped in the repo
+# (logoMDM.png IS shipped — it holds the transparent no-bg artwork)
 Logo MDM pic solo.png
 Gemini_Generated_Image_*.png
+logoMDM-no bg.png
+logo position.png
