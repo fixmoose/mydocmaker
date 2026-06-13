@@ -24,3 +24,27 @@ dist/
 
 # Claude Code session state — never committed
 .claude/
+
+# This repo (fixmoose/mydocmaker) is MyDocMaker ONLY, with its files at the
+# repo root. Other apps / websites that happen to live alongside it in the
+# local "DocMaker Studio" working folder are NOT part of this repo — each is
+# (or should be) its own project. Ignore them so they're never committed here.
+# NOTE: "MyDocMaker App/" is a now-redundant local duplicate of the root
+# files; work from the root from now on and delete that folder when ready.
+MyDocMaker App/
+MyDocMaker Website/
+DocMaker Studio Website/
+CouplesCalendar App/
+DreamPortfolio App/
+LifeOrganizer App/
+MileageTracker App/
+MovingBuddy App/
+NotesEverywhere App/
+RentMyStack App/
+ShoppingList App/
+WhereToCrash App/
+kWhMarket App/
+
+# Design scratch / source images kept locally but not shipped in the repo
+Gemini_Generated_Image_*.png
+Logo MDM pic solo.png

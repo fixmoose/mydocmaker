@@ -33,6 +33,15 @@ your computer:
 > SmartScreen will show "Windows protected your PC" → click **More
 > info → Run anyway**. macOS: right-click the app → Open → Open again.
 > You only do this once per machine.
+>
+> **macOS "damaged / can't be opened"?** macOS adds a quarantine flag to
+> apps downloaded from the internet. If right-click → Open doesn't clear
+> it, open **Terminal** and run:
+> ```bash
+> xattr -dr com.apple.quarantine /Applications/MyDocMaker.app
+> ```
+> (adjust the path if you didn't move it to Applications), then open it
+> normally.
 
 ## 🗑️ Uninstall
 
@@ -52,7 +61,7 @@ your computer:
   the desktop, or another window. New drops add to the list.
 - **Paste a website link** and capture the full webpage as PDF pages —
   automatically split across multiple **A4** or **Letter** pages.
-- **iPhone photos (HEIC)** work out of the box — plus HEIF and AVIF.
+- **iPhone photos** work out of the box.
 - **Mix and match** — combine photos, documents, PDFs, and webpages into one
   PDF, in whatever order you choose.
 - **Reorder & remove** pages before building.
@@ -82,7 +91,7 @@ your computer:
 
 | Category   | What you can drop / add |
 |------------|--------------------------|
-| Images     | png, jpg, jpeg, bmp, gif, tiff, webp, ico, ppm/pgm/pbm, tga, **heic, heif, avif** |
+| Images     | png, jpg, jpeg, bmp, gif, tiff, webp, ico, ppm/pgm/pbm, tga |
 | Webpages   | any **URL** (paste the link) |
 | PDFs       | pdf (merged in as-is) |
 | Text/code  | txt, md, csv, log, py, js, ts, html, css, json, xml, yaml, ini, sh |
@@ -113,7 +122,7 @@ python mydocmaker.py
 ```
 
 Built with Python + Tkinter (cross-platform GUI), `tkinterdnd2` (drag & drop),
-`pillow-heif` (HEIC), `playwright` (webpage capture), `pypdf` + `reportlab`
+`pillow-heif`, `playwright` (webpage capture), `pypdf` + `reportlab`
 (PDF assembly), `pyhanko` + `cryptography` (PAdES e-signatures).
 
 ### How the downloads are built

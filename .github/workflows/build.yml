@@ -92,6 +92,7 @@ jobs:
           pyinstaller --noconfirm --windowed --onedir
           --name "${{ env.APP_NAME }}"
           --add-data "installer/icon.png:."
+          --add-data "logoMDM.png:."
           --collect-all playwright
           --collect-all tkinterdnd2
           --collect-all pillow_heif
@@ -110,6 +111,7 @@ jobs:
           --name "${{ env.APP_NAME }}"
           --icon "installer/icon.ico"
           --add-data "installer/icon.png;."
+          --add-data "logoMDM.png;."
           --collect-all playwright
           --collect-all tkinterdnd2
           --collect-all pillow_heif
@@ -130,6 +132,7 @@ jobs:
           --name "${{ env.APP_NAME }}"
           --icon "installer/icon.icns"
           --add-data "installer/icon.png:."
+          --add-data "logoMDM.png:."
           --osx-bundle-identifier com.fixmoose.mydocmaker
           --collect-all playwright
           --collect-all tkinterdnd2
@@ -316,14 +319,42 @@ jobs:
           print("Injected CFBundleDocumentTypes:", [t.get('CFBundleTypeName') for t in doc_types])
           PY
 
+      # Re-sign the .app AFTER editing Info.plist. PyInstaller ad-hoc-signs
+      # the bundle during the build, but the plist edit above invalidates
+      # that signature (the seal covers Info.plist). On Apple Silicon a
+      # bundle with a broken/missing signature is rejected by Gatekeeper as
+      # "MyDocMaker.app is damaged and can't be opened" — NOT the normal
+      # "unidentified developer" prompt. Re-applying an ad-hoc signature
+      # (-s -) fixes that; users then just right-click → Open once. (A real
+      # Developer ID + notarization would remove even that prompt, but
+      # requires a paid Apple account.)
+      - name: Ad-hoc re-sign macOS .app
+        if: matrix.os == 'macos-latest'
+        run: |
+          APP="dist/${APP_NAME}.app"
+          if [ ! -d "$APP" ]; then
+            echo "No .app produced — skipping codesign."
+            exit 0
+          fi
+          codesign --force --deep --sign - --timestamp=none "$APP"
+          echo "Verifying signature:"
+          codesign --verify --deep --strict --verbose=2 "$APP" || {
+            echo "::warning::codesign verify reported issues, but continuing."
+          }
+
+      # Package with ditto, not zip. ditto preserves the bundle's symlinks,
+      # extended attributes and code signature exactly; plain `zip -r` can
+      # corrupt nested framework symlinks, which also surfaces as "damaged".
       - name: Package (macOS)
         if: matrix.os == 'macos-latest'
         run: |
           cd dist
           if [ -d "${{ env.APP_NAME }}.app" ]; then
-            zip -r "../${{ matrix.artifact }}.zip" "${{ env.APP_NAME }}.app"
+            ditto -c -k --sequesterRsrc --keepParent \
+              "${{ env.APP_NAME }}.app" "../${{ matrix.artifact }}.zip"
           else
-            zip -r "../${{ matrix.artifact }}.zip" "${{ env.APP_NAME }}"
+            ditto -c -k --sequesterRsrc --keepParent \
+              "${{ env.APP_NAME }}" "../${{ matrix.artifact }}.zip"
           fi
 
       - name: Package (Linux portable tarball)

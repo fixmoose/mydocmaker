@@ -4,7 +4,7 @@ MyDocMaker  —  v1.30
 ================================================================
 A free, cross-platform (Windows / macOS / Linux) drag-and-drop PDF builder.
 
-Drop files in (images incl. HEIC, PDFs, text, Office docs), OR paste a website
+Drop files in (images, PDFs, text, Office docs), OR paste a website
 URL to capture a full webpage as PDF pages — mix and match — then click
 Create PDF and save. No coding required.
 
@@ -106,7 +106,7 @@ WHATS_NEW = {
     "1.0": [
         "First public release of MyDocMaker. Drop in files, paste a "
         "website link, reorder everything, click Create PDF.",
-        "Supported inputs: PDFs, images (PNG/JPG/BMP/GIF/TIFF/WebP/ICO/PPM/TGA), iPhone HEIC + HEIF + AVIF, webpages (URL paste, full-page "
+        "Supported inputs: PDFs, images (PNG/JPG/BMP/GIF/TIFF/WebP/ICO/PPM/TGA), iPhone photos, webpages (URL paste, full-page "
         "capture), text/code files, Office documents (Word, Excel, "
         "PowerPoint, ODF — with LibreOffice or MS Office installed).",
         "DocuSign-style e-signatures — three modes: Digital (business-detail stamp auto-rendered from your name), Typed, Drawn.",
@@ -3382,13 +3382,6 @@ class SignDialog:
         head.pack(fill="x", padx=12, pady=(12, 4))
         ttk.Label(head, text="Sign and create PDF",
                   font=("", 13, "bold")).pack(side="left")
-        default_label = (
-            next((s["label"] for s in self._signatures
-                  if s["id"] == self._default_signature_id), "—")
-            if self._default_signature_id else "no signature saved"
-        )
-        ttk.Label(head, text=f"Default signature: {default_label}",
-                  foreground="#555").pack(side="right")
 
         # Mode toggle
         # Prepare = save the PDF with empty signature fields at every spot
@@ -3433,6 +3426,40 @@ class SignDialog:
                    command=self._add_person).pack(side="left")
         ttk.Button(persons_btn_row, text="− Remove last",
                    command=self._remove_last_person).pack(side="left", padx=(6, 0))
+
+        # v1.45: visible signature picker (sign mode only). Mirrors the
+        # persons editor's slot used in prepare mode. Switching among
+        # several saved signatures used to be possible ONLY via the
+        # per-window right-click menu, which users couldn't find — so every
+        # window silently used the first signature. This makes the active
+        # signature obvious: it sets the signature for NEW windows, and when
+        # a window is selected it reassigns just that one.
+        self.sig_picker_frame = ttk.LabelFrame(
+            self.win, text="Signature to use",
+        )
+        # NOTE: not packed yet — _refresh_mode_ui handles that.
+        sig_row = ttk.Frame(self.sig_picker_frame)
+        sig_row.pack(fill="x", padx=10, pady=(6, 2))
+        ttk.Label(sig_row, text="Signature:").pack(side="left")
+        self.sig_combo_var = tk.StringVar()
+        self.sig_combo = ttk.Combobox(
+            sig_row, textvariable=self.sig_combo_var, state="readonly",
+            width=42,
+        )
+        self.sig_combo.pack(side="left", padx=(6, 0))
+        self.sig_combo.bind("<<ComboboxSelected>>",
+                            self._on_signature_combo_changed)
+        ttk.Label(
+            self.sig_picker_frame,
+            text="Applies to new signature windows you place. To change a "
+                 "window you already placed, click to select it first, then "
+                 "pick here (or right-click the window → Sign as ▸). Manage "
+                 "or add signatures with the My Signatures button in the "
+                 "main window.",
+            foreground="#555", wraplength=760, justify="left",
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+        self._sig_combo_ids = []
+        self._populate_signature_combo()
 
         # Instruction line (status — updates per interaction)
         self.status_lbl = ttk.Label(
@@ -3843,6 +3870,53 @@ class SignDialog:
                 self._update_status_for_selection()
                 return
 
+    # ---- Signature picker (sign mode) ----------------------------------
+    def _populate_signature_combo(self):
+        """Build the combobox list from saved signatures plus a trailing
+        'leave empty' option. self._sig_combo_ids holds the parallel
+        signature ids (None for the leave-empty entry)."""
+        labels, ids = [], []
+        for sig in self._signatures:
+            labels.append(sig.get("label") or sig.get("name") or "Signature")
+            ids.append(sig["id"])
+        labels.append("— Leave empty (someone else signs) —")
+        ids.append(None)
+        self._sig_combo_ids = ids
+        self.sig_combo.config(values=labels)
+        self._sync_signature_combo()
+
+    def _sync_signature_combo(self):
+        """Point the combobox at the selected window's signature, or — when
+        nothing is selected — at the current default for new windows. Set
+        programmatically, so this does NOT fire <<ComboboxSelected>>."""
+        if not hasattr(self, "sig_combo"):
+            return
+        sel = self._selected_stamp()
+        target_id = (sel.get("signature_id") if sel is not None
+                     else self._default_signature_id)
+        try:
+            idx = self._sig_combo_ids.index(target_id)
+        except ValueError:
+            idx = len(self._sig_combo_ids) - 1   # leave-empty fallback
+        if self.sig_combo.cget("values"):
+            self.sig_combo.current(idx)
+
+    def _on_signature_combo_changed(self, _event=None):
+        idx = self.sig_combo.current()
+        if idx < 0 or idx >= len(self._sig_combo_ids):
+            return
+        chosen = self._sig_combo_ids[idx]
+        # New windows placed from now on use this signature.
+        self._default_signature_id = chosen
+        sel = self._selected_stamp()
+        if sel is not None:
+            # Reassign just the selected window (redraws + refreshes status).
+            self._assign_signature(sel["id"], chosen)
+        else:
+            self._update_status_for_selection()
+        # Drop focus so Delete/Escape keep acting on the canvas, not the box.
+        self.canvas.focus_set()
+
     def _assign_person(self, stamp_id, person_id):
         """Prepare-mode: assign a stamp to one of the Person slots."""
         for s in self._stamps:
@@ -3902,6 +3976,8 @@ class SignDialog:
             text=f"{n} signature window{'' if n == 1 else 's'} placed."
         )
         self._refresh_action_button()
+        # Keep the signature picker mirroring the current selection / default.
+        self._sync_signature_combo()
         sel = self._selected_stamp()
         if sel is not None:
             idx = self._stamps.index(sel) + 1
@@ -3961,11 +4037,15 @@ class SignDialog:
         is_prepare = self.mode_var.get() == "prepare"
         if is_prepare:
             # Insert the persons editor between mode_row and status_lbl.
+            self.sig_picker_frame.pack_forget()
             self.persons_frame.pack(fill="x", padx=12, pady=(0, 4),
                                      before=self.status_lbl)
             self._render_persons_list()
         else:
             self.persons_frame.pack_forget()
+            self.sig_picker_frame.pack(fill="x", padx=12, pady=(0, 4),
+                                       before=self.status_lbl)
+            self._sync_signature_combo()
         self._refresh_action_button()
         self._redraw_stamps()
         self._update_status_for_selection()
@@ -4374,6 +4454,12 @@ class PreviewTab:
         self._cached_image_refs = []   # holds PhotoImage list so Tcl doesn't GC them
         self._page_y_positions = []    # y of each page in the canvas (for Prev/Next nav)
         self._configure_after_id = None  # debounce window-resize re-renders
+        # v1.45: per-page removal. _page_sources[i] = (item.uid, local_idx)
+        # for the i-th currently-shown page; _hidden_count tracks how many
+        # are excluded so the Restore button can label itself.
+        self._page_sources = []
+        self._hidden_count = 0
+        self._page_btn_widgets = []    # per-page Remove buttons (kept from GC)
 
         # ----- Toolbar
         bar = ttk.Frame(self.frame)
@@ -4397,6 +4483,14 @@ class PreviewTab:
 
         ttk.Button(bar, text="↻ Refresh", command=self.refresh_preview
                    ).pack(side="right")
+        # Restore hidden pages — only meaningful once the user has hidden at
+        # least one page; label updates with the count.
+        self.restore_btn = ttk.Button(
+            bar, text="Restore hidden pages",
+            command=self._restore_hidden_pages,
+        )
+        self.restore_btn.pack(side="right", padx=(0, 6))
+        self.restore_btn.pack_forget()
 
         # ----- Status line
         self.status_lbl = ttk.Label(self.frame, text="",
@@ -4484,16 +4578,28 @@ class PreviewTab:
         # Build a combined PDF from cached per-item bytes. Items not yet
         # rendered are skipped (they'll appear when their render finishes
         # and a subsequent invalidate fires).
+        #
+        # v1.45: per-page exclusions. We keep a `_page_sources` list parallel
+        # to the pages we actually add — each entry is (item.uid, local_idx)
+        # so the per-page "Remove" button knows what to hide, and a running
+        # `hidden` count drives the Restore control.
         writer = PdfWriter()
+        excluded = self.app.excluded_pages
+        self._page_sources = []
         pending = 0
         failed = 0
+        hidden = 0
         skipped_labels = []
         for it in items:
             if it.render_status == "ready" and it.cached_pdf_bytes:
                 try:
                     reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
-                    for pg in reader.pages:
+                    for local_idx, pg in enumerate(reader.pages):
+                        if (it.uid, local_idx) in excluded:
+                            hidden += 1
+                            continue
                         writer.add_page(pg)
+                        self._page_sources.append((it.uid, local_idx))
                 except Exception:
                     failed += 1
                     skipped_labels.append(it.label)
@@ -4502,6 +4608,7 @@ class PreviewTab:
                 skipped_labels.append(it.label)
             else:
                 pending += 1
+        self._hidden_count = hidden
 
         if len(writer.pages) == 0:
             self._teardown_pdf()
@@ -4510,8 +4617,14 @@ class PreviewTab:
                     f"Rendering {pending} item(s)… the preview will appear "
                     "as they finish."
                 )
+            elif hidden:
+                self._set_placeholder(
+                    f"All {hidden} page(s) are hidden. Use “Restore hidden "
+                    "pages” above to bring them back."
+                )
             else:
                 self._set_placeholder("No pages to preview yet.")
+            self._update_restore_button()
             return
 
         # Materialise to bytes, hand to pypdfium2 for rendering.
@@ -4526,16 +4639,27 @@ class PreviewTab:
             return
 
         status_bits = [f"{self._page_count} pages"]
+        if hidden:
+            status_bits.append(f"{hidden} hidden")
         if pending:
             status_bits.append(f"{pending} still rendering")
         if failed:
             status_bits.append(f"{failed} failed")
         self.status_lbl.config(text="  ·  ".join(status_bits))
+        self._update_restore_button()
         self._dirty = False
         self._render_all_pages()
 
     def _set_placeholder(self, text):
         self.status_lbl.config(text="")
+        # Destroy any lingering per-page Remove buttons (canvas.delete only
+        # removes the embedding window item, not the child Button widget).
+        for w in getattr(self, "_page_btn_widgets", []):
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self._page_btn_widgets = []
         self.canvas.delete("all")
         self.canvas.create_text(
             10, 10, anchor="nw",
@@ -4698,6 +4822,15 @@ class PreviewTab:
                 scale = 1.0
         scale = min(scale, 6.0)
 
+        # Destroy any per-page Remove buttons from the previous render before
+        # clearing the canvas, so the Button child widgets don't leak.
+        for w in self._page_btn_widgets:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+        self._page_btn_widgets = []
+
         self.canvas.delete("all")
         self._cached_image_refs = []
         self._page_y_positions = []
@@ -4722,6 +4855,18 @@ class PreviewTab:
             self._page_y_positions.append(y)
             x = max((cw - pil.width) // 2, 8)
             self.canvas.create_image(x, y, anchor="nw", image=photo)
+            # v1.45: a "✕ Remove page" button floating at the page's top-right.
+            # Clicking it hides just this page from the output (and preview).
+            rm_btn = tk.Button(
+                self.canvas, text="✕ Remove page",
+                font=("", 8), fg="#a30000", cursor="hand2",
+                relief="raised", bd=1, padx=4, pady=0,
+                command=lambda i=idx: self._remove_page(i),
+            )
+            self.canvas.create_window(
+                x + pil.width - 4, y + 4, anchor="ne", window=rm_btn,
+            )
+            self._page_btn_widgets.append(rm_btn)
             # Page number label below each page so users can see where they are.
             label_y = y + pil.height + 4
             self.canvas.create_text(
@@ -4737,6 +4882,43 @@ class PreviewTab:
         )
         self._update_page_indicator()
 
+    # ---- Per-page removal (v1.45) ---------------------------------------
+    def _remove_page(self, display_idx):
+        """Hide the page currently shown at display_idx. Maps it back to its
+        source (item.uid, local_idx) and records that in the app-level
+        exclusion set, then rebuilds the preview. The exclusion is honoured
+        by both the final Create-PDF build and the sign build."""
+        if display_idx < 0 or display_idx >= len(self._page_sources):
+            return
+        src = self._page_sources[display_idx]
+        self.app.excluded_pages.add(src)
+        # Rebuild immediately so the page disappears and numbering updates.
+        self._dirty = True
+        self._rebuild_now()
+
+    def _restore_hidden_pages(self):
+        """Un-hide every page the user removed in this session."""
+        if not self.app.excluded_pages:
+            return
+        self.app.excluded_pages.clear()
+        self._dirty = True
+        self._rebuild_now()
+
+    def _update_restore_button(self):
+        """Show the Restore button (with a live count) only when something is
+        hidden; hide it otherwise."""
+        n = self._hidden_count
+        if n > 0:
+            self.restore_btn.config(
+                text=f"Restore {n} hidden page{'' if n == 1 else 's'}"
+            )
+            try:
+                self.restore_btn.pack(side="right", padx=(0, 6))
+            except tk.TclError:
+                pass
+        else:
+            self.restore_btn.pack_forget()
+
 
 # ---------------------------------------------------------------------------
 # The application window
@@ -4745,6 +4927,11 @@ class App:
     def __init__(self, root):
         self.root = root
         self.items = []          # ordered list of Item
+        # v1.45: individual pages hidden from the output. Each entry is a
+        # (item.uid, local_page_index) tuple — keyed by the stable Item uid
+        # so reordering/removing other items doesn't disturb it. Honoured by
+        # the Preview tab, the final Create-PDF build, and the sign build.
+        self.excluded_pages = set()
         self.work_queue = queue.Queue()
         self._update_dialog_state = None  # populated while auto-update is open
         self._install_dialog = None       # populated while install-deps dialog is open
@@ -4759,6 +4946,24 @@ class App:
         pad = {"padx": 10, "pady": 6}
 
         # --- Header --------------------------------------------------------
+        # Brand banner (logoMDM.png) at the top, scaled to a fixed height.
+        # Falls back silently to just the text line if the logo or Pillow
+        # isn't available.
+        self._header_logo_ref = None
+        logo_path = _find_app_logo()
+        if logo_path and PIL_TK_OK:
+            try:
+                src = Image.open(logo_path)
+                target_h = 72
+                w = max(1, round(src.width * target_h / src.height))
+                resized = src.resize((w, target_h), LANCZOS)
+                self._header_logo_ref = _ImageTk.PhotoImage(resized)
+                ttk.Label(root, image=self._header_logo_ref).pack(
+                    anchor="w", padx=10, pady=(8, 0)
+                )
+            except Exception:
+                self._header_logo_ref = None
+
         head = ttk.Label(
             root,
             text="Drop any file(s) below — or paste a website URL — and create a combined PDF.",
@@ -4769,8 +4974,8 @@ class App:
         notes = []
         if not DND_OK:
             notes.append("Drag-and-drop unavailable (install tkinterdnd2). Use Browse.")
-        if not HEIC_OK:
-            notes.append("HEIC support not loaded (install pillow-heif).")
+        # Note: HEIC/HEIF/AVIF decoding (pillow-heif) is supported silently
+        # in the background — we intentionally don't surface it in the UI.
         if notes:
             ttk.Label(root, text="  ·  ".join(notes), foreground="#b35900"
                       ).pack(anchor="w", padx=10)
@@ -5383,12 +5588,19 @@ class App:
         i = self._sel()
         if i is None:
             return
+        removed = self.items[i]
+        # Drop any per-page exclusions that belonged to this item.
+        self.excluded_pages = {
+            (uid, p) for (uid, p) in self.excluded_pages
+            if uid != removed.uid
+        }
         del self.items[i]
         self._refresh(select=min(i, len(self.items) - 1))
         self.status.config(text=f"Removed. Total: {len(self.items)}.")
 
     def clear_all(self):
         self.items.clear()
+        self.excluded_pages.clear()
         self._refresh()
         self.status.config(text="Cleared.")
 
@@ -6071,6 +6283,7 @@ class App:
         render cost twice."""
         try:
             writer = PdfWriter()
+            excluded = set(self.excluded_pages)
             for it in self.items:
                 if it.cached_pdf_bytes:
                     reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
@@ -6080,7 +6293,11 @@ class App:
                     page_mode = self.size_var.get()
                     data = RenderWorker._render(it, page_mode)
                     reader = PdfReader(io.BytesIO(data))
-                for pg in reader.pages:
+                # Honour pages hidden in the Preview tab so the signed PDF
+                # matches what the user sees / what Create PDF would produce.
+                for local_idx, pg in enumerate(reader.pages):
+                    if (it.uid, local_idx) in excluded:
+                        continue
                     writer.add_page(pg)
             if len(writer.pages) == 0:
                 self.work_queue.put((
@@ -6136,9 +6353,11 @@ class App:
         page_mode = self.size_var.get()
         flatten = bool(self.flatten_var.get() and FLATTEN_OK)
         items_snapshot = list(self.items)
+        excluded_snapshot = set(self.excluded_pages)
         threading.Thread(
             target=self._build_worker,
-            args=(items_snapshot, page_mode, out_path, flatten, action),
+            args=(items_snapshot, page_mode, out_path, flatten, action,
+                  excluded_snapshot),
             daemon=True,
         ).start()
 
@@ -6147,7 +6366,9 @@ class App:
         for btn in (self.create_btn, self.create_open_btn, self.create_print_btn):
             btn.config(state=state)
 
-    def _build_worker(self, items, page_mode, out_path, flatten=False, action="none"):
+    def _build_worker(self, items, page_mode, out_path, flatten=False,
+                      action="none", excluded=None):
+        excluded = excluded or set()
         writer = PdfWriter()
         skipped = []
         for it in items:
@@ -6170,7 +6391,11 @@ class App:
                         skipped.append(f"{it.label} (unsupported)")
                         continue
                 reader = PdfReader(buf)
-                for pg in reader.pages:
+                # Skip any pages the user hid in the Preview tab. Pages are
+                # keyed by (item.uid, local index within this item).
+                for local_idx, pg in enumerate(reader.pages):
+                    if (it.uid, local_idx) in excluded:
+                        continue
                     writer.add_page(pg)
             except Exception as e:
                 skipped.append(f"{it.label} ({e})")
@@ -6368,6 +6593,23 @@ def _find_app_icon():
     here = os.path.dirname(os.path.abspath(__file__))
     candidates.append(os.path.join(here, "installer", "icon.png"))
     candidates.append(os.path.join(here, "icon.png"))
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _find_app_logo():
+    """Locate the wide banner logo (logoMDM.png) shown in the window header.
+    Bundled next to the executable via PyInstaller --add-data; in dev mode it
+    sits beside this file. Returns None if not found (header falls back to a
+    plain text title)."""
+    candidates = []
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(os.path.join(meipass, "logoMDM.png"))
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates.append(os.path.join(here, "logoMDM.png"))
     for p in candidates:
         if os.path.exists(p):
             return p
