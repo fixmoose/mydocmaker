@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.49
+- **Company logo on digital signatures (optional).** The signature creator's
+  Digital mode now has a "Company logo" picker. If set, the logo is rendered
+  on the signed stamp just below the company name. Any image type/size is
+  accepted — it's opened (PNG/JPG/WebP/HEIC/…), EXIF-rotated, trimmed and
+  downscaled by a normalizer, then stored with the signature.
+- **Click the empty page list to browse.** Clicking anywhere in the empty
+  Pages list now opens the file browser (previously only the small "click to
+  browse" hint text was clickable); drag-and-drop is unaffected, and normal
+  row selection still works once files are added.
+- **Window start-size fit.** The default window width now adapts to its
+  content so the long Flatten label is never clipped behind the corner logo.
+- Sharper app icon (re-extracted from the higher-resolution logo source).
+
 ## v1.48
 - **New app icon** — the MyDocMaker logo mark (document + pencil) in brand
   blue, replacing the old red "MD" tile.

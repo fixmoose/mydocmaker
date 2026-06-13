@@ -27,6 +27,7 @@ import json
 import socket
 import datetime
 import time
+import base64
 import hashlib
 import getpass
 import platform as _platform_mod
@@ -100,12 +101,23 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.48"
+APP_VERSION = "1.49"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.49": [
+        "Digital signatures can now carry your company logo. It's optional — "
+        "add it in the signature creator and it appears just below your "
+        "company name on the signed stamp. Any image type or size works "
+        "(it's cropped and resized automatically).",
+        "Click anywhere in the empty page list to browse for files — not "
+        "just on the small 'click to browse' hint.",
+        "Fixed the start-up window width so the Flatten option's text is no "
+        "longer partly hidden behind the corner logo.",
+        "Sharper app icon.",
+    ],
     "1.48": [
         "New app icon — the MyDocMaker logo mark in blue, replacing the old "
         "red 'MD' tile.",
@@ -1962,6 +1974,10 @@ def _signatures_dir():
 SIGNATURE_META_FIELDS = (
     "label", "name", "company", "address", "tax_id", "license",
     "style", "creator_mode", "created_at",
+    # v1.49: optional company logo for digital signatures, stored as a
+    # base64 PNG string (normalized by _normalize_logo_image). Empty when
+    # no logo was added.
+    "logo_png",
 )
 
 
@@ -2285,6 +2301,33 @@ def _find_font(candidates, size):
     return ImageFont.load_default()
 
 
+def _normalize_logo_image(raw_bytes, max_w=520, max_h=200):
+    """Normalize an uploaded company logo (any format/size) for use in the
+    digital-signature stamp. Opens via PIL — which handles PNG/JPG/WebP/BMP/
+    GIF/TIFF/ICO and, since pillow-heif is registered, HEIC/HEIF/AVIF —
+    honours EXIF orientation, converts to RGBA, trims fully-transparent
+    margins, and downscales to fit (max_w, max_h) preserving aspect (never
+    upscales). Returns clean PNG bytes, or None if the file can't be read as
+    an image."""
+    try:
+        im = Image.open(io.BytesIO(raw_bytes))
+        try:
+            im = ImageOps.exif_transpose(im)
+        except Exception:
+            pass
+        im = im.convert("RGBA")
+        bbox = im.getbbox()
+        if bbox:
+            im = im.crop(bbox)
+        if im.width > max_w or im.height > max_h:
+            im.thumbnail((max_w, max_h), LANCZOS)
+        buf = io.BytesIO()
+        im.save(buf, "PNG", optimize=True)
+        return buf.getvalue()
+    except Exception:
+        return None
+
+
 def _compose_signature_appearance(signature_png_bytes, meta, timestamp_str):
     """v1.43: compact DocuSign-style appearance with minimal internal
     padding — text fills the rectangle efficiently.
@@ -2401,6 +2444,27 @@ def _compose_signature_appearance(signature_png_bytes, meta, timestamp_str):
     if company:
         for line in _wrap_to_width(company, font_value):
             _draw_line(line, font_value, (45, 45, 70, 255), line_h=34)
+
+    # v1.49: optional company logo, drawn right below the company name.
+    # Scaled to fit the right pane's width and whatever vertical room is
+    # left above the badge (so it degrades gracefully when many text lines
+    # are present). Skipped entirely if there's no usable space.
+    logo_b64 = meta.get("logo_png") or ""
+    if logo_b64 and y < H - 44:
+        try:
+            logo_im = Image.open(
+                io.BytesIO(base64.b64decode(logo_b64))).convert("RGBA")
+            max_h = min((H - 36) - y, 80)
+            if max_h >= 16:
+                lw, lh = logo_im.size
+                sc = min(text_w / lw, max_h / lh)
+                nw, nh = max(1, int(lw * sc)), max(1, int(lh * sc))
+                logo_im = logo_im.resize((nw, nh), LANCZOS)
+                img.paste(logo_im, (text_x, y + 2), logo_im)
+                y += nh + 6
+        except Exception:
+            pass
+
     if address:
         for line in _wrap_to_width(address, font_caption):
             _draw_line(line, font_caption, (80, 80, 80, 255), line_h=30)
@@ -3098,6 +3162,16 @@ class SignatureCreatorDialog:
             except OSError:
                 pass
 
+        # v1.49: optional company logo (digital mode). Stored in meta as a
+        # base64 PNG; decode it back to bytes when editing an existing sig.
+        self._logo_png = None
+        self._logo_thumb_ref = None
+        if self.existing.get("logo_png"):
+            try:
+                self._logo_png = base64.b64decode(self.existing["logo_png"])
+            except Exception:
+                self._logo_png = None
+
         preset_name = self.existing.get("name") or self.existing.get("label")
         if not preset_name:
             try:
@@ -3330,6 +3404,22 @@ class SignatureCreatorDialog:
             ent.bind("<KeyRelease>",
                      lambda _e: self._refresh_appearance_preview())
 
+        # v1.49: optional company logo, shown below the company name on the
+        # signed stamp. Accepts any image type/size (normalized on import).
+        ttk.Label(f, text="Company logo (optional)").pack(
+            anchor="w", padx=10, pady=(8, 2))
+        logo_row = ttk.Frame(f)
+        logo_row.pack(fill="x", padx=10, pady=(0, 2))
+        ttk.Button(logo_row, text="Choose image…",
+                   command=self._choose_logo).pack(side="left")
+        self._logo_clear_btn = ttk.Button(
+            logo_row, text="Remove", command=self._clear_logo)
+        self._logo_clear_btn.pack(side="left", padx=6)
+        self._logo_thumb_lbl = ttk.Label(logo_row, text="No logo",
+                                          foreground="#888")
+        self._logo_thumb_lbl.pack(side="left", padx=6)
+        self._update_logo_thumb()
+
         # v1.36: live WYSIWYG preview of the final signed stamp.
         ttk.Label(f, text="Preview of the signed stamp:",
                   foreground="#666").pack(anchor="w", padx=10, pady=(8, 2))
@@ -3340,6 +3430,61 @@ class SignatureCreatorDialog:
         )
         self.digital_preview_lbl.pack(padx=10, pady=(0, 8), fill="x")
         self.details_frame = f
+
+    def _choose_logo(self):
+        """Pick a company-logo image (any type/size) and normalize it."""
+        path = filedialog.askopenfilename(
+            parent=self.win,
+            title="Choose company logo",
+            filetypes=[
+                ("Images",
+                 "*.png *.jpg *.jpeg *.gif *.bmp *.tif *.tiff *.webp *.ico "
+                 "*.heic *.heif *.avif"),
+                ("All files", "*.*"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                raw = fh.read()
+        except OSError as e:
+            messagebox.showerror(APP_NAME, f"Couldn't read that file:\n{e}")
+            return
+        norm = _normalize_logo_image(raw)
+        if norm is None:
+            messagebox.showerror(
+                APP_NAME, "That file doesn't look like an image I can read.")
+            return
+        self._logo_png = norm
+        self._update_logo_thumb()
+        self._refresh_appearance_preview()
+
+    def _clear_logo(self):
+        self._logo_png = None
+        self._update_logo_thumb()
+        self._refresh_appearance_preview()
+
+    def _update_logo_thumb(self):
+        """Refresh the little logo thumbnail + the Remove button's state."""
+        lbl = getattr(self, "_logo_thumb_lbl", None)
+        if lbl is None:
+            return
+        if self._logo_png and PIL_TK_OK:
+            try:
+                im = Image.open(io.BytesIO(self._logo_png)).convert("RGBA")
+                im.thumbnail((96, 40), LANCZOS)
+                self._logo_thumb_ref = _ImageTk.PhotoImage(im)
+                lbl.config(image=self._logo_thumb_ref, text="")
+                if getattr(self, "_logo_clear_btn", None) is not None:
+                    self._logo_clear_btn.state(["!disabled"])
+                return
+            except Exception:
+                pass
+        self._logo_thumb_ref = None
+        lbl.config(image="", text="No logo", foreground="#888")
+        if getattr(self, "_logo_clear_btn", None) is not None:
+            self._logo_clear_btn.state(["disabled"])
 
     def _build_save_rows(self):
         """v1.33: one Save button per mode, packed by _refresh_mode under
@@ -3532,6 +3677,9 @@ class SignatureCreatorDialog:
                 return
             if mode == "digital":
                 meta = {k: v.get() for k, v in self.detail_vars.items()}
+                if self._logo_png:
+                    meta["logo_png"] = base64.b64encode(
+                        self._logo_png).decode("ascii")
             elif mode == "type":
                 meta = {"name": (self.type_var.get() or "").strip()}
             else:  # draw
@@ -3599,6 +3747,10 @@ class SignatureCreatorDialog:
                 "name": typed_name or display_name,
                 "company": "", "address": "", "tax_id": "", "license": "",
             }
+        # Optional company logo (digital mode only), carried as base64 PNG.
+        if mode == "digital" and self._logo_png:
+            meta["logo_png"] = base64.b64encode(
+                self._logo_png).decode("ascii")
         if not meta.get("label"):
             meta["label"] = meta.get("name") or "Signature"
         if not meta.get("name"):
@@ -5665,6 +5817,11 @@ class App:
             self.listbox.drop_target_register(DND_FILES)
             self.listbox.dnd_bind("<<Drop>>", self.on_drop)
 
+        # 'or click to browse': clicking anywhere in the EMPTY list opens the
+        # file browser, not just the small centered hint label. Once items are
+        # present, the click falls through to normal listbox selection.
+        self.listbox.bind("<Button-1>", self._on_listbox_click)
+
         # Totals strip right under the listbox: count, total MB on disk,
         # and the *estimated* size if you flatten. Helps users decide
         # whether the Flatten checkbox is worth turning on.
@@ -6186,6 +6343,15 @@ class App:
         if paths:
             self.add_paths(list(paths))
 
+    def _on_listbox_click(self, _event):
+        """When the page list is empty, a click anywhere in it opens the file
+        browser (matching the 'or click to browse' hint). With items present,
+        return None so the listbox's normal row selection still works."""
+        if not self.items:
+            self.browse()
+            return "break"
+        return None
+
     # --- List operations -----------------------------------------------------
     def _sel(self):
         s = self.listbox.curselection()
@@ -6268,8 +6434,10 @@ class App:
         if hasattr(self, "empty_hint"):
             if self.items:
                 self.empty_hint.place_forget()
+                self.listbox.config(cursor="")
             else:
                 self.empty_hint.place(relx=0.5, rely=0.5, anchor="center")
+                self.listbox.config(cursor="hand2")
         # Update the running totals strip under the listbox.
         self._update_totals()
         # Tell the Preview tab the page list changed — debounced repaint.
