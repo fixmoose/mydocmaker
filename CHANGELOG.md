@@ -1,6 +1,13 @@
 # Changelog
 
 ## v1.49
+- **A3 and 11×17 (Tabloid) page sizes** added alongside Original / A4 /
+  Letter — useful for plan sets and large drawings (e.g. signing a permit
+  set). Document inputs (PDFs and Office docs) are now placed **centered on
+  the chosen sheet at their original size, without upscaling** — a Letter
+  page on an 11×17 sheet stays Letter-size, centered, on a full 11×17 page;
+  pages larger than the sheet are scaled down to fit. Images still scale to
+  fill the page as before. Applies to both the live preview and Create PDF.
 - **Company logo on digital signatures (optional).** The signature creator's
   Digital mode now has a "Company logo" picker. If set, the logo is rendered
   on the signed stamp under your signature, on the left side. Any image type/size is

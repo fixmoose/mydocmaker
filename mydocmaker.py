@@ -71,9 +71,9 @@ except Exception:
     HEIC_OK = False
 
 # --- PDF assembly ------------------------------------------------------------
-from pypdf import PdfWriter, PdfReader
+from pypdf import PdfWriter, PdfReader, Transformation
 from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import letter, A4
+from reportlab.lib.pagesizes import letter, A4, A3, ELEVENSEVENTEEN
 from reportlab.lib.utils import ImageReader
 
 # --- PDF flatten (optional, large files) ------------------------------------
@@ -108,6 +108,10 @@ APP_VERSION = "1.49"
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
     "1.49": [
+        "New page sizes: A3 and 11×17 (Tabloid) — handy for plan sets and "
+        "large drawings, e.g. signing a permit set. Documents smaller than "
+        "the sheet are centered at their original size (never stretched or "
+        "enlarged); anything larger than the sheet shrinks to fit.",
         "Digital signatures can now carry your company logo. It's optional — "
         "add it in the signature creator and it appears under your signature "
         "on the left side of the stamp. Any image type or size works "
@@ -776,6 +780,66 @@ def default_page_size():
     Letter-using countries."""
     cc = _detect_country_code()
     return "letter" if cc in _LETTER_COUNTRIES else "a4"
+
+
+# Forced page-size modes the user can pick (besides "original", which keeps
+# each image's own dimensions). Maps to reportlab point tuples (portrait).
+# ELEVENSEVENTEEN is 11×17 in (Tabloid/Ledger) — handy for plan sets/drawings.
+_PAGE_SIZES = {
+    "letter": letter,
+    "a4": A4,
+    "a3": A3,
+    "tabloid": ELEVENSEVENTEEN,
+}
+# Equivalent format names for Playwright's webpage→PDF capture.
+_PLAYWRIGHT_FORMATS = {
+    "letter": "Letter",
+    "a4": "A4",
+    "a3": "A3",
+    "tabloid": "Tabloid",
+}
+
+
+def _page_size_pt(page_mode):
+    """reportlab (w, h) points for a forced page-size mode; defaults to
+    Letter for unknown/'original' values (callers handle 'original' before
+    calling this)."""
+    return _PAGE_SIZES.get(page_mode, letter)
+
+
+def _normalize_pdf_to_pagesize(pdf_bytes, page_mode):
+    """Re-place every page of `pdf_bytes` CENTERED on the chosen sheet size,
+    WITHOUT enlarging the original (v1.49). Used for document inputs (PDFs /
+    Office docs / plan sets): picking e.g. 11×17 puts each original page,
+    untouched, in the middle of a full 11×17 sheet. Pages larger than the
+    sheet are scaled DOWN to fit (otherwise they'd be clipped); smaller pages
+    keep their exact size. page_mode == 'original' (or anything not a known
+    sheet) returns the bytes unchanged."""
+    if page_mode not in _PAGE_SIZES:
+        return pdf_bytes
+    W, H = _PAGE_SIZES[page_mode]
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        for src in reader.pages:
+            sw = float(src.mediabox.width)
+            sh = float(src.mediabox.height)
+            if sw <= 0 or sh <= 0:
+                writer.add_page(src)
+                continue
+            scale = min(W / sw, H / sh, 1.0)   # fit, but never upscale
+            dx = (W - sw * scale) / 2.0
+            dy = (H - sh * scale) / 2.0
+            dest = writer.add_blank_page(width=W, height=H)
+            dest.merge_transformed_page(
+                src, Transformation().scale(scale, scale).translate(dx, dy))
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        # If anything goes wrong, fall back to the original (un-normalized)
+        # bytes rather than dropping the page.
+        return pdf_bytes
 
 
 def _open_with_default_viewer(path):
@@ -1593,7 +1657,7 @@ def image_to_pdf_bytes(path, page_mode="original"):
     if page_mode == "original":
         img.save(buf, format="PDF")
     else:
-        page = A4 if page_mode == "a4" else letter
+        page = _page_size_pt(page_mode)
         pw, ph = page
         c = canvas.Canvas(buf, pagesize=page)
         iw, ih = img.size
@@ -1609,7 +1673,7 @@ def image_to_pdf_bytes(path, page_mode="original"):
 
 
 def text_to_pdf_bytes(path, page_mode="letter"):
-    page = A4 if page_mode == "a4" else letter
+    page = _page_size_pt(page_mode)
     pw, ph = page
     buf = io.BytesIO()
     c = canvas.Canvas(buf, pagesize=page)
@@ -1827,7 +1891,7 @@ def office_to_pdf_bytes(path):
 def url_to_pdf_bytes(url, page_mode="a4"):
     """Capture a full live webpage to a multi-page PDF via headless Chromium."""
     from playwright.sync_api import sync_playwright
-    fmt = "A4" if page_mode != "letter" else "Letter"
+    fmt = _PLAYWRIGHT_FORMATS.get(page_mode, "A4")
     buf = None
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -3057,12 +3121,12 @@ class RenderWorker:
             return image_to_pdf_bytes(item.value, page_mode).getvalue()
         if kind == "pdf":
             with open(item.value, "rb") as fh:
-                return fh.read()
+                return _normalize_pdf_to_pagesize(fh.read(), page_mode)
         if kind == "text":
-            tm = "a4" if page_mode == "a4" else "letter"
-            return text_to_pdf_bytes(item.value, tm).getvalue()
+            return text_to_pdf_bytes(item.value, page_mode).getvalue()
         if kind == "office":
-            return office_to_pdf_bytes(item.value).getvalue()
+            return _normalize_pdf_to_pagesize(
+                office_to_pdf_bytes(item.value).getvalue(), page_mode)
         raise ValueError(f"Unsupported file kind: {item.value}")
 
 
@@ -5909,7 +5973,15 @@ class App:
                         variable=self.size_var,
                         command=self._on_page_mode_changed
                         ).pack(side="left", padx=4)
+        ttk.Radiobutton(opt, text="A3", value="a3",
+                        variable=self.size_var,
+                        command=self._on_page_mode_changed
+                        ).pack(side="left", padx=4)
         ttk.Radiobutton(opt, text="Letter", value="letter",
+                        variable=self.size_var,
+                        command=self._on_page_mode_changed
+                        ).pack(side="left", padx=4)
+        ttk.Radiobutton(opt, text="11×17", value="tabloid",
                         variable=self.size_var,
                         command=self._on_page_mode_changed
                         ).pack(side="left", padx=4)
@@ -7302,12 +7374,13 @@ class App:
                         buf = image_to_pdf_bytes(it.value, page_mode)
                     elif kind == "pdf":
                         with open(it.value, "rb") as fh:
-                            buf = io.BytesIO(fh.read())
+                            buf = io.BytesIO(
+                                _normalize_pdf_to_pagesize(fh.read(), page_mode))
                     elif kind == "text":
-                        tm = "a4" if page_mode == "a4" else "letter"
-                        buf = text_to_pdf_bytes(it.value, tm)
+                        buf = text_to_pdf_bytes(it.value, page_mode)
                     elif kind == "office":
-                        buf = office_to_pdf_bytes(it.value)
+                        buf = io.BytesIO(_normalize_pdf_to_pagesize(
+                            office_to_pdf_bytes(it.value).getvalue(), page_mode))
                     else:
                         skipped.append(f"{it.label} (unsupported)")
                         continue
