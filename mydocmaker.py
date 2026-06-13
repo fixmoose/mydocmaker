@@ -102,12 +102,20 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.58"
+APP_VERSION = "1.59"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.59": [
+        "The Order tab now always reflects the current orientation/size — change "
+        "anything in Pages or Preview and the Order thumbnails update to match "
+        "when you open it (no more stale view).",
+        "The per-page ⟳ flip is now smooth: only the page you click rotates, "
+        "right where it sits — the rest of the document no longer blinks or "
+        "redraws.",
+    ],
     "1.58": [
         "Order tab now has a Zoom control (50%–300%) — make the page thumbnails "
         "as big as you like to see them clearly.",
@@ -6466,6 +6474,8 @@ class OrderTab:
         # State
         self._thumb_refs = {}     # key -> PhotoImage (kept from GC)
         self._cards = {}          # key -> card Frame widget
+        self._img_labels = {}     # key -> the thumbnail Label (for in-place updates)
+        self._flip_btns = {}      # key -> the ⟳ flip Button (for colour updates)
         self._card_ids = {}       # key -> canvas window id
         self._order = []          # current visual order of keys
         self._labels = {}         # key -> source item label
@@ -6489,9 +6499,10 @@ class OrderTab:
         self._dirty = True
 
     def on_show(self):
-        """Called when the Order tab becomes visible."""
-        if self._dirty:
-            self.refresh()
+        """Called when the Order tab becomes visible. Always rebuilds so it
+        can never show a stale layout — e.g. after the orientation/size was
+        changed on the Pages or Preview tab."""
+        self.refresh()
 
     def _bind_wheel(self):
         self.canvas.bind_all("<MouseWheel>", self._on_wheel)
@@ -6644,16 +6655,69 @@ class OrderTab:
             w.bind("<B1-Motion>", self._on_motion)
             w.bind("<ButtonRelease-1>", self._on_release)
         self._cards[key] = card
+        self._img_labels[key] = img_lbl
+        self._flip_btns[key] = flip
+
+    def _single_page_thumb(self, key):
+        """Render ONE page's thumbnail (PhotoImage), applying its flip override
+        and the current layout — mirrors build_ordered_native's per-page path.
+        Used to update a single card in place without rebuilding the grid."""
+        uid, idx = key
+        it = next((x for x in self.app.items if x.uid == uid), None)
+        if not it or not getattr(it, "cached_pdf_bytes", None):
+            return None
+        try:
+            reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
+            if idx >= len(reader.pages):
+                return None
+            pg = reader.pages[idx]
+            turns = self.app.page_rotate.get(key, 0)
+            if turns:
+                pg = _rotate_page_baked(pg, turns)
+            layout = self.app._current_layout()
+            writer = PdfWriter()
+            if layout.nup == 2:
+                sheet = _sheet_dims(layout.size, layout.paper) or letter
+                cell = ((sheet[0], sheet[1] / 2.0) if layout.arrange == "stack"
+                        else (sheet[0] / 2.0, sheet[1]))
+                pc = "asis" if turns else layout.content
+                _place_page_on_sheet(writer, pg, cell[0], cell[1], pc)
+            else:
+                writer.add_page(pg)
+            buf = io.BytesIO()
+            writer.write(buf)
+            doc = pdfium.PdfDocument(buf.getvalue())
+            inner_w, inner_h = self.CARD_W - 12, self.CARD_H - 34
+            page = doc[0]
+            pw = page.get_size()[0] / 72.0 * 96.0
+            scale = max(0.1, min(2.0, inner_w / max(1.0, pw)))
+            pil = page.render(scale=scale).to_pil().convert("RGB")
+            pil.thumbnail((inner_w, inner_h))
+            doc.close()
+            return _ImageTk.PhotoImage(pil)
+        except Exception:
+            return None
 
     def _flip_page(self, key):
         """Per-page orientation override: rotate this one page +90° (cycles
         through 4 turns). Ephemeral — cleared if the global size/orientation
-        changes (see App._on_page_mode_changed). Rebuilds the grid + preview."""
+        changes. Updates ONLY this card's thumbnail in place (no full rebuild,
+        so nothing else blinks); the Preview updates when next shown."""
         self.app.page_rotate[key] = (self.app.page_rotate.get(key, 0) + 1) % 4
         if self.app.page_rotate[key] == 0:
             self.app.page_rotate.pop(key, None)
-        self.invalidate()
-        self.refresh()
+        # Re-render just this page and swap its thumbnail + button colour.
+        thumb = self._single_page_thumb(key)
+        if thumb is not None:
+            self._thumb_refs[key] = thumb
+            lbl = self._img_labels.get(key)
+            if lbl is not None:
+                lbl.config(image=thumb)
+        btn = self._flip_btns.get(key)
+        if btn is not None:
+            btn.config(fg=("#2b6cb0" if self.app.page_rotate.get(key) else "#444"))
+        # Preview reflects it on next show (don't force a rebuild now — that's
+        # what caused the whole document to blink).
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
             if self.app._tab_is("Preview"):
@@ -6903,6 +6967,8 @@ class OrderTab:
                 pass
         self._cards = {}
         self._card_ids = {}
+        self._img_labels = {}
+        self._flip_btns = {}
         self._thumb_refs = {}
         self._placeholder = None
 

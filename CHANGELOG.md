@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.59
+- **Order tab always matches the current layout.** `on_show` now rebuilds the
+  grid every time the tab is shown (instead of only when marked dirty), so an
+  orientation/size change made on Pages or Preview always flows into the Order
+  thumbnails — no stale view.
+- **Smooth per-page flip.** Clicking ⟳ now re-renders only that one card's
+  thumbnail in place (`_single_page_thumb` + an in-place image swap) and just
+  invalidates the Preview, instead of rebuilding the whole grid. The rest of
+  the document no longer blinks/redraws on each flip.
+
 ## v1.58
 - **Order tab zoom** (50%–300%). Card size scales with the zoom level
   (`CARD_W`/`CARD_H` became zoom-aware properties) and thumbnails re-render at
