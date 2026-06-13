@@ -28,6 +28,7 @@ import socket
 import datetime
 import time
 import base64
+from collections import namedtuple
 import hashlib
 import getpass
 import platform as _platform_mod
@@ -101,12 +102,25 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.49"
+APP_VERSION = "1.50"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.50": [
+        "Page orientation: choose Portrait or Landscape for the output sheet "
+        "(next to Page size).",
+        "Document orientation: a separate 'Content' control in the Preview tab "
+        "rotates the original on the sheet — 'Auto' turns each page to best "
+        "fit (e.g. a wide drawing on a landscape sheet), or force "
+        "Portrait/Landscape.",
+        "2-up coupler: tick '2-up (2 pages per sheet)' to print two pages "
+        "side-by-side on one sheet — it auto-picks the matching big landscape "
+        "sheet, so two Letter pages land on one 11×17 landscape sheet at full "
+        "size. Great for plan sets.",
+        "The MyDocMaker logo in the window now opens mydocmaker.com.",
+    ],
     "1.49": [
         "New page sizes: A3 and 11×17 (Tabloid) — handy for plan sets and "
         "large drawings, e.g. signing a permit set. Documents smaller than "
@@ -807,38 +821,133 @@ def _page_size_pt(page_mode):
     return _PAGE_SIZES.get(page_mode, letter)
 
 
-def _normalize_pdf_to_pagesize(pdf_bytes, page_mode):
-    """Re-place every page of `pdf_bytes` CENTERED on the chosen sheet size,
-    WITHOUT enlarging the original (v1.49). Used for document inputs (PDFs /
-    Office docs / plan sets): picking e.g. 11×17 puts each original page,
-    untouched, in the middle of a full 11×17 sheet. Pages larger than the
-    sheet are scaled DOWN to fit (otherwise they'd be clipped); smaller pages
-    keep their exact size. page_mode == 'original' (or anything not a known
-    sheet) returns the bytes unchanged."""
-    if page_mode not in _PAGE_SIZES:
-        return pdf_bytes
-    W, H = _PAGE_SIZES[page_mode]
+# v1.50: page layout settings carried together through the render pipeline.
+#   size:    "original" | "a4" | "a3" | "letter" | "tabloid"
+#   paper:   "portrait" | "landscape"   (orientation of the OUTPUT sheet)
+#   content: "auto" | "portrait" | "landscape"  (how source content sits on it)
+#   nup:     1 | 2   (2 = "coupler": two pages side-by-side per sheet)
+PageLayout = namedtuple("PageLayout", "size paper content nup")
+DEFAULT_LAYOUT = PageLayout("original", "portrait", "auto", 1)
+
+
+def _sheet_dims(size, paper="portrait"):
+    """(w, h) points of the output sheet for a size + paper orientation, or
+    None for 'original'/unknown (caller keeps native size)."""
+    if size not in _PAGE_SIZES:
+        return None
+    w, h = _PAGE_SIZES[size]
+    if paper == "landscape":
+        w, h = h, w
+    return (w, h)
+
+
+def _wants_rotation(sw, sh, sheet_w, sheet_h, content):
+    """Should a source page (sw×sh) be rotated 90° to sit on the sheet?
+    - content 'portrait':  force upright  → rotate if currently wider-than-tall
+    - content 'landscape': force sideways → rotate if currently taller-than-wide
+    - content 'auto':      match the sheet's orientation (least wasted space)"""
+    if sw <= 0 or sh <= 0:
+        return False
+    if content == "portrait":
+        return sw > sh
+    if content == "landscape":
+        return sh > sw
+    return (sw > sh) != (sheet_w > sheet_h)   # auto
+
+
+def _place_page_on_sheet(writer, src, sheet_w, sheet_h, content):
+    """Add a new sheet_w×sheet_h page to `writer` and stamp `src` onto it,
+    optionally rotated 90° (per content mode), scaled to fit but NEVER
+    enlarged, and centered."""
+    sw = float(src.mediabox.width)
+    sh = float(src.mediabox.height)
+    if sw <= 0 or sh <= 0:
+        writer.add_page(src)
+        return
+    rot = _wants_rotation(sw, sh, sheet_w, sheet_h, content)
+    # Effective (post-rotation) source footprint used for fit + centering.
+    ew, eh = (sh, sw) if rot else (sw, sh)
+    scale = min(sheet_w / ew, sheet_h / eh, 1.0)   # fit, never upscale
+    dx = (sheet_w - ew * scale) / 2.0
+    dy = (sheet_h - eh * scale) / 2.0
+    dest = writer.add_blank_page(width=sheet_w, height=sheet_h)
+    if rot:
+        # rotate 90° CCW about origin maps (x,y)->(-y,x); shift back by +sh in
+        # x so the page sits in the positive quadrant, then scale + center.
+        ctm = (Transformation()
+               .rotate(90).translate(sh, 0)
+               .scale(scale, scale).translate(dx, dy))
+    else:
+        ctm = Transformation().scale(scale, scale).translate(dx, dy)
+    dest.merge_transformed_page(src, ctm)
+
+
+def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto"):
+    """Coupler: place pages two-per-sheet, side by side, on a sheet_w×sheet_h
+    landscape sheet. Each page is fit into its half (sheet_w/2 × sheet_h),
+    rotated per content mode, centered, never enlarged. An odd final page
+    sits alone on the left half. 2× Letter-portrait → 11×17 landscape fits
+    exactly (no scaling)."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
+        pages = list(reader.pages)
+        if not pages:
+            return pdf_bytes
         writer = PdfWriter()
-        for src in reader.pages:
-            sw = float(src.mediabox.width)
-            sh = float(src.mediabox.height)
-            if sw <= 0 or sh <= 0:
-                writer.add_page(src)
-                continue
-            scale = min(W / sw, H / sh, 1.0)   # fit, but never upscale
-            dx = (W - sw * scale) / 2.0
-            dy = (H - sh * scale) / 2.0
-            dest = writer.add_blank_page(width=W, height=H)
-            dest.merge_transformed_page(
-                src, Transformation().scale(scale, scale).translate(dx, dy))
+        half_w = sheet_w / 2.0
+        for i in range(0, len(pages), 2):
+            dest = writer.add_blank_page(width=sheet_w, height=sheet_h)
+            for slot, pg in enumerate(pages[i:i + 2]):   # 0 = left, 1 = right
+                sw = float(pg.mediabox.width)
+                sh = float(pg.mediabox.height)
+                if sw <= 0 or sh <= 0:
+                    continue
+                rot = _wants_rotation(sw, sh, half_w, sheet_h, content)
+                ew, eh = (sh, sw) if rot else (sw, sh)
+                scale = min(half_w / ew, sheet_h / eh, 1.0)
+                dx = slot * half_w + (half_w - ew * scale) / 2.0
+                dy = (sheet_h - eh * scale) / 2.0
+                if rot:
+                    ctm = (Transformation().rotate(90).translate(sh, 0)
+                           .scale(scale, scale).translate(dx, dy))
+                else:
+                    ctm = Transformation().scale(scale, scale).translate(dx, dy)
+                dest.merge_transformed_page(pg, ctm)
         out = io.BytesIO()
         writer.write(out)
         return out.getvalue()
     except Exception:
-        # If anything goes wrong, fall back to the original (un-normalized)
-        # bytes rather than dropping the page.
+        return pdf_bytes
+
+
+def _apply_nup(pdf_bytes, layout):
+    """Apply the 2-up coupler to an ASSEMBLED document if layout.nup == 2.
+    No-op otherwise. Used by the preview, Create PDF, and the sign flow so
+    all three agree."""
+    if layout.nup == 2:
+        sheet = _sheet_dims(layout.size, layout.paper)
+        if sheet:
+            return _impose_2up(pdf_bytes, sheet[0], sheet[1], layout.content)
+    return pdf_bytes
+
+
+def _impose_doc(pdf_bytes, layout):
+    """Re-place every page of `pdf_bytes` onto the layout's sheet — rotated
+    per content mode, centered, never enlarged (v1.49/1.50). For document
+    inputs (PDFs/Office docs/plan sets). 'original' size returns unchanged."""
+    sheet = _sheet_dims(layout.size, layout.paper)
+    if sheet is None:
+        return pdf_bytes
+    W, H = sheet
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        for src in reader.pages:
+            _place_page_on_sheet(writer, src, W, H, layout.content)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
         return pdf_bytes
 
 
@@ -1637,7 +1746,7 @@ def install_component(component_id, status_cb=None):
 # ---------------------------------------------------------------------------
 # Converters — each returns a BytesIO containing a PDF
 # ---------------------------------------------------------------------------
-def image_to_pdf_bytes(path, page_mode="original"):
+def image_to_pdf_bytes(path, layout=DEFAULT_LAYOUT):
     img = Image.open(path)
     try:
         img = ImageOps.exif_transpose(img)
@@ -1654,14 +1763,20 @@ def image_to_pdf_bytes(path, page_mode="original"):
         img = img.convert("RGB")
 
     buf = io.BytesIO()
-    if page_mode == "original":
+    sheet = _sheet_dims(layout.size, layout.paper)
+    if sheet is None:
         img.save(buf, format="PDF")
     else:
-        page = _page_size_pt(page_mode)
-        pw, ph = page
-        c = canvas.Canvas(buf, pagesize=page)
+        pw, ph = sheet
         iw, ih = img.size
-        scale = min(pw / iw, ph / ih)
+        # Content rotation only when explicitly forced — photos shouldn't be
+        # auto-rotated sideways (documents handle 'auto' in _impose_doc).
+        if layout.content in ("portrait", "landscape") and \
+                _wants_rotation(iw, ih, pw, ph, layout.content):
+            img = img.rotate(90, expand=True)
+            iw, ih = img.size
+        c = canvas.Canvas(buf, pagesize=(pw, ph))
+        scale = min(pw / iw, ph / ih)   # images fill the sheet (may scale up)
         dw, dh = iw * scale, ih * scale
         x, y = (pw - dw) / 2, (ph - dh) / 2
         c.drawImage(ImageReader(img), x, y, dw, dh,
@@ -1672,11 +1787,11 @@ def image_to_pdf_bytes(path, page_mode="original"):
     return buf
 
 
-def text_to_pdf_bytes(path, page_mode="letter"):
-    page = _page_size_pt(page_mode)
-    pw, ph = page
+def text_to_pdf_bytes(path, layout=DEFAULT_LAYOUT):
+    pw, ph = (_sheet_dims(layout.size, layout.paper)
+              or _sheet_dims("letter", layout.paper))
     buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=page)
+    c = canvas.Canvas(buf, pagesize=(pw, ph))
     margin = 50
     y = ph - margin
     c.setFont("Courier", 9)
@@ -1888,10 +2003,11 @@ def office_to_pdf_bytes(path):
     )
 
 
-def url_to_pdf_bytes(url, page_mode="a4"):
+def url_to_pdf_bytes(url, layout=DEFAULT_LAYOUT):
     """Capture a full live webpage to a multi-page PDF via headless Chromium."""
     from playwright.sync_api import sync_playwright
-    fmt = _PLAYWRIGHT_FORMATS.get(page_mode, "A4")
+    fmt = _PLAYWRIGHT_FORMATS.get(layout.size, "A4")
+    landscape = (layout.paper == "landscape")
     buf = None
     with sync_playwright() as p:
         browser = p.chromium.launch()
@@ -1910,7 +2026,7 @@ def url_to_pdf_bytes(url, page_mode="a4"):
             "catch (e) {} }"
         )
         pdf_bytes = page.pdf(
-            format=fmt, print_background=True,
+            format=fmt, landscape=landscape, print_background=True,
             margin={"top": "12mm", "bottom": "12mm",
                     "left": "10mm", "right": "10mm"},
         )
@@ -3057,11 +3173,11 @@ class Item:
 # every Tk-touching operation itself.
 # ---------------------------------------------------------------------------
 class RenderWorker:
-    def __init__(self, on_event, page_mode_fn, concurrency=2):
+    def __init__(self, on_event, layout_fn, concurrency=2):
         """on_event: callable(msg_tuple) — pushed onto App.work_queue.
-        page_mode_fn: zero-arg callable returning current page-size pref."""
+        layout_fn: zero-arg callable returning the current PageLayout."""
         self._on_event = on_event
-        self._page_mode_fn = page_mode_fn
+        self._layout_fn = layout_fn
         self._queue = queue.Queue()
         self._stop = threading.Event()
         for _ in range(concurrency):
@@ -3092,17 +3208,20 @@ class RenderWorker:
             try:
                 item.render_status = "rendering"
                 self._on_event(("item_status", item.uid))
-                page_mode = self._page_mode_fn()
-                data = self._render(item, page_mode)
+                layout = self._layout_fn()
+                data = self._render(item, layout)
                 item.cached_pdf_bytes = data
+                # Per-item render depends on size/paper/content (NOT nup —
+                # 2-up imposition happens later at assembly time).
+                lk = (layout.size, layout.paper, layout.content, layout.nup)
                 if item.kind == "file":
                     try:
-                        item.cache_key = (item.value, os.path.getmtime(item.value),
-                                          page_mode)
+                        item.cache_key = (item.value,
+                                          os.path.getmtime(item.value)) + lk
                     except OSError:
-                        item.cache_key = (item.value, 0, page_mode)
+                        item.cache_key = (item.value, 0) + lk
                 else:
-                    item.cache_key = (item.value, page_mode)
+                    item.cache_key = (item.value,) + lk
                 item.render_status = "ready"
                 self._on_event(("item_rendered", item.uid))
             except Exception as e:
@@ -3111,22 +3230,27 @@ class RenderWorker:
                 self._on_event(("item_render_failed", item.uid, str(e)))
 
     @staticmethod
-    def _render(item, page_mode):
+    def _render(item, layout):
         """Convert one Item to PDF bytes. Mirrors what _build_worker does
-        at Create-PDF time so the cache is byte-equivalent."""
+        at Create-PDF time so the cache is byte-equivalent. (2-up imposition
+        is applied later, on the assembled document, not here.)"""
+        # Under 2-up, render each item at its NATIVE size; the side-by-side
+        # placement onto the big sheet happens at assembly time.
+        if layout.nup == 2:
+            layout = layout._replace(size="original", nup=1)
         if item.kind == "url":
-            return url_to_pdf_bytes(item.value, page_mode).getvalue()
+            return url_to_pdf_bytes(item.value, layout).getvalue()
         kind = file_kind(item.value)
         if kind == "image":
-            return image_to_pdf_bytes(item.value, page_mode).getvalue()
+            return image_to_pdf_bytes(item.value, layout).getvalue()
         if kind == "pdf":
             with open(item.value, "rb") as fh:
-                return _normalize_pdf_to_pagesize(fh.read(), page_mode)
+                return _impose_doc(fh.read(), layout)
         if kind == "text":
-            return text_to_pdf_bytes(item.value, page_mode).getvalue()
+            return text_to_pdf_bytes(item.value, layout).getvalue()
         if kind == "office":
-            return _normalize_pdf_to_pagesize(
-                office_to_pdf_bytes(item.value).getvalue(), page_mode)
+            return _impose_doc(
+                office_to_pdf_bytes(item.value).getvalue(), layout)
         raise ValueError(f"Unsupported file kind: {item.value}")
 
 
@@ -5318,6 +5442,17 @@ class PreviewTab:
         zoom_box.pack(side="left")
         zoom_box.bind("<<ComboboxSelected>>", lambda e: self._on_zoom_changed())
 
+        # Content orientation: how the original document sits on the sheet
+        # (separate from the paper orientation set on the Pages tab). Auto
+        # rotates each page to best match the sheet.
+        ttk.Label(bar, text="Content:").pack(side="left", padx=(20, 4))
+        for _txt, _val in (("Auto", "auto"), ("Portrait", "portrait"),
+                           ("Landscape", "landscape")):
+            ttk.Radiobutton(bar, text=_txt, value=_val,
+                            variable=self.app.content_var,
+                            command=self.app._on_page_mode_changed
+                            ).pack(side="left")
+
         ttk.Button(bar, text="↻ Refresh", command=self.refresh_preview
                    ).pack(side="right")
         # Restore hidden pages — only meaningful once the user has hidden at
@@ -5464,12 +5599,15 @@ class PreviewTab:
             self._update_restore_button()
             return
 
-        # Materialise to bytes, hand to pypdfium2 for rendering.
+        # Materialise to bytes, hand to pypdfium2 for rendering. Under 2-up the
+        # assembled native pages are paired onto the big landscape sheet so the
+        # preview shows the actual imposed result.
         buf = io.BytesIO()
         writer.write(buf)
+        combined_bytes = _apply_nup(buf.getvalue(), self.app._current_layout())
         self._teardown_pdf()
         try:
-            self._combined_pdf = pdfium.PdfDocument(buf.getvalue())
+            self._combined_pdf = pdfium.PdfDocument(combined_bytes)
             self._page_count = len(self._combined_pdf)
         except Exception as e:
             self._set_placeholder(f"Couldn't open combined PDF: {e}")
@@ -5694,15 +5832,19 @@ class PreviewTab:
             self.canvas.create_image(x, y, anchor="nw", image=photo)
             # v1.45: a "✕ Remove page" button floating at the page's top-right.
             # Clicking it hides just this page from the output (and preview).
-            rm_btn = tk.Button(
-                self.canvas, text="✕ Remove page",
-                font=("", 8), fg="#a30000", cursor="hand2",
-                relief="raised", bd=1, padx=4, pady=0,
-                command=lambda i=idx: self._remove_page(i),
-            )
-            self.canvas.create_window(
-                x + pil.width - 4, y + 4, anchor="ne", window=rm_btn,
-            )
+            # Skipped under 2-up: a displayed sheet holds two source pages, so
+            # there's no 1:1 page→source mapping to remove. (Turn 2-up off to
+            # remove individual pages, then re-enable.)
+            if not (hasattr(self.app, "nup_var") and self.app.nup_var.get()):
+                rm_btn = tk.Button(
+                    self.canvas, text="✕ Remove page",
+                    font=("", 8), fg="#a30000", cursor="hand2",
+                    relief="raised", bd=1, padx=4, pady=0,
+                    command=lambda i=idx: self._remove_page(i),
+                )
+                self.canvas.create_window(
+                    x + pil.width - 4, y + 4, anchor="ne", window=rm_btn,
+                )
             self._page_btn_widgets.append(rm_btn)
             # Page number label below each page so users can see where they are.
             label_y = y + pil.height + 4
@@ -5937,8 +6079,14 @@ class App:
                 w = max(1, round(src.width * target_h / src.height))
                 self._brand_logo_ref = _ImageTk.PhotoImage(
                     src.resize((w, target_h), LANCZOS))
-                ttk.Label(controls, image=self._brand_logo_ref).pack(
-                    side="right", anchor="se", padx=(8, 14), pady=(2, 8))
+                logo_lbl = ttk.Label(controls, image=self._brand_logo_ref,
+                                     cursor="hand2")
+                logo_lbl.pack(side="right", anchor="se", padx=(8, 14),
+                              pady=(2, 8))
+                logo_lbl.bind(
+                    "<Button-1>",
+                    lambda _e: webbrowser.open(WEBSITE_URL))
+                Tooltip(logo_lbl, "Visit mydocmaker.com")
             except Exception:
                 self._brand_logo_ref = None
 
@@ -5985,6 +6133,29 @@ class App:
                         variable=self.size_var,
                         command=self._on_page_mode_changed
                         ).pack(side="left", padx=4)
+
+        # --- Paper orientation + 2-up coupler -----------------------------
+        # orient_var = the output SHEET orientation. content_var (set here so
+        # it always exists; its radios live in the Preview tab) = how the
+        # original content sits on the sheet. nup_var = the coupler.
+        self.content_var = tk.StringVar(value="auto")
+        orient_row = ttk.Frame(left)
+        orient_row.pack(fill="x", **pad)
+        ttk.Label(orient_row, text="Orientation:").pack(side="left")
+        self.orient_var = tk.StringVar(value="portrait")
+        ttk.Radiobutton(orient_row, text="Portrait", value="portrait",
+                        variable=self.orient_var,
+                        command=self._on_page_mode_changed
+                        ).pack(side="left", padx=4)
+        ttk.Radiobutton(orient_row, text="Landscape", value="landscape",
+                        variable=self.orient_var,
+                        command=self._on_page_mode_changed
+                        ).pack(side="left", padx=4)
+        self.nup_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            orient_row, text="2-up (2 pages per sheet)",
+            variable=self.nup_var, command=self._on_nup_changed,
+        ).pack(side="left", padx=(16, 0))
 
         # Flatten option — rasterizes pages into JPEG to shrink the output.
         # Disabled if pypdfium2 isn't available (e.g. dev environment missing
@@ -6137,7 +6308,7 @@ class App:
         # URL captures) from spawning more than two instances at once.
         self._render_worker = RenderWorker(
             on_event=lambda msg: self.work_queue.put(msg),
-            page_mode_fn=lambda: self.size_var.get(),
+            layout_fn=self._current_layout,
             concurrency=2,
         )
 
@@ -6179,16 +6350,39 @@ class App:
         if current == "Preview" and hasattr(self, "preview"):
             self.preview.refresh_preview()
 
+    def _current_layout(self):
+        """Snapshot the page-layout controls into a PageLayout. Defensive so
+        it works even if called before every widget exists."""
+        return PageLayout(
+            self.size_var.get() if hasattr(self, "size_var") else "original",
+            self.orient_var.get() if hasattr(self, "orient_var") else "portrait",
+            self.content_var.get() if hasattr(self, "content_var") else "auto",
+            2 if (hasattr(self, "nup_var") and self.nup_var.get()) else 1,
+        )
+
     def _on_page_mode_changed(self):
-        """User toggled Original / A4 / Letter. Existing cached renders
-        used the OLD page mode and are now stale — drop them and re-queue
-        everything. Visible pre-rendered state in the listbox flips back
-        to '⏳ rendering' for each item."""
+        """A page-layout control changed (size / paper orientation / content
+        orientation). Cached per-item renders used the OLD layout and are now
+        stale — drop them and re-queue everything; the listbox flips back to
+        '⏳ rendering' for each item."""
         for it in self.items:
             self._render_worker.reset_cache(it)
             self._render_worker.enqueue(it)
         self._refresh()  # update status glyphs
         if hasattr(self, "preview"):
+            self.preview.invalidate()
+
+    def _on_nup_changed(self):
+        """2-up toggle. Turning it on auto-selects the matching big landscape
+        sheet (Letter⇒11×17, A4⇒A3) so two pages pair up cleanly; that change
+        re-renders items. Turning it off just refreshes the preview (the
+        per-item renders don't depend on 2-up)."""
+        if self.nup_var.get():
+            big = {"a4": "a3", "a3": "a3"}.get(self.size_var.get(), "tabloid")
+            self.size_var.set(big)
+            self.orient_var.set("landscape")
+            self._on_page_mode_changed()
+        elif hasattr(self, "preview"):
             self.preview.invalidate()
 
     def _restore_session(self):
@@ -7283,8 +7477,7 @@ class App:
                 else:
                     # Fall back to live render if cache missed (e.g. user
                     # hits Sign before RenderWorker finished an item).
-                    page_mode = self.size_var.get()
-                    data = RenderWorker._render(it, page_mode)
+                    data = RenderWorker._render(it, self._current_layout())
                     reader = PdfReader(io.BytesIO(data))
                 # Honour pages hidden in the Preview tab so the signed PDF
                 # matches what the user sees / what Create PDF would produce.
@@ -7299,7 +7492,8 @@ class App:
                 return
             staged = io.BytesIO()
             writer.write(staged)
-            self.work_queue.put(("ready_for_signing", staged.getvalue()))
+            final = _apply_nup(staged.getvalue(), self._current_layout())
+            self.work_queue.put(("ready_for_signing", final))
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
 
@@ -7343,13 +7537,13 @@ class App:
         self._set_busy(True)
         self.status.config(text="Working… (capturing webpages can take a few seconds)")
         self.progress.config(maximum=100, value=0)
-        page_mode = self.size_var.get()
+        layout = self._current_layout()
         flatten = bool(self.flatten_var.get() and FLATTEN_OK)
         items_snapshot = list(self.items)
         excluded_snapshot = set(self.excluded_pages)
         threading.Thread(
             target=self._build_worker,
-            args=(items_snapshot, page_mode, out_path, flatten, action,
+            args=(items_snapshot, layout, out_path, flatten, action,
                   excluded_snapshot),
             daemon=True,
         ).start()
@@ -7359,28 +7553,30 @@ class App:
         for btn in (self.create_btn, self.create_open_btn, self.create_print_btn):
             btn.config(state=state)
 
-    def _build_worker(self, items, page_mode, out_path, flatten=False,
+    def _build_worker(self, items, layout, out_path, flatten=False,
                       action="none", excluded=None):
         excluded = excluded or set()
+        # Under 2-up, render each item at native size; the 2-up pass below
+        # pairs them onto the big sheet.
+        rl = layout._replace(size="original", nup=1) if layout.nup == 2 else layout
         writer = PdfWriter()
         skipped = []
         for it in items:
             try:
                 if it.kind == "url":
-                    buf = url_to_pdf_bytes(it.value, page_mode)
+                    buf = url_to_pdf_bytes(it.value, rl)
                 else:
                     kind = file_kind(it.value)
                     if kind == "image":
-                        buf = image_to_pdf_bytes(it.value, page_mode)
+                        buf = image_to_pdf_bytes(it.value, rl)
                     elif kind == "pdf":
                         with open(it.value, "rb") as fh:
-                            buf = io.BytesIO(
-                                _normalize_pdf_to_pagesize(fh.read(), page_mode))
+                            buf = io.BytesIO(_impose_doc(fh.read(), rl))
                     elif kind == "text":
-                        buf = text_to_pdf_bytes(it.value, page_mode)
+                        buf = text_to_pdf_bytes(it.value, rl)
                     elif kind == "office":
-                        buf = io.BytesIO(_normalize_pdf_to_pagesize(
-                            office_to_pdf_bytes(it.value).getvalue(), page_mode))
+                        buf = io.BytesIO(_impose_doc(
+                            office_to_pdf_bytes(it.value).getvalue(), rl))
                     else:
                         skipped.append(f"{it.label} (unsupported)")
                         continue
@@ -7405,7 +7601,8 @@ class App:
         except Exception as e:
             self.work_queue.put(("error", f"Could not assemble PDF: {e}"))
             return
-        orig_bytes = staged.getvalue()
+        # Coupler: pair pages two-per-sheet onto the big landscape sheet.
+        orig_bytes = _apply_nup(staged.getvalue(), layout)
         out_data = orig_bytes
         flatten_note = ""
         if flatten:

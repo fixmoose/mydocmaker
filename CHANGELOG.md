@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.50
+- **Page orientation (Portrait / Landscape)** for the output sheet, next to
+  Page size. Flows through every input type (images, text, webpages via
+  Playwright's landscape flag, and centered documents).
+- **Document/content orientation** — a separate "Content: Auto / Portrait /
+  Landscape" control in the Preview tab that rotates the *original* on the
+  sheet (independent of the paper). "Auto" rotates each page to best match the
+  sheet's orientation.
+- **2-up coupler** — "2-up (2 pages per sheet)" places two pages side-by-side
+  on one sheet. Turning it on auto-selects the matching big landscape sheet
+  (Letter⇒11×17, A4⇒A3), so two Letter pages land at full size on one 11×17
+  landscape sheet (exact fit, no scaling). Works in the live preview, Create
+  PDF, and Sign & Create. (Per-page Remove is paused while 2-up is on, since a
+  sheet then holds two source pages.)
+- The brand logo in the window now opens mydocmaker.com.
+
 ## v1.49
 - **A3 and 11×17 (Tabloid) page sizes** added alongside Original / A4 /
   Letter — useful for plan sets and large drawings (e.g. signing a permit
