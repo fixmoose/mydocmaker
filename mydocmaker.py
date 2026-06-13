@@ -102,12 +102,23 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.54"
+APP_VERSION = "1.55"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.55": [
+        "New Style tab — dress up the whole document. Add a watermark (one-click "
+        "DRAFT / CONFIDENTIAL / INTERNAL / COPY presets, your own text, or a "
+        "logo/image), page numbers, header/footer text, and Bates numbering "
+        "(sequential legal-style IDs). Everything shows live in the Preview.",
+        "Cover sheet — prepend a cover to any document. Choose your own PDF/image "
+        "file, auto-generate one from a title/subtitle/date/prepared-by, or "
+        "build it from a saved signature (company name, logo, address). The "
+        "cover is always Letter or A4, even when the rest of the document is a "
+        "different size.",
+    ],
     "1.54": [
         "The Order tab now sits after Preview (Pages · Preview · Order), and it "
         "stays in sync with the Preview — hide or restore a page in the "
@@ -988,6 +999,339 @@ def _impose_doc(pdf_bytes, layout):
         return out.getvalue()
     except Exception:
         return pdf_bytes
+
+
+# ---------------------------------------------------------------------------
+# Style pipeline (v1.55): watermark, page numbers, header/footer, Bates, and
+# a cover sheet. All run as POST-processing on the already-assembled document
+# (after 2-up imposition), so they apply to the final page geometry. A single
+# StyleSettings carries every option; apply_style() is the one entry point the
+# preview / Create PDF / Sign flows all call so the three stay identical.
+# ---------------------------------------------------------------------------
+WATERMARK_PRESETS = ("DRAFT", "CONFIDENTIAL", "INTERNAL", "COPY")
+
+
+def _safe_int(value, default=0):
+    """Parse an int from a string/spinbox value, falling back to default."""
+    try:
+        return int(str(value).strip())
+    except (ValueError, TypeError):
+        return default
+
+
+class StyleSettings:
+    """All Style-tab options in one carrier. Defaults = everything off, so a
+    fresh document is untouched and apply_style() is a no-op."""
+    __slots__ = (
+        "wm_text", "wm_image_bytes", "wm_opacity",
+        "page_numbers", "pn_format", "pn_position",
+        "header_text", "footer_text",
+        "bates_on", "bates_prefix", "bates_start", "bates_digits",
+        "cover_mode", "cover_file", "cover_size",
+        "cover_title", "cover_subtitle", "cover_date", "cover_by",
+        "cover_sig_id",
+    )
+
+    def __init__(self):
+        # Watermark
+        self.wm_text = ""            # preset or custom; "" = no text watermark
+        self.wm_image_bytes = None   # raw image bytes; None = no image watermark
+        self.wm_opacity = 0.12       # 0..1
+        # Page numbers
+        self.page_numbers = False
+        self.pn_format = "Page {n} of {total}"
+        self.pn_position = "bottom-center"
+        # Header / footer running text
+        self.header_text = ""
+        self.footer_text = ""
+        # Bates numbering
+        self.bates_on = False
+        self.bates_prefix = ""
+        self.bates_start = 1
+        self.bates_digits = 6
+        # Cover sheet
+        self.cover_mode = "none"     # none | file | auto | signature
+        self.cover_file = ""
+        self.cover_size = "letter"   # letter | a4  (always one of these)
+        self.cover_title = ""
+        self.cover_subtitle = ""
+        self.cover_date = ""
+        self.cover_by = ""
+        self.cover_sig_id = ""
+
+    def is_active(self):
+        return bool(
+            self.wm_text or self.wm_image_bytes or self.page_numbers
+            or self.header_text or self.footer_text or self.bates_on
+            or self.cover_mode != "none"
+        )
+
+
+DEFAULT_STYLE = StyleSettings()
+
+
+def _draw_text_watermark(c, w, h, text, opacity):
+    """Diagonal gray text watermark centered on a (w×h) reportlab canvas."""
+    c.saveState()
+    try:
+        c.setFillAlpha(opacity)
+    except Exception:
+        pass
+    c.setFillGray(0.25)
+    # Size the font to roughly span the page diagonal.
+    import math
+    diag = math.hypot(w, h)
+    font = "Helvetica-Bold"
+    size = max(24, min(160, diag / max(6, len(text)) * 1.6))
+    c.translate(w / 2.0, h / 2.0)
+    c.rotate(45)
+    c.setFont(font, size)
+    c.drawCentredString(0, -size * 0.35, text)
+    c.restoreState()
+
+
+def _draw_image_watermark(c, w, h, image_bytes, opacity):
+    """Centered, semi-transparent image watermark covering ~60% of the page."""
+    try:
+        img = Image.open(io.BytesIO(image_bytes)).convert("RGBA")
+    except Exception:
+        return
+    bb = img.getbbox()
+    if bb:
+        img = img.crop(bb)
+    iw, ih = img.size
+    if iw <= 0 or ih <= 0:
+        return
+    target = min(w, h) * 0.6
+    scale = min(target / iw, target / ih)
+    dw, dh = iw * scale, ih * scale
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    buf.seek(0)
+    c.saveState()
+    try:
+        c.setFillAlpha(opacity)
+    except Exception:
+        pass
+    c.drawImage(ImageReader(buf), (w - dw) / 2.0, (h - dh) / 2.0,
+                width=dw, height=dh, mask="auto", preserveAspectRatio=True)
+    c.restoreState()
+
+
+def _pn_xy(position, w, h, margin=28):
+    """(x, y, anchor) for a page-number / footer string at one of the named
+    positions. anchor is 'l'|'c'|'r' for left/center/right alignment."""
+    bottom = position.startswith("bottom")
+    y = margin if bottom else h - margin
+    if position.endswith("left"):
+        return margin, y, "l"
+    if position.endswith("right"):
+        return w - margin, y, "r"
+    return w / 2.0, y, "c"
+
+
+def _draw_string(c, x, y, text, anchor, size=9, font="Helvetica"):
+    c.setFont(font, size)
+    c.setFillGray(0.2)
+    if anchor == "l":
+        c.drawString(x, y, text)
+    elif anchor == "r":
+        c.drawRightString(x, y, text)
+    else:
+        c.drawCentredString(x, y, text)
+
+
+def _apply_marks(pdf_bytes, style):
+    """Overlay watermark + page numbers + header/footer + Bates onto every
+    page of pdf_bytes (which is already the assembled content). The cover
+    sheet is handled separately (and stays unmarked)."""
+    want = (style.wm_text or style.wm_image_bytes or style.page_numbers
+            or style.header_text or style.footer_text or style.bates_on)
+    if not want:
+        return pdf_bytes
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return pdf_bytes
+    pages = reader.pages
+    total = len(pages)
+    writer = PdfWriter()
+    for i, page in enumerate(pages):
+        w = float(page.mediabox.width)
+        h = float(page.mediabox.height)
+        buf = io.BytesIO()
+        c = canvas.Canvas(buf, pagesize=(w, h))
+        if style.wm_text:
+            _draw_text_watermark(c, w, h, style.wm_text, style.wm_opacity)
+        if style.wm_image_bytes:
+            _draw_image_watermark(c, w, h, style.wm_image_bytes,
+                                  style.wm_opacity)
+        if style.header_text:
+            x, y, a = _pn_xy("top-center", w, h)
+            _draw_string(c, x, y, style.header_text, a)
+        if style.footer_text:
+            x, y, a = _pn_xy("bottom-left", w, h)
+            _draw_string(c, x, y, style.footer_text, a)
+        if style.page_numbers:
+            txt = style.pn_format.replace("{n}", str(i + 1)).replace(
+                "{total}", str(total))
+            x, y, a = _pn_xy(style.pn_position, w, h)
+            _draw_string(c, x, y, txt, a)
+        if style.bates_on:
+            num = style.bates_start + i
+            label = f"{style.bates_prefix}{num:0{style.bates_digits}d}"
+            x, y, a = _pn_xy("bottom-right", w, h)
+            _draw_string(c, x, y, label, a, size=8)
+        c.showPage()
+        c.save()
+        try:
+            overlay = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+            page.merge_page(overlay)
+        except Exception:
+            pass
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+def _cover_sheet_pdf(style, app=None):
+    """Build the cover sheet as PDF bytes sized to style.cover_size (always
+    Letter or A4, independent of the document). Returns b"" if no cover."""
+    if style.cover_mode == "none":
+        return b""
+    W, H = _PAGE_SIZES.get(style.cover_size, letter)
+
+    if style.cover_mode == "file":
+        path = style.cover_file
+        if not path or not os.path.exists(path):
+            return b""
+        try:
+            kind = file_kind(path)
+            if kind == "image":
+                raw = image_to_pdf_bytes(
+                    path, PageLayout(style.cover_size, "portrait",
+                                     "auto", 1, "side")).getvalue()
+            elif kind == "pdf":
+                with open(path, "rb") as fh:
+                    raw = fh.read()
+            else:
+                return b""
+            # Keep only the first page, normalized onto the cover sheet.
+            reader = PdfReader(io.BytesIO(raw))
+            first = PdfWriter()
+            first.add_page(reader.pages[0])
+            b = io.BytesIO()
+            first.write(b)
+            return _impose_doc(
+                b.getvalue(),
+                PageLayout(style.cover_size, "portrait", "auto", 1, "side"))
+        except Exception:
+            return b""
+
+    # auto / signature → render a styled cover with reportlab.
+    title = style.cover_title
+    subtitle = style.cover_subtitle
+    by = style.cover_by
+    date = style.cover_date
+    logo_bytes = None
+    if style.cover_mode == "signature" and app is not None:
+        meta = None
+        for s in list_signatures():
+            if s.get("id") == style.cover_sig_id:
+                meta = s
+                break
+        if meta is None:
+            sigs = list_signatures()
+            meta = sigs[0] if sigs else {}
+        title = title or meta.get("company") or meta.get("name") or "Document"
+        subtitle = subtitle or meta.get("address") or ""
+        by = by or meta.get("name") or ""
+        lp = meta.get("logo_png") or ""
+        if lp:
+            try:
+                logo_bytes = base64.b64decode(lp)
+            except Exception:
+                logo_bytes = None
+
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf, pagesize=(W, H))
+    cx = W / 2.0
+    y = H * 0.72
+    if logo_bytes:
+        try:
+            lim = Image.open(io.BytesIO(logo_bytes)).convert("RGBA")
+            bb = lim.getbbox()
+            if bb:
+                lim = lim.crop(bb)
+            lw, lh = lim.size
+            tw = min(W * 0.5, 260)
+            sc = min(tw / lw, 120.0 / lh)
+            lb = io.BytesIO(); lim.save(lb, format="PNG"); lb.seek(0)
+            c.drawImage(ImageReader(lb), cx - lw * sc / 2.0, y,
+                        width=lw * sc, height=lh * sc, mask="auto")
+            y -= 36
+        except Exception:
+            pass
+    c.setFillGray(0.1)
+    c.setFont("Helvetica-Bold", 28)
+    for line in _wrap_text(title or "Document", 28, W * 0.8, "Helvetica-Bold"):
+        c.drawCentredString(cx, y, line); y -= 34
+    if subtitle:
+        c.setFont("Helvetica", 14); c.setFillGray(0.3)
+        for line in _wrap_text(subtitle, 14, W * 0.8, "Helvetica"):
+            c.drawCentredString(cx, y, line); y -= 20
+    y -= 30
+    c.setFont("Helvetica", 12); c.setFillGray(0.35)
+    if by:
+        c.drawCentredString(cx, y, f"Prepared by: {by}"); y -= 18
+    if date:
+        c.drawCentredString(cx, y, date); y -= 18
+    # A thin rule under the title block.
+    c.setStrokeGray(0.7)
+    c.line(W * 0.2, H * 0.66, W * 0.8, H * 0.66)
+    c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+def _wrap_text(text, font_size, max_w, font="Helvetica"):
+    """Greedy word-wrap using reportlab's string metrics."""
+    from reportlab.pdfbase.pdfmetrics import stringWidth
+    words = str(text).split()
+    if not words:
+        return [""]
+    lines, cur = [], words[0]
+    for word in words[1:]:
+        trial = cur + " " + word
+        if stringWidth(trial, font, font_size) <= max_w:
+            cur = trial
+        else:
+            lines.append(cur); cur = word
+    lines.append(cur)
+    return lines
+
+
+def apply_style(pdf_bytes, style, app=None):
+    """Single entry point: stamp marks onto the content, then prepend the
+    cover sheet (which stays unmarked). No-op when style is inactive."""
+    if style is None or not style.is_active():
+        return pdf_bytes
+    marked = _apply_marks(pdf_bytes, style)
+    cover = _cover_sheet_pdf(style, app)
+    if cover:
+        try:
+            writer = PdfWriter()
+            for pg in PdfReader(io.BytesIO(cover)).pages:
+                writer.add_page(pg)
+            for pg in PdfReader(io.BytesIO(marked)).pages:
+                writer.add_page(pg)
+            out = io.BytesIO()
+            writer.write(out)
+            return out.getvalue()
+        except Exception:
+            return marked
+    return marked
 
 
 def _open_with_default_viewer(path):
@@ -5663,6 +6007,7 @@ class PreviewTab:
         buf = io.BytesIO()
         writer.write(buf)
         combined_bytes = _apply_nup(buf.getvalue(), self.app._current_layout())
+        combined_bytes = apply_style(combined_bytes, self.app.style, self.app)
         self._teardown_pdf()
         try:
             self._combined_pdf = pdfium.PdfDocument(combined_bytes)
@@ -6337,6 +6682,299 @@ class OrderTab:
 
 
 # ---------------------------------------------------------------------------
+# StyleTab (v1.55): watermark, page numbers, header/footer, Bates, cover sheet.
+#   Every control writes straight into App.style (a StyleSettings) and triggers
+#   a debounced Preview refresh, so the Preview tab is the live WYSIWYG view.
+# ---------------------------------------------------------------------------
+class StyleTab:
+    def __init__(self, parent, app):
+        self.app = app
+        self.frame = parent
+        self._refresh_after = None
+        self._sig_ids = []        # parallel to the signature combo entries
+
+        # Scrollable body (many controls won't fit at once).
+        outer = ttk.Frame(parent)
+        outer.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(outer, highlightthickness=0)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(outer, orient="vertical", command=self.canvas.yview)
+        sb.pack(side="left", fill="y")
+        self.canvas.config(yscrollcommand=sb.set)
+        body = ttk.Frame(self.canvas)
+        self._body_id = self.canvas.create_window((0, 0), window=body,
+                                                  anchor="nw")
+        body.bind("<Configure>", lambda _e: self.canvas.config(
+            scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>", lambda e: self.canvas.itemconfig(
+            self._body_id, width=e.width))
+        self.canvas.bind("<Enter>", lambda _e: self.canvas.bind_all(
+            "<MouseWheel>", self._wheel))
+        self.canvas.bind("<Leave>", lambda _e: self.canvas.unbind_all(
+            "<MouseWheel>"))
+
+        st = app.style
+        pad = {"padx": 10, "pady": (2, 2)}
+
+        # ===== Watermark ==================================================
+        wm = ttk.LabelFrame(body, text="Watermark")
+        wm.pack(fill="x", padx=10, pady=(10, 6))
+        self.wm_text = tk.StringVar(value=st.wm_text)
+        preset_row = ttk.Frame(wm); preset_row.pack(fill="x", **pad)
+        ttk.Label(preset_row, text="Preset:").pack(side="left")
+        for name in WATERMARK_PRESETS:
+            ttk.Button(preset_row, text=name, width=11,
+                       command=lambda n=name: self._set_wm_text(n)
+                       ).pack(side="left", padx=2)
+        ttk.Button(preset_row, text="None", width=6,
+                   command=lambda: self._set_wm_text("")).pack(side="left", padx=2)
+        custom_row = ttk.Frame(wm); custom_row.pack(fill="x", **pad)
+        ttk.Label(custom_row, text="Custom text:").pack(side="left")
+        e = ttk.Entry(custom_row, textvariable=self.wm_text)
+        e.pack(side="left", fill="x", expand=True, padx=6)
+        e.bind("<KeyRelease>", lambda _e: self._schedule())
+        img_row = ttk.Frame(wm); img_row.pack(fill="x", **pad)
+        ttk.Button(img_row, text="Image/logo…",
+                   command=self._choose_wm_image).pack(side="left")
+        self.wm_img_lbl = ttk.Label(img_row, text="(none)", foreground="#666")
+        self.wm_img_lbl.pack(side="left", padx=6)
+        ttk.Button(img_row, text="Clear image",
+                   command=self._clear_wm_image).pack(side="left")
+        op_row = ttk.Frame(wm); op_row.pack(fill="x", **pad)
+        ttk.Label(op_row, text="Opacity:").pack(side="left")
+        self.wm_op = tk.DoubleVar(value=st.wm_opacity)
+        ttk.Scale(op_row, from_=0.03, to=0.6, variable=self.wm_op,
+                  command=lambda _v: self._schedule()).pack(
+            side="left", fill="x", expand=True, padx=6)
+
+        # ===== Page numbers ===============================================
+        pn = ttk.LabelFrame(body, text="Page numbers")
+        pn.pack(fill="x", padx=10, pady=6)
+        self.pn_on = tk.BooleanVar(value=st.page_numbers)
+        ttk.Checkbutton(pn, text="Add page numbers", variable=self.pn_on,
+                        command=self._sync_now).pack(anchor="w", **pad)
+        pr = ttk.Frame(pn); pr.pack(fill="x", **pad)
+        ttk.Label(pr, text="Format:").pack(side="left")
+        self.pn_fmt = tk.StringVar(value=st.pn_format)
+        fe = ttk.Entry(pr, textvariable=self.pn_fmt, width=22)
+        fe.pack(side="left", padx=6)
+        fe.bind("<KeyRelease>", lambda _e: self._schedule())
+        ttk.Label(pr, text="{n} = page, {total} = count",
+                  foreground="#888").pack(side="left")
+        ttk.Label(pr, text="Position:").pack(side="left", padx=(12, 2))
+        self.pn_pos = tk.StringVar(value=st.pn_position)
+        ttk.Combobox(pr, textvariable=self.pn_pos, width=14, state="readonly",
+                     values=("bottom-center", "bottom-left", "bottom-right",
+                             "top-center", "top-left", "top-right")
+                     ).pack(side="left")
+        self.pn_pos.trace_add("write", lambda *_: self._sync_now())
+
+        # ===== Header / footer ============================================
+        hf = ttk.LabelFrame(body, text="Header / footer text")
+        hf.pack(fill="x", padx=10, pady=6)
+        hr = ttk.Frame(hf); hr.pack(fill="x", **pad)
+        ttk.Label(hr, text="Header:", width=8).pack(side="left")
+        self.header = tk.StringVar(value=st.header_text)
+        he = ttk.Entry(hr, textvariable=self.header)
+        he.pack(side="left", fill="x", expand=True, padx=6)
+        he.bind("<KeyRelease>", lambda _e: self._schedule())
+        fr = ttk.Frame(hf); fr.pack(fill="x", **pad)
+        ttk.Label(fr, text="Footer:", width=8).pack(side="left")
+        self.footer = tk.StringVar(value=st.footer_text)
+        fe2 = ttk.Entry(fr, textvariable=self.footer)
+        fe2.pack(side="left", fill="x", expand=True, padx=6)
+        fe2.bind("<KeyRelease>", lambda _e: self._schedule())
+
+        # ===== Bates numbering ============================================
+        bt = ttk.LabelFrame(body, text="Bates numbering")
+        bt.pack(fill="x", padx=10, pady=6)
+        self.bates_on = tk.BooleanVar(value=st.bates_on)
+        ttk.Checkbutton(bt, text="Add Bates numbers (sequential, bottom-right)",
+                        variable=self.bates_on,
+                        command=self._sync_now).pack(anchor="w", **pad)
+        br = ttk.Frame(bt); br.pack(fill="x", **pad)
+        ttk.Label(br, text="Prefix:").pack(side="left")
+        self.bates_prefix = tk.StringVar(value=st.bates_prefix)
+        be = ttk.Entry(br, textvariable=self.bates_prefix, width=12)
+        be.pack(side="left", padx=6)
+        be.bind("<KeyRelease>", lambda _e: self._schedule())
+        ttk.Label(br, text="Start #:").pack(side="left", padx=(8, 2))
+        self.bates_start = tk.StringVar(value=str(st.bates_start))
+        ttk.Spinbox(br, from_=0, to=999999, width=8, textvariable=self.bates_start,
+                    command=self._sync_now).pack(side="left")
+        ttk.Label(br, text="Digits:").pack(side="left", padx=(8, 2))
+        self.bates_digits = tk.StringVar(value=str(st.bates_digits))
+        ttk.Spinbox(br, from_=1, to=10, width=5, textvariable=self.bates_digits,
+                    command=self._sync_now).pack(side="left")
+
+        # ===== Cover sheet ================================================
+        cv = ttk.LabelFrame(body, text="Cover sheet")
+        cv.pack(fill="x", padx=10, pady=6)
+        self.cover_mode = tk.StringVar(value=st.cover_mode)
+        mr = ttk.Frame(cv); mr.pack(fill="x", **pad)
+        for txt, val in (("None", "none"), ("From file", "file"),
+                         ("Auto-generate", "auto"), ("From signature", "signature")):
+            ttk.Radiobutton(mr, text=txt, value=val, variable=self.cover_mode,
+                            command=self._on_cover_mode).pack(side="left", padx=4)
+        ttk.Label(mr, text="Size:").pack(side="left", padx=(12, 2))
+        self.cover_size = tk.StringVar(value=st.cover_size)
+        for txt, val in (("Letter", "letter"), ("A4", "a4")):
+            ttk.Radiobutton(mr, text=txt, value=val, variable=self.cover_size,
+                            command=self._sync_now).pack(side="left")
+        # File row
+        self.cover_file_row = ttk.Frame(cv)
+        ttk.Button(self.cover_file_row, text="Choose file…",
+                   command=self._choose_cover_file).pack(side="left")
+        self.cover_file_lbl = ttk.Label(self.cover_file_row, text="(none)",
+                                        foreground="#666")
+        self.cover_file_lbl.pack(side="left", padx=6)
+        # Fields row (auto / signature)
+        self.cover_fields = ttk.Frame(cv)
+        self.cover_title = tk.StringVar(value=st.cover_title)
+        self.cover_subtitle = tk.StringVar(value=st.cover_subtitle)
+        self.cover_by = tk.StringVar(value=st.cover_by)
+        self.cover_date = tk.StringVar(value=st.cover_date)
+        for label, var in (("Title:", self.cover_title),
+                           ("Subtitle:", self.cover_subtitle),
+                           ("Prepared by:", self.cover_by),
+                           ("Date:", self.cover_date)):
+            row = ttk.Frame(self.cover_fields); row.pack(fill="x", pady=1)
+            ttk.Label(row, text=label, width=11).pack(side="left")
+            ent = ttk.Entry(row, textvariable=var)
+            ent.pack(side="left", fill="x", expand=True, padx=6)
+            ent.bind("<KeyRelease>", lambda _e: self._schedule())
+        # Signature picker (signature mode)
+        self.cover_sig_row = ttk.Frame(cv)
+        ttk.Label(self.cover_sig_row, text="Use signature:").pack(side="left")
+        self.cover_sig = tk.StringVar()
+        self.cover_sig_combo = ttk.Combobox(
+            self.cover_sig_row, textvariable=self.cover_sig, width=32,
+            state="readonly")
+        self.cover_sig_combo.pack(side="left", padx=6)
+        self.cover_sig_combo.bind("<<ComboboxSelected>>",
+                                  lambda _e: self._sync_now())
+
+        self._refresh_image_label()
+        self._refresh_cover_file_label()
+        self._on_cover_mode()   # show/hide the right sub-rows
+
+    # ---- helpers ----------------------------------------------------------
+    def _wheel(self, event):
+        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def _set_wm_text(self, text):
+        self.wm_text.set(text)
+        self._sync_now()
+
+    def _choose_wm_image(self):
+        path = filedialog.askopenfilename(
+            title="Choose watermark image",
+            filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.gif *.bmp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        try:
+            with open(path, "rb") as fh:
+                self.app.style.wm_image_bytes = fh.read()
+        except OSError:
+            return
+        self._refresh_image_label()
+        self._sync_now()
+
+    def _clear_wm_image(self):
+        self.app.style.wm_image_bytes = None
+        self._refresh_image_label()
+        self._sync_now()
+
+    def _refresh_image_label(self):
+        has = self.app.style.wm_image_bytes is not None
+        self.wm_img_lbl.config(text="image set" if has else "(none)")
+
+    def _choose_cover_file(self):
+        path = filedialog.askopenfilename(
+            title="Choose cover file (PDF or image)",
+            filetypes=[("PDF / image", "*.pdf *.png *.jpg *.jpeg *.webp"),
+                       ("All files", "*.*")])
+        if not path:
+            return
+        self.app.style.cover_file = path
+        self._refresh_cover_file_label()
+        self._sync_now()
+
+    def _refresh_cover_file_label(self):
+        p = self.app.style.cover_file
+        self.cover_file_lbl.config(text=os.path.basename(p) if p else "(none)")
+
+    def _on_cover_mode(self):
+        mode = self.cover_mode.get()
+        self.cover_file_row.pack_forget()
+        self.cover_fields.pack_forget()
+        self.cover_sig_row.pack_forget()
+        if mode == "file":
+            self.cover_file_row.pack(fill="x", padx=10, pady=(2, 6))
+        elif mode in ("auto", "signature"):
+            if mode == "signature":
+                self._reload_signatures()
+                self.cover_sig_row.pack(fill="x", padx=10, pady=(2, 2))
+            self.cover_fields.pack(fill="x", padx=10, pady=(2, 6))
+        self._sync_now()
+
+    def _reload_signatures(self):
+        sigs = list_signatures()
+        self._sig_ids = [s.get("id") for s in sigs]
+        labels = [s.get("label") or s.get("name") or s.get("company")
+                  or s.get("id", "")[:8] for s in sigs]
+        self.cover_sig_combo.config(values=labels)
+        st = self.app.style
+        if st.cover_sig_id in self._sig_ids:
+            self.cover_sig.set(labels[self._sig_ids.index(st.cover_sig_id)])
+        elif labels:
+            self.cover_sig.set(labels[0])
+
+    # ---- sync + refresh ---------------------------------------------------
+    def _schedule(self):
+        """Debounced sync for fast-changing inputs (typing, slider drag)."""
+        if self._refresh_after is not None:
+            try:
+                self.frame.after_cancel(self._refresh_after)
+            except (tk.TclError, ValueError):
+                pass
+        self._refresh_after = self.frame.after(350, self._sync_now)
+
+    def _sync_now(self):
+        self._refresh_after = None
+        st = self.app.style
+        st.wm_text = self.wm_text.get().strip()
+        try:
+            st.wm_opacity = float(self.wm_op.get())
+        except (tk.TclError, ValueError):
+            pass
+        st.page_numbers = bool(self.pn_on.get())
+        st.pn_format = self.pn_fmt.get() or "Page {n} of {total}"
+        st.pn_position = self.pn_pos.get()
+        st.header_text = self.header.get().strip()
+        st.footer_text = self.footer.get().strip()
+        st.bates_on = bool(self.bates_on.get())
+        st.bates_prefix = self.bates_prefix.get()
+        st.bates_start = _safe_int(self.bates_start.get(), 1)
+        st.bates_digits = max(1, min(10, _safe_int(self.bates_digits.get(), 6)))
+        st.cover_mode = self.cover_mode.get()
+        st.cover_size = self.cover_size.get()
+        st.cover_title = self.cover_title.get()
+        st.cover_subtitle = self.cover_subtitle.get()
+        st.cover_by = self.cover_by.get()
+        st.cover_date = self.cover_date.get()
+        sidx = self.cover_sig_combo.current()
+        if 0 <= sidx < len(self._sig_ids):
+            st.cover_sig_id = self._sig_ids[sidx]
+        # Live update: the Preview is the WYSIWYG surface.
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+            if self.app._tab_is("Preview"):
+                self.app.preview.refresh_preview()
+
+
+# ---------------------------------------------------------------------------
 # The application window
 # ---------------------------------------------------------------------------
 class App:
@@ -6354,6 +6992,10 @@ class App:
         # (items in list order, each item's pages in document order). Keyed by
         # the same (uid, idx) tuples as excluded_pages so the two compose.
         self.page_order = []
+        # v1.55: Style-tab settings (watermark / page numbers / header-footer /
+        # Bates / cover sheet). Applied as post-processing by apply_style() in
+        # the preview, Create PDF, and Sign flows. Defaults = inactive (no-op).
+        self.style = StyleSettings()
         self.work_queue = queue.Queue()
         self._update_dialog_state = None  # populated while auto-update is open
         self._install_dialog = None       # populated while install-deps dialog is open
@@ -6422,9 +7064,11 @@ class App:
         pages_tab = ttk.Frame(self.notebook)
         preview_tab = ttk.Frame(self.notebook)
         order_tab = ttk.Frame(self.notebook)
+        style_tab = ttk.Frame(self.notebook)
         self.notebook.add(pages_tab, text="Pages")
         self.notebook.add(preview_tab, text="Preview")
         self.notebook.add(order_tab, text="Order")
+        self.notebook.add(style_tab, text="Style")
 
         # --- URL capture row ----------------------------------------------
         urlframe = ttk.LabelFrame(pages_tab, text="Add a webpage (paste a link)")
@@ -6647,6 +7291,10 @@ class App:
         # OrderTab (v1.53): drag-to-reorder thumbnail grid. Built after the
         # preview so its reorders can invalidate/refresh the preview.
         self.order_tab = OrderTab(order_tab, self)
+
+        # StyleTab (v1.55): watermark / page numbers / header-footer / Bates /
+        # cover sheet. Writes into self.style and refreshes the preview live.
+        self.style_tab = StyleTab(style_tab, self)
 
         # Primary action row: Create PDF + (grayed-for-now) Sign and Create PDF.
         # Sign lights up in v1.26 when e-signature lands; today it just sits
@@ -8042,6 +8690,7 @@ class App:
             staged = io.BytesIO()
             writer.write(staged)
             final = _apply_nup(staged.getvalue(), self._current_layout())
+            final = apply_style(final, self.style, self)
             self.work_queue.put(("ready_for_signing", final))
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
@@ -8160,6 +8809,8 @@ class App:
             return
         # Coupler: pair pages two-per-sheet onto the big landscape sheet.
         orig_bytes = _apply_nup(staged.getvalue(), layout)
+        # Style pass: watermark / page numbers / header-footer / Bates / cover.
+        orig_bytes = apply_style(orig_bytes, self.style, self)
         out_data = orig_bytes
         flatten_note = ""
         if flatten:

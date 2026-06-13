@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.55
+- **New "Style" tab** — document-wide finishing applied as a post-processing
+  pass (`apply_style`), honoured identically by Preview, Create PDF, and Sign:
+  - **Watermark** — one-click presets (DRAFT / CONFIDENTIAL / INTERNAL / COPY),
+    custom text (diagonal, opacity slider), and/or an uploaded logo/image.
+  - **Page numbers** — `{n}`/`{total}` format with selectable position.
+  - **Header / footer** — running text on every page.
+  - **Bates numbering** — sequential legal-style IDs (prefix + start + digits),
+    bottom-right.
+  - **Cover sheet** — prepend from a chosen PDF/image file, auto-generate from
+    title/subtitle/date/prepared-by, or build from a saved signature (company
+    name, logo, address). The cover is always Letter or A4, independent of the
+    document's page size.
+  - Implementation: a `StyleSettings` carrier on the app; the Style tab writes
+    into it and refreshes the Preview live (the WYSIWYG surface).
+
 ## v1.54
 - **Tab order is now Pages · Preview · Order** (Preview promoted to second, as
   the primary view; Order moved to third).
