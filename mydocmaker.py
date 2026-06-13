@@ -102,12 +102,19 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.52"
+APP_VERSION = "1.53"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.53": [
+        "New Order tab — arrange your whole document visually. It shows every "
+        "page as a thumbnail; drag any page to a new spot and the rest slide "
+        "aside to make room. Drop it and the Preview and the saved PDF follow "
+        "the new order. Works across files too — pull page 3 of one PDF in "
+        "between pages of another. 'Reset to original order' undoes it all.",
+    ],
     "1.52": [
         "2-up now arranges pages either side-by-side or stacked one above the "
         "other — pick it on the Preview tab's '2-up' control. Side-by-side "
@@ -5599,6 +5606,11 @@ class PreviewTab:
         failed = 0
         hidden = 0
         skipped_labels = []
+        # Collect pages keyed by (uid, idx) first, then emit in the custom
+        # page order (Order tab) — so the preview reflects the user's drag
+        # arrangement, not just item order.
+        page_map = {}
+        natural = []
         for it in items:
             if it.render_status == "ready" and it.cached_pdf_bytes:
                 try:
@@ -5607,8 +5619,9 @@ class PreviewTab:
                         if (it.uid, local_idx) in excluded:
                             hidden += 1
                             continue
-                        writer.add_page(pg)
-                        self._page_sources.append((it.uid, local_idx))
+                        key = (it.uid, local_idx)
+                        page_map[key] = pg
+                        natural.append(key)
                 except Exception:
                     failed += 1
                     skipped_labels.append(it.label)
@@ -5617,6 +5630,9 @@ class PreviewTab:
                 skipped_labels.append(it.label)
             else:
                 pending += 1
+        for key in self.app.reorder_keys(natural):
+            writer.add_page(page_map[key])
+            self._page_sources.append(key)
         self._hidden_count = hidden
 
         if len(writer.pages) == 0:
@@ -5945,6 +5961,372 @@ class PreviewTab:
 
 
 # ---------------------------------------------------------------------------
+# OrderTab (v1.53): visual page reordering.
+#   A scrollable grid of page thumbnails — one card per page across every
+#   item. Drag a card and the grid opens a gap at the hovered slot ("makes
+#   space"); drop to commit the new sequence into App.page_order, which the
+#   Preview / Create PDF / Sign assembly all honour. Pages keep their
+#   (item.uid, local_idx) identity, so this composes with per-page hiding.
+# ---------------------------------------------------------------------------
+class OrderTab:
+    CARD_W = 150          # card width  (px) incl. border
+    CARD_H = 210          # card height (px) incl. page-number strip
+    GAP = 16              # spacing between cards
+    MARGIN = 16           # canvas inset
+
+    def __init__(self, parent, app):
+        self.app = app
+        self.frame = parent
+
+        # ----- Toolbar
+        bar = ttk.Frame(self.frame)
+        bar.pack(fill="x", padx=8, pady=(8, 4))
+        ttk.Label(
+            bar,
+            text="Drag a page to reorder the whole document. "
+                 "The Preview and the saved PDF follow this order.",
+            foreground="#555",
+        ).pack(side="left")
+        self.reset_btn = ttk.Button(bar, text="Reset to original order",
+                                    command=self._reset_order)
+        self.reset_btn.pack(side="right")
+        ttk.Button(bar, text="↻ Refresh", command=self.refresh
+                   ).pack(side="right", padx=(0, 6))
+
+        # ----- Scrollable canvas of thumbnail cards
+        wrap = ttk.Frame(self.frame)
+        wrap.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.canvas = tk.Canvas(wrap, highlightthickness=0, background="#f4f4f4")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.sb = ttk.Scrollbar(wrap, orient="vertical",
+                                command=self.canvas.yview)
+        self.sb.pack(side="left", fill="y")
+        self.canvas.config(yscrollcommand=self.sb.set)
+
+        # Re-flow the grid when the tab is resized.
+        self.canvas.bind("<Configure>", self._on_resize)
+        self.canvas.bind("<Enter>", lambda _e: self._bind_wheel())
+        self.canvas.bind("<Leave>", lambda _e: self._unbind_wheel())
+
+        # State
+        self._thumb_refs = {}     # key -> PhotoImage (kept from GC)
+        self._cards = {}          # key -> card Frame widget
+        self._card_ids = {}       # key -> canvas window id
+        self._order = []          # current visual order of keys
+        self._labels = {}         # key -> source item label
+        self._cols = 1
+        self._dirty = True
+
+        # Drag state
+        self._drag_key = None
+        self._drag_off = (0, 0)
+        self._insert_idx = None
+        self._targets = {}        # key -> (x, y) the card is easing toward
+        self._anim_id = None      # pending after() id for the ease loop
+
+        self._placeholder = None
+
+    # ---- visibility / lifecycle ------------------------------------------
+    def invalidate(self):
+        """Mark the grid stale so the next show rebuilds it."""
+        self._dirty = True
+
+    def on_show(self):
+        """Called when the Order tab becomes visible."""
+        if self._dirty:
+            self.refresh()
+
+    def _bind_wheel(self):
+        self.canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self.canvas.bind_all("<Button-4>", self._on_wheel)
+        self.canvas.bind_all("<Button-5>", self._on_wheel)
+
+    def _unbind_wheel(self):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+    def _on_wheel(self, event):
+        if getattr(event, "num", None) == 4 or getattr(event, "delta", 0) > 0:
+            self.canvas.yview_scroll(-1, "units")
+        else:
+            self.canvas.yview_scroll(1, "units")
+
+    def _on_resize(self, _event=None):
+        cols = self._compute_cols()
+        if cols != self._cols and self._order:
+            self._cols = cols
+            self._layout(animate=False)
+
+    def _compute_cols(self):
+        w = self.canvas.winfo_width() or self.canvas.winfo_reqwidth()
+        usable = max(1, w - 2 * self.MARGIN)
+        return max(1, usable // (self.CARD_W + self.GAP))
+
+    # ---- build the grid ---------------------------------------------------
+    def refresh(self):
+        """Re-assemble the native page set and rebuild the thumbnail grid."""
+        self._clear()
+        if not (PIL_TK_OK and FLATTEN_OK):
+            self._set_placeholder("Page thumbnails need pypdfium2 + Pillow.")
+            self._dirty = False
+            return
+        try:
+            pdf_bytes, ordered, labels = self.app.build_ordered_native()
+        except Exception as e:
+            self._set_placeholder(f"Couldn't assemble pages: {e}")
+            self._dirty = False
+            return
+        if not ordered:
+            self._set_placeholder(
+                "No pages yet — add files on the Pages tab, then drag the "
+                "thumbnails here to arrange them.")
+            self._dirty = False
+            return
+
+        self._order = list(ordered)
+        self._labels = labels
+        try:
+            doc = pdfium.PdfDocument(pdf_bytes)
+        except Exception as e:
+            self._set_placeholder(f"Couldn't open combined PDF: {e}")
+            self._dirty = False
+            return
+        inner_w = self.CARD_W - 12
+        inner_h = self.CARD_H - 34
+        try:
+            for i, key in enumerate(self._order):
+                page = doc[i]
+                # Scale so the long edge fits the card's image area.
+                pw = page.get_size()[0] / 72.0 * 96.0
+                scale = max(0.1, min(2.0, inner_w / max(1.0, pw)))
+                pil = page.render(scale=scale).to_pil().convert("RGB")
+                pil.thumbnail((inner_w, inner_h))
+                self._thumb_refs[key] = _ImageTk.PhotoImage(pil)
+                self._make_card(key, i + 1)
+        finally:
+            try:
+                doc.close()
+            except Exception:
+                pass
+
+        self._cols = self._compute_cols()
+        self._layout(animate=False)
+        self._dirty = False
+        self._update_reset_btn()
+
+    def _make_card(self, key, page_no):
+        card = tk.Frame(self.canvas, bd=1, relief="solid",
+                        background="white", highlightthickness=0,
+                        width=self.CARD_W, height=self.CARD_H)
+        card.pack_propagate(False)
+        img_lbl = tk.Label(card, image=self._thumb_refs[key],
+                           background="white", cursor="fleur")
+        img_lbl.pack(expand=True)
+        cap = tk.Label(card, text=f"{page_no}",
+                       background="#fafafa", foreground="#444",
+                       font=("", 9))
+        cap.pack(fill="x", side="bottom")
+        # Drag bindings on the card and its children so a press anywhere works.
+        for w in (card, img_lbl, cap):
+            w.bind("<ButtonPress-1>", lambda e, k=key: self._on_press(e, k))
+            w.bind("<B1-Motion>", self._on_motion)
+            w.bind("<ButtonRelease-1>", self._on_release)
+        self._cards[key] = card
+
+    def _slot_xy(self, idx):
+        col = idx % self._cols
+        row = idx // self._cols
+        x = self.MARGIN + col * (self.CARD_W + self.GAP)
+        y = self.MARGIN + row * (self.CARD_H + self.GAP)
+        return x, y
+
+    def _layout(self, animate=True, skip_key=None, insert_idx=None):
+        """Assign every card a target grid slot. When dragging, `skip_key` is
+        the lifted card (it follows the cursor, not a slot) and `insert_idx`
+        is the slot held open for it. With animate=True the cards ease toward
+        their new targets (smooth "make space"); with animate=False they snap
+        (used on first build and on resize)."""
+        seq = [k for k in self._order if k != skip_key]
+        if skip_key is not None and insert_idx is not None:
+            # Open a gap: cards at/after insert_idx shift one slot along.
+            display = seq[:insert_idx] + [None] + seq[insert_idx:]
+        else:
+            display = seq
+        self._targets = {}
+        for idx, key in enumerate(display):
+            if key is None:
+                continue
+            x, y = self._slot_xy(idx)
+            self._targets[key] = (x, y)
+            cid = self._card_ids.get(key)
+            if cid is None:
+                self._card_ids[key] = self.canvas.create_window(
+                    x, y, anchor="nw", window=self._cards[key])
+            elif not animate:
+                self.canvas.coords(cid, x, y)
+        self._update_scrollregion(len(self._order))
+        if animate:
+            self._kick_anim()
+
+    def _kick_anim(self):
+        if self._anim_id is None:
+            self._anim_id = self.canvas.after(16, self._animate)
+
+    def _animate(self):
+        """Ease each non-dragged card a fraction toward its target slot. (a):
+        gives the gap a smooth glide instead of a jump. Reschedules until
+        everything is within a pixel of its target."""
+        self._anim_id = None
+        moving = False
+        for key, (tx, ty) in self._targets.items():
+            if key == self._drag_key:
+                continue
+            cid = self._card_ids.get(key)
+            if cid is None:
+                continue
+            try:
+                x, y = self.canvas.coords(cid)
+            except (tk.TclError, ValueError):
+                continue
+            dx, dy = tx - x, ty - y
+            if abs(dx) < 1 and abs(dy) < 1:
+                self.canvas.coords(cid, tx, ty)
+                continue
+            self.canvas.coords(cid, x + dx * 0.4, y + dy * 0.4)
+            moving = True
+        if moving:
+            self._anim_id = self.canvas.after(16, self._animate)
+
+    def _update_scrollregion(self, n):
+        rows = (n + self._cols - 1) // self._cols
+        h = self.MARGIN * 2 + rows * (self.CARD_H + self.GAP)
+        w = self.canvas.winfo_width()
+        self.canvas.config(scrollregion=(0, 0, w, max(h, 1)))
+
+    # ---- drag handlers ----------------------------------------------------
+    def _on_press(self, event, key):
+        self._drag_key = key
+        cid = self._card_ids.get(key)
+        if cid is not None:
+            self.canvas.tag_raise(cid)
+            self._cards[key].config(relief="raised", bd=2)
+        # offset of the cursor within the card, in canvas coords
+        cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
+        cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
+        x, y = self.canvas.coords(cid) if cid is not None else (0, 0)
+        self._drag_off = (cx - x, cy - y)
+        self._insert_idx = self._order.index(key)
+
+    def _on_motion(self, event):
+        if self._drag_key is None:
+            return
+        cid = self._card_ids.get(self._drag_key)
+        if cid is None:
+            return
+        cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
+        cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
+        nx = cx - self._drag_off[0]
+        ny = cy - self._drag_off[1]
+        self.canvas.coords(cid, nx, ny)            # dragged card tracks cursor
+        # (b) accurate insert index: use the dragged card's CENTER and round to
+        # the nearest gap boundary, so the slot flips exactly at the midpoint.
+        idx = self._insert_index_at(nx + self.CARD_W / 2.0,
+                                    ny + self.CARD_H / 2.0)
+        if idx != self._insert_idx:
+            self._insert_idx = idx
+            self._layout(skip_key=self._drag_key, insert_idx=idx)
+            self.canvas.tag_raise(cid)
+
+    def _insert_index_at(self, cx, cy):
+        """Map a point (the dragged card's center) to an insertion index among
+        the stationary cards. Rounds to the nearest column boundary so the gap
+        opens on the side the card's center has crossed."""
+        eff_w = self.CARD_W + self.GAP
+        eff_h = self.CARD_H + self.GAP
+        col = round((cx - self.MARGIN) / eff_w)
+        col = max(0, min(self._cols, col))
+        row = int((cy - self.MARGIN + eff_h / 2.0) // eff_h)
+        row = max(0, row)
+        idx = row * self._cols + col
+        # Stationary cards = len(order) - 1, so insert index spans [0, that].
+        return max(0, min(len(self._order) - 1, idx))
+
+    def _on_release(self, _event):
+        if self._drag_key is None:
+            return
+        key = self._drag_key
+        target = self._insert_idx if self._insert_idx is not None else 0
+        seq = [k for k in self._order if k != key]
+        seq.insert(min(target, len(seq)), key)
+        changed = seq != self._order
+        self._order = seq
+        self.app.page_order = list(seq)
+        # Drop the lifted styling; clear drag state BEFORE laying out so the
+        # dropped card eases into its slot like the rest.
+        dropped = self._cards.get(key)
+        if dropped is not None:
+            dropped.config(relief="solid", bd=1)
+        self._drag_key = None
+        self._insert_idx = None
+        # Renumber captions + settle the grid (animated glide into place).
+        for i, k in enumerate(self._order):
+            card = self._cards.get(k)
+            if card is not None:
+                for child in card.winfo_children():
+                    if isinstance(child, tk.Label) and child.cget("text").isdigit():
+                        child.config(text=str(i + 1))
+        self._layout(animate=True)
+        self._update_reset_btn()
+        if changed and hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+            if self.app._tab_is("Preview"):
+                self.app.preview.refresh_preview()
+
+    # ---- reset / housekeeping --------------------------------------------
+    def _reset_order(self):
+        self.app.page_order = []
+        self.invalidate()
+        self.refresh()
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+            if self.app._tab_is("Preview"):
+                self.app.preview.refresh_preview()
+
+    def _update_reset_btn(self):
+        state = "normal" if self.app.page_order else "disabled"
+        try:
+            self.reset_btn.config(state=state)
+        except tk.TclError:
+            pass
+
+    def _set_placeholder(self, text):
+        self._clear()
+        self._placeholder = self.canvas.create_text(
+            self.MARGIN, self.MARGIN, anchor="nw", text=text,
+            fill="#666", font=("", 11), width=520)
+
+    def _clear(self):
+        if self._anim_id is not None:
+            try:
+                self.canvas.after_cancel(self._anim_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._anim_id = None
+        self._targets = {}
+        self.canvas.delete("all")
+        for card in self._cards.values():
+            try:
+                card.destroy()
+            except tk.TclError:
+                pass
+        self._cards = {}
+        self._card_ids = {}
+        self._thumb_refs = {}
+        self._placeholder = None
+
+
+# ---------------------------------------------------------------------------
 # The application window
 # ---------------------------------------------------------------------------
 class App:
@@ -5956,6 +6338,12 @@ class App:
         # so reordering/removing other items doesn't disturb it. Honoured by
         # the Preview tab, the final Create-PDF build, and the sign build.
         self.excluded_pages = set()
+        # v1.53: custom page order. A list of (item.uid, local_page_index)
+        # keys giving the desired OUTPUT sequence, independent of item order —
+        # set by dragging thumbnails on the Order tab. Empty = natural order
+        # (items in list order, each item's pages in document order). Keyed by
+        # the same (uid, idx) tuples as excluded_pages so the two compose.
+        self.page_order = []
         self.work_queue = queue.Queue()
         self._update_dialog_state = None  # populated while auto-update is open
         self._install_dialog = None       # populated while install-deps dialog is open
@@ -6022,8 +6410,10 @@ class App:
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         pages_tab = ttk.Frame(self.notebook)
+        order_tab = ttk.Frame(self.notebook)
         preview_tab = ttk.Frame(self.notebook)
         self.notebook.add(pages_tab, text="Pages")
+        self.notebook.add(order_tab, text="Order")
         self.notebook.add(preview_tab, text="Preview")
 
         # --- URL capture row ----------------------------------------------
@@ -6244,6 +6634,10 @@ class App:
         # forwarded by _poll_queue.
         self.preview = PreviewTab(preview_tab, self)
 
+        # OrderTab (v1.53): drag-to-reorder thumbnail grid. Built after the
+        # preview so its reorders can invalidate/refresh the preview.
+        self.order_tab = OrderTab(order_tab, self)
+
         # Primary action row: Create PDF + (grayed-for-now) Sign and Create PDF.
         # Sign lights up in v1.26 when e-signature lands; today it just sits
         # there visibly disabled so users know the feature is on the way.
@@ -6400,15 +6794,24 @@ class App:
         self.root.after(4000, self._maybe_auto_check_updates)
 
     # --- Tab + page-mode UI hooks --------------------------------------------
+    def _tab_is(self, name):
+        """True when the currently selected notebook tab is `name`."""
+        try:
+            return self.notebook.tab(self.notebook.select(), "text") == name
+        except tk.TclError:
+            return False
+
     def _on_tab_changed(self, _event=None):
-        """Called when the user switches Notebook tabs. The Preview tab
-        does a refresh on entry so it always reflects current item state."""
+        """Called when the user switches Notebook tabs. The Preview and Order
+        tabs rebuild on entry so they always reflect current item state."""
         try:
             current = self.notebook.tab(self.notebook.select(), "text")
         except tk.TclError:
             return
         if current == "Preview" and hasattr(self, "preview"):
             self.preview.refresh_preview()
+        elif current == "Order" and hasattr(self, "order_tab"):
+            self.order_tab.on_show()
 
     def _current_layout(self):
         """Snapshot the page-layout controls into a PageLayout. Defensive so
@@ -6420,6 +6823,58 @@ class App:
             2 if (hasattr(self, "nup_var") and self.nup_var.get()) else 1,
             self.arrange_var.get() if hasattr(self, "arrange_var") else "side",
         )
+
+    def reorder_keys(self, natural_keys):
+        """Apply the user's custom page order (self.page_order) to the current
+        list of natural (uid, idx) page keys.
+
+        Pages already placed in page_order keep their saved relative order;
+        pages not yet placed (newly added items) are appended in natural
+        position; pages that no longer exist drop out. self.page_order is
+        refreshed to the reconciled sequence so it stays compact and valid.
+        Returns the final ordered key list."""
+        natural_set = set(natural_keys)
+        ordered = [k for k in self.page_order if k in natural_set]
+        placed = set(ordered)
+        for k in natural_keys:
+            if k not in placed:
+                ordered.append(k)
+                placed.add(k)
+        self.page_order = ordered
+        return ordered
+
+    def build_ordered_native(self):
+        """Assemble the combined NATIVE pages (no 2-up imposition) from cached
+        per-item bytes, honouring per-page exclusions and the custom page
+        order. Returns (pdf_bytes, ordered_keys, labels): ordered_keys[i] is
+        the (uid, idx) source of page i, and labels maps each key to its item
+        label. Used by the Order tab to render its thumbnail grid. Returns
+        (b"", [], {}) when nothing is ready yet."""
+        pairs = []
+        labels = {}
+        for it in self.items:
+            if it.render_status == "ready" and it.cached_pdf_bytes:
+                try:
+                    reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
+                except Exception:
+                    continue
+                for local_idx, pg in enumerate(reader.pages):
+                    key = (it.uid, local_idx)
+                    if key in self.excluded_pages:
+                        continue
+                    pairs.append((key, pg))
+                    labels[key] = it.label
+        if not pairs:
+            self.reorder_keys([])
+            return b"", [], {}
+        page_map = dict(pairs)
+        ordered = self.reorder_keys([k for k, _ in pairs])
+        writer = PdfWriter()
+        for key in ordered:
+            writer.add_page(page_map[key])
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue(), ordered, labels
 
     def _on_page_mode_changed(self):
         """A page-layout control changed (size / paper orientation / content
@@ -6784,9 +7239,12 @@ class App:
                 self.listbox.config(cursor="hand2")
         # Update the running totals strip under the listbox.
         self._update_totals()
-        # Tell the Preview tab the page list changed — debounced repaint.
+        # Tell the Preview + Order tabs the page list changed — they rebuild
+        # lazily on next show.
         if hasattr(self, "preview"):
             self.preview.invalidate()
+        if hasattr(self, "order_tab"):
+            self.order_tab.invalidate()
         # _refresh is called by every list mutation (add / remove / reorder /
         # clear), so this is the single hook point for session persistence.
         self._schedule_save()
@@ -7544,6 +8002,8 @@ class App:
         try:
             writer = PdfWriter()
             excluded = set(self.excluded_pages)
+            page_map = {}
+            natural = []
             for it in self.items:
                 if it.cached_pdf_bytes:
                     reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
@@ -7557,7 +8017,13 @@ class App:
                 for local_idx, pg in enumerate(reader.pages):
                     if (it.uid, local_idx) in excluded:
                         continue
-                    writer.add_page(pg)
+                    key = (it.uid, local_idx)
+                    page_map[key] = pg
+                    natural.append(key)
+            # Emit in the custom page order (Order tab) so the signed PDF
+            # matches the arrangement shown in the preview.
+            for key in self.reorder_keys(natural):
+                writer.add_page(page_map[key])
             if len(writer.pages) == 0:
                 self.work_queue.put((
                     "error", "No pages were created — nothing to sign."
@@ -7634,6 +8100,8 @@ class App:
         rl = layout._replace(size="original", nup=1) if layout.nup == 2 else layout
         writer = PdfWriter()
         skipped = []
+        page_map = {}
+        natural = []
         for it in items:
             try:
                 if it.kind == "url":
@@ -7659,9 +8127,15 @@ class App:
                 for local_idx, pg in enumerate(reader.pages):
                     if (it.uid, local_idx) in excluded:
                         continue
-                    writer.add_page(pg)
+                    key = (it.uid, local_idx)
+                    page_map[key] = pg
+                    natural.append(key)
             except Exception as e:
                 skipped.append(f"{it.label} ({e})")
+
+        # Emit pages in the custom Order-tab sequence (no-op when untouched).
+        for key in self.reorder_keys(natural):
+            writer.add_page(page_map[key])
 
         if len(writer.pages) == 0:
             self.work_queue.put(("error", "No pages were created.\n\n" + "\n".join(skipped)))
