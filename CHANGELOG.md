@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.58
+- **Order tab zoom** (50%–300%). Card size scales with the zoom level
+  (`CARD_W`/`CARD_H` became zoom-aware properties) and thumbnails re-render at
+  the new size, so pages are no longer tiny.
+- **Fixed "Sheets" drag mode.** Dragging now operates on a *set* of cards: in
+  Sheets mode under 2-up it lifts and moves **both** pages of a sheet together
+  (with a 2-slot gap snapped to sheet boundaries), instead of only moving the
+  grabbed page. The Sheets radio is disabled (and falls back to Pages) when
+  2-up is off, since there are no pairs to move.
+
 ## v1.57
 - **Per-page orientation flip (Order tab).** Each page card has a ⟳ button to
   rotate just that page 90° (cycles through 4 turns), overriding the global

@@ -102,12 +102,20 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.57"
+APP_VERSION = "1.58"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.58": [
+        "Order tab now has a Zoom control (50%–300%) — make the page thumbnails "
+        "as big as you like to see them clearly.",
+        "Fixed the 'Sheets' drag mode: under 2-up it now picks up both pages of "
+        "a sheet and moves them together as one unit (it was only moving the "
+        "single page you grabbed). 'Sheets' is greyed out when 2-up is off, "
+        "since there are no pairs to move then.",
+    ],
     "1.57": [
         "Order tab: flip a single page on the go. Each page now has a ⟳ button "
         "to rotate just that page (portrait ↔ landscape) without changing the "
@@ -6389,14 +6397,25 @@ class PreviewTab:
 #   (item.uid, local_idx) identity, so this composes with per-page hiding.
 # ---------------------------------------------------------------------------
 class OrderTab:
-    CARD_W = 150          # card width  (px) incl. border
-    CARD_H = 210          # card height (px) incl. page-number strip
+    BASE_CARD_W = 150     # card width  (px) at 100% zoom
+    BASE_CARD_H = 210     # card height (px) at 100% zoom
     GAP = 16              # spacing between cards
     MARGIN = 16           # canvas inset
+    ZOOMS = ("50%", "75%", "100%", "150%", "200%", "300%")
+
+    # Card size scales with the zoom level (set in _apply_zoom).
+    @property
+    def CARD_W(self):
+        return max(60, int(self.BASE_CARD_W * self._zoom))
+
+    @property
+    def CARD_H(self):
+        return max(84, int(self.BASE_CARD_H * self._zoom))
 
     def __init__(self, parent, app):
         self.app = app
         self.frame = parent
+        self._zoom = 1.0   # thumbnail zoom factor (set CARD_W/CARD_H)
 
         # ----- Toolbar. Two rows so nothing ever clips on a narrow window:
         # row 1 = controls (always visible), row 2 = wrapping hint text.
@@ -6408,8 +6427,16 @@ class OrderTab:
         ttk.Label(bar, text="Drag:").pack(side="left")
         ttk.Radiobutton(bar, text="Pages", value="page",
                         variable=self.drag_mode).pack(side="left")
-        ttk.Radiobutton(bar, text="Sheets", value="sheet",
-                        variable=self.drag_mode).pack(side="left", padx=(0, 6))
+        self.sheets_radio = ttk.Radiobutton(bar, text="Sheets", value="sheet",
+                                            variable=self.drag_mode)
+        self.sheets_radio.pack(side="left", padx=(0, 6))
+        # Zoom: make the thumbnails bigger/smaller (the window has the room).
+        ttk.Label(bar, text="Zoom:").pack(side="left", padx=(8, 2))
+        self.zoom_var = tk.StringVar(value="100%")
+        zb = ttk.Combobox(bar, textvariable=self.zoom_var, width=6,
+                          state="readonly", values=self.ZOOMS)
+        zb.pack(side="left")
+        zb.bind("<<ComboboxSelected>>", self._on_zoom)
         # Buttons packed right FIRST so they always stay on-screen.
         self.reset_btn = ttk.Button(bar, text="Reset order",
                                     command=self._reset_order)
@@ -6448,7 +6475,8 @@ class OrderTab:
         # Drag state
         self._drag_key = None
         self._drag_pair = None
-        self._drag_off = (0, 0)
+        self._drag_set = set()
+        self._drag_off = {}
         self._insert_idx = None
         self._targets = {}        # key -> (x, y) the card is easing toward
         self._anim_id = None      # pending after() id for the ease loop
@@ -6490,6 +6518,15 @@ class OrderTab:
             self._cols = cols
             self._layout(animate=False)
 
+    def _on_zoom(self, _event=None):
+        """Zoom changed — re-render thumbnails at the new card size."""
+        try:
+            self._zoom = int(self.zoom_var.get().rstrip("%")) / 100.0
+        except (ValueError, AttributeError):
+            self._zoom = 1.0
+        self.invalidate()
+        self.refresh()
+
     GROUP_H = 22   # vertical room above each pair row for the "Sheet N" label
 
     def _is_nup(self):
@@ -6511,6 +6548,13 @@ class OrderTab:
     def refresh(self):
         """Re-assemble the native page set and rebuild the thumbnail grid."""
         self._clear()
+        # Sheets drag only makes sense under 2-up; gray it out otherwise.
+        if self._is_nup():
+            self.sheets_radio.state(["!disabled"])
+        else:
+            self.sheets_radio.state(["disabled"])
+            if self.drag_mode.get() == "sheet":
+                self.drag_mode.set("page")
         flip_note = ("  Click ⟳ on a page to flip just that page — but "
                      "Create the PDF now, as changing size/orientation in "
                      "Pages or Preview clears per-page flips.")
@@ -6624,16 +6668,15 @@ class OrderTab:
         y = self.MARGIN + row * self._row_pitch() + head
         return x, y
 
-    def _layout(self, animate=True, skip_key=None, insert_idx=None):
-        """Assign every card a target grid slot. When dragging, `skip_key` is
-        the lifted card (it follows the cursor, not a slot) and `insert_idx`
-        is the slot held open for it. With animate=True the cards ease toward
-        their new targets (smooth "make space"); with animate=False they snap
-        (used on first build and on resize)."""
-        seq = [k for k in self._order if k != skip_key]
-        if skip_key is not None and insert_idx is not None:
-            # Open a gap: cards at/after insert_idx shift one slot along.
-            display = seq[:insert_idx] + [None] + seq[insert_idx:]
+    def _layout(self, animate=True, skip_keys=None, insert_idx=None, gap=1):
+        """Assign every card a target grid slot. When dragging, `skip_keys` are
+        the lifted cards (they follow the cursor, not a slot) and `insert_idx`
+        is where a `gap`-slot hole is held open for them (gap=2 for a sheet).
+        animate=True eases cards toward targets; animate=False snaps."""
+        skip_keys = skip_keys or set()
+        seq = [k for k in self._order if k not in skip_keys]
+        if skip_keys and insert_idx is not None:
+            display = seq[:insert_idx] + [None] * gap + seq[insert_idx:]
         else:
             display = seq
         self._targets = {}
@@ -6689,7 +6732,7 @@ class OrderTab:
         self._anim_id = None
         moving = False
         for key, (tx, ty) in self._targets.items():
-            if key == self._drag_key:
+            if key in self._drag_set:
                 continue
             cid = self._card_ids.get(key)
             if cid is None:
@@ -6716,42 +6759,54 @@ class OrderTab:
     # ---- drag handlers ----------------------------------------------------
     def _on_press(self, event, key):
         self._drag_key = key
-        # Sheet mode (only under 2-up): pick up the whole pair this page is in.
+        # Sheet mode (only under 2-up): pick up the WHOLE pair this page is in,
+        # so both cards lift and move together. Otherwise just this page.
         self._drag_pair = None
         if self.drag_mode.get() == "sheet" and self._is_nup():
             idx = self._order.index(key)
             p = idx // 2
             self._drag_pair = self._order[2 * p:2 * p + 2]
-        cid = self._card_ids.get(key)
-        if cid is not None:
-            self.canvas.tag_raise(cid)
-            self._cards[key].config(relief="raised", bd=2)
-        # offset of the cursor within the card, in canvas coords
+            self._drag_set = set(self._drag_pair)
+        else:
+            self._drag_set = {key}
         cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
         cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
-        x, y = self.canvas.coords(cid) if cid is not None else (0, 0)
-        self._drag_off = (cx - x, cy - y)
+        # Record each lifted card's offset from the cursor so they move as one.
+        self._drag_off = {}
+        for k in self._drag_set:
+            cid = self._card_ids.get(k)
+            if cid is None:
+                continue
+            self.canvas.tag_raise(cid)
+            self._cards[k].config(relief="raised", bd=2)
+            x, y = self.canvas.coords(cid)
+            self._drag_off[k] = (cx - x, cy - y)
         self._insert_idx = self._order.index(key)
 
     def _on_motion(self, event):
         if self._drag_key is None:
             return
-        cid = self._card_ids.get(self._drag_key)
-        if cid is None:
-            return
         cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
         cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
-        nx = cx - self._drag_off[0]
-        ny = cy - self._drag_off[1]
-        self.canvas.coords(cid, nx, ny)            # dragged card tracks cursor
-        # (b) accurate insert index: use the dragged card's CENTER and round to
-        # the nearest gap boundary, so the slot flips exactly at the midpoint.
-        idx = self._insert_index_at(nx + self.CARD_W / 2.0,
-                                    ny + self.CARD_H / 2.0)
+        # Move every lifted card together, tracking the cursor.
+        for k, (ox, oy) in self._drag_off.items():
+            cid = self._card_ids.get(k)
+            if cid is not None:
+                self.canvas.coords(cid, cx - ox, cy - oy)
+        # Insert index from the PRIMARY card's center.
+        pox, poy = self._drag_off.get(self._drag_key, (0, 0))
+        idx = self._insert_index_at(cx - pox + self.CARD_W / 2.0,
+                                    cy - poy + self.CARD_H / 2.0)
+        gap = len(self._drag_set)
+        if gap > 1:
+            idx = (idx // 2) * 2          # snap to a sheet boundary
         if idx != self._insert_idx:
             self._insert_idx = idx
-            self._layout(skip_key=self._drag_key, insert_idx=idx)
-            self.canvas.tag_raise(cid)
+            self._layout(skip_keys=self._drag_set, insert_idx=idx, gap=gap)
+            for k in self._drag_set:
+                cid = self._card_ids.get(k)
+                if cid is not None:
+                    self.canvas.tag_raise(cid)
 
     def _insert_index_at(self, cx, cy):
         """Map a point (the dragged card's center) to an insertion index among
@@ -6785,13 +6840,15 @@ class OrderTab:
         changed = seq != self._order
         self._order = seq
         self.app.page_order = list(seq)
-        # Drop the lifted styling; clear drag state BEFORE laying out so the
-        # dropped card eases into its slot like the rest.
-        dropped = self._cards.get(key)
-        if dropped is not None:
-            dropped.config(relief="solid", bd=1)
+        # Drop the lifted styling on every dragged card; clear drag state BEFORE
+        # laying out so the dropped cards ease into their slots like the rest.
+        for k in self._drag_set:
+            card = self._cards.get(k)
+            if card is not None:
+                card.config(relief="solid", bd=1)
         self._drag_key = None
         self._drag_pair = None
+        self._drag_set = set()
         self._insert_idx = None
         # Renumber captions + settle the grid (animated glide into place).
         for i, k in enumerate(self._order):
