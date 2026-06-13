@@ -102,12 +102,17 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.53"
+APP_VERSION = "1.54"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.54": [
+        "The Order tab now sits after Preview (Pages · Preview · Order), and it "
+        "stays in sync with the Preview — hide or restore a page in the "
+        "Preview and the Order grid updates to match.",
+    ],
     "1.53": [
         "New Order tab — arrange your whole document visually. It shows every "
         "page as a thumbnail; drag any page to a new spot and the rest slide "
@@ -5935,6 +5940,9 @@ class PreviewTab:
         # Rebuild immediately so the page disappears and numbering updates.
         self._dirty = True
         self._rebuild_now()
+        # Keep the Order tab in sync — a hidden page must drop from its grid.
+        if hasattr(self.app, "order_tab"):
+            self.app.order_tab.invalidate()
 
     def _restore_hidden_pages(self):
         """Un-hide every page the user removed in this session."""
@@ -5943,6 +5951,8 @@ class PreviewTab:
         self.app.excluded_pages.clear()
         self._dirty = True
         self._rebuild_now()
+        if hasattr(self.app, "order_tab"):
+            self.app.order_tab.invalidate()
 
     def _update_restore_button(self):
         """Show the Restore button (with a live count) only when something is
@@ -6410,11 +6420,11 @@ class App:
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         pages_tab = ttk.Frame(self.notebook)
-        order_tab = ttk.Frame(self.notebook)
         preview_tab = ttk.Frame(self.notebook)
+        order_tab = ttk.Frame(self.notebook)
         self.notebook.add(pages_tab, text="Pages")
-        self.notebook.add(order_tab, text="Order")
         self.notebook.add(preview_tab, text="Preview")
+        self.notebook.add(order_tab, text="Order")
 
         # --- URL capture row ----------------------------------------------
         urlframe = ttk.LabelFrame(pages_tab, text="Add a webpage (paste a link)")

@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.54
+- **Tab order is now Pages · Preview · Order** (Preview promoted to second, as
+  the primary view; Order moved to third).
+- **Order stays in sync with the Preview.** Hiding or restoring a page in the
+  Preview tab now invalidates the Order grid, so switching to Order reflects
+  the current page set instead of a stale one. (Page-list, orientation, size,
+  and 2-up changes already propagated via the shared refresh.)
+
 ## v1.53
 - **New "Order" tab — visual page reordering.** A scrollable grid shows every
   page across all added files as a thumbnail. Drag a page and the grid opens a
