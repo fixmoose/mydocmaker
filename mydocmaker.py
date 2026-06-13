@@ -102,12 +102,26 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.56"
+APP_VERSION = "1.57"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.57": [
+        "Order tab: flip a single page on the go. Each page now has a ⟳ button "
+        "to rotate just that page (portrait ↔ landscape) without changing the "
+        "whole document. Heads up — per-page flips are temporary: Create the "
+        "PDF while they're set, because changing the size or orientation in "
+        "Pages or Preview clears them.",
+        "Order tab: choose what you drag. A new 'Drag: Pages / Sheets' switch "
+        "lets you drag individual pages (to change 2-up pairings) or whole "
+        "sheets (to move a pair as a unit without breaking it).",
+        "Windows now open wide enough to show everything — no more Refresh/Reset "
+        "or other buttons hidden off the edge. The window also can't be shrunk "
+        "small enough to clip a control.",
+        "Renamed 'Page size' to 'Paper size' on the Pages tab.",
+    ],
     "1.56": [
         "Choose your 2-up pairings. When '2-up' is on, the Order tab now shows "
         "one sheet per row (a boxed 'Sheet 1', 'Sheet 2', …, each holding two "
@@ -898,11 +912,39 @@ def _wants_rotation(sw, sh, sheet_w, sheet_h, content):
     - content 'auto':      match the sheet's orientation (least wasted space)"""
     if sw <= 0 or sh <= 0:
         return False
+    if content == "asis":
+        return False   # page already baked to its desired orientation
     if content == "portrait":
         return sw > sh
     if content == "landscape":
         return sh > sw
     return (sw > sh) != (sheet_w > sheet_h)   # auto
+
+
+def _rotate_page_baked(src, turns):
+    """Return a single page with `src` rotated by turns×90° baked into its
+    content stream (mediabox swapped for odd turns). Used for the per-page
+    'flip this page' override on the Order tab — baking (vs the /Rotate flag)
+    means the rotation survives 2-up imposition and renders correctly in the
+    thumbnail. turns is taken mod 4; 0 returns src unchanged."""
+    turns %= 4
+    if turns == 0:
+        return src
+    w = float(src.mediabox.width)
+    h = float(src.mediabox.height)
+    writer = PdfWriter()
+    nw, nh = (h, w) if turns in (1, 3) else (w, h)
+    dest = writer.add_blank_page(width=nw, height=nh)
+    if turns == 1:
+        ctm = Transformation().rotate(90).translate(h, 0)
+    elif turns == 2:
+        ctm = Transformation().rotate(180).translate(w, h)
+    else:  # turns == 3
+        ctm = Transformation().rotate(270).translate(0, w)
+    dest.merge_transformed_page(src, ctm)
+    buf = io.BytesIO()
+    writer.write(buf)
+    return PdfReader(io.BytesIO(buf.getvalue())).pages[0]
 
 
 def _place_page_on_sheet(writer, src, sheet_w, sheet_h, content):
@@ -932,14 +974,17 @@ def _place_page_on_sheet(writer, src, sheet_w, sheet_h, content):
     dest.merge_transformed_page(src, ctm)
 
 
-def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto", arrange="side"):
+def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto", arrange="side",
+                asis_indices=None):
     """Coupler: place pages two-per-sheet on a sheet_w×sheet_h sheet. With
     arrange="side" the two pages sit left/right (each fit into sheet_w/2 ×
     sheet_h); with arrange="stack" they sit top/bottom (each into sheet_w ×
     sheet_h/2). Pages are rotated per content mode, centered, never enlarged.
     An odd final page sits alone in slot 0. 2× Letter-portrait → 11×17
     landscape (side) or 2× Letter-landscape → 11×17 portrait (stack) fit
-    exactly (no scaling)."""
+    exactly (no scaling). Page indices in `asis_indices` keep their current
+    orientation (per-page 'flip' overrides already baked the rotation in)."""
+    asis_indices = asis_indices or set()
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
         pages = list(reader.pages)
@@ -958,7 +1003,8 @@ def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto", arrange="side"):
                 sh = float(pg.mediabox.height)
                 if sw <= 0 or sh <= 0:
                     continue
-                rot = _wants_rotation(sw, sh, half_w, half_h, content)
+                pc = "asis" if (i + slot) in asis_indices else content
+                rot = _wants_rotation(sw, sh, half_w, half_h, pc)
                 ew, eh = (sh, sw) if rot else (sw, sh)
                 scale = min(half_w / ew, half_h / eh, 1.0)
                 # Cell origin (PDF y grows upward, so slot 0 is the TOP row).
@@ -979,15 +1025,16 @@ def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto", arrange="side"):
         return pdf_bytes
 
 
-def _apply_nup(pdf_bytes, layout):
+def _apply_nup(pdf_bytes, layout, asis_indices=None):
     """Apply the 2-up coupler to an ASSEMBLED document if layout.nup == 2.
     No-op otherwise. Used by the preview, Create PDF, and the sign flow so
-    all three agree."""
+    all three agree. `asis_indices` lists page indices (in the assembled doc)
+    whose orientation was already set by a per-page flip and must be left as-is."""
     if layout.nup == 2:
         sheet = _sheet_dims(layout.size, layout.paper)
         if sheet:
             return _impose_2up(pdf_bytes, sheet[0], sheet[1], layout.content,
-                               layout.arrange)
+                               layout.arrange, asis_indices)
     return pdf_bytes
 
 
@@ -5989,9 +6036,16 @@ class PreviewTab:
                 skipped_labels.append(it.label)
             else:
                 pending += 1
-        for key in self.app.reorder_keys(natural):
-            writer.add_page(page_map[key])
+        asis_idx = set()
+        for out_i, key in enumerate(self.app.reorder_keys(natural)):
+            pg = page_map[key]
+            turns = self.app.page_rotate.get(key, 0)
+            if turns:
+                pg = _rotate_page_baked(pg, turns)
+                asis_idx.add(out_i)
+            writer.add_page(pg)
             self._page_sources.append(key)
+        self._asis_idx = asis_idx
         self._hidden_count = hidden
 
         if len(writer.pages) == 0:
@@ -6016,7 +6070,8 @@ class PreviewTab:
         # preview shows the actual imposed result.
         buf = io.BytesIO()
         writer.write(buf)
-        combined_bytes = _apply_nup(buf.getvalue(), self.app._current_layout())
+        combined_bytes = _apply_nup(buf.getvalue(), self.app._current_layout(),
+                                    getattr(self, "_asis_idx", None))
         combined_bytes = apply_style(combined_bytes, self.app.style, self.app)
         self._teardown_pdf()
         try:
@@ -6343,17 +6398,28 @@ class OrderTab:
         self.app = app
         self.frame = parent
 
-        # ----- Toolbar
+        # ----- Toolbar. Two rows so nothing ever clips on a narrow window:
+        # row 1 = controls (always visible), row 2 = wrapping hint text.
         bar = ttk.Frame(self.frame)
-        bar.pack(fill="x", padx=8, pady=(8, 4))
-        # Hint text adapts to 2-up: it explains pairing when the grid is paired.
-        self.hint_lbl = ttk.Label(bar, text="", foreground="#555")
-        self.hint_lbl.pack(side="left")
-        self.reset_btn = ttk.Button(bar, text="Reset to original order",
+        bar.pack(fill="x", padx=8, pady=(8, 2))
+        # Drag mode: whole pages (re-pairs under 2-up) vs whole sheets (move a
+        # pair as a unit). Only meaningful under 2-up; shown always for clarity.
+        self.drag_mode = tk.StringVar(value="page")
+        ttk.Label(bar, text="Drag:").pack(side="left")
+        ttk.Radiobutton(bar, text="Pages", value="page",
+                        variable=self.drag_mode).pack(side="left")
+        ttk.Radiobutton(bar, text="Sheets", value="sheet",
+                        variable=self.drag_mode).pack(side="left", padx=(0, 6))
+        # Buttons packed right FIRST so they always stay on-screen.
+        self.reset_btn = ttk.Button(bar, text="Reset order",
                                     command=self._reset_order)
         self.reset_btn.pack(side="right")
         ttk.Button(bar, text="↻ Refresh", command=self.refresh
                    ).pack(side="right", padx=(0, 6))
+        # Row 2: hint text — wraps so long messages never push anything off.
+        self.hint_lbl = ttk.Label(self.frame, text="", foreground="#555",
+                                  justify="left", wraplength=560)
+        self.hint_lbl.pack(fill="x", padx=10, pady=(0, 4))
 
         # ----- Scrollable canvas of thumbnail cards
         wrap = ttk.Frame(self.frame)
@@ -6381,6 +6447,7 @@ class OrderTab:
 
         # Drag state
         self._drag_key = None
+        self._drag_pair = None
         self._drag_off = (0, 0)
         self._insert_idx = None
         self._targets = {}        # key -> (x, y) the card is easing toward
@@ -6414,7 +6481,10 @@ class OrderTab:
         else:
             self.canvas.yview_scroll(1, "units")
 
-    def _on_resize(self, _event=None):
+    def _on_resize(self, event=None):
+        # Keep the hint text wrapping to the visible width so it never clips.
+        if event is not None and event.width > 40:
+            self.hint_lbl.config(wraplength=event.width - 24)
         cols = self._compute_cols()
         if cols != self._cols and self._order:
             self._cols = cols
@@ -6441,14 +6511,18 @@ class OrderTab:
     def refresh(self):
         """Re-assemble the native page set and rebuild the thumbnail grid."""
         self._clear()
+        flip_note = ("  Click ⟳ on a page to flip just that page — but "
+                     "Create the PDF now, as changing size/orientation in "
+                     "Pages or Preview clears per-page flips.")
         if self._is_nup():
             self.hint_lbl.config(
                 text="2-up is on — each boxed row is one sheet (2 pages). "
-                     "Drag a page to another row to change which pages pair up.")
+                     "Drag in 'Pages' mode to change which pages pair up, or "
+                     "'Sheets' mode to move a whole pair." + flip_note)
         else:
             self.hint_lbl.config(
-                text="Drag a page to reorder the whole document. "
-                     "The Preview and the saved PDF follow this order.")
+                text="Drag a page to reorder the document; the Preview and "
+                     "saved PDF follow this order." + flip_note)
         if not (PIL_TK_OK and FLATTEN_OK):
             self._set_placeholder("Page thumbnails need pypdfium2 + Pillow.")
             self._dirty = False
@@ -6502,6 +6576,17 @@ class OrderTab:
                         background="white", highlightthickness=0,
                         width=self.CARD_W, height=self.CARD_H)
         card.pack_propagate(False)
+        # Top strip: the per-page flip button (⟳). Packed first so it sits
+        # above the thumbnail and stays clickable (it's not a drag handle).
+        top = tk.Frame(card, background="white")
+        top.pack(fill="x", side="top")
+        flipped = bool(self.app.page_rotate.get(key))
+        flip = tk.Button(top, text="⟳", font=("", 9), bd=1, padx=3, pady=0,
+                         relief="raised", cursor="hand2",
+                         fg=("#2b6cb0" if flipped else "#444"),
+                         command=lambda k=key: self._flip_page(k))
+        flip.pack(side="right", padx=2, pady=2)
+        Tooltip(flip, "Flip this page (portrait ↔ landscape)")
         img_lbl = tk.Label(card, image=self._thumb_refs[key],
                            background="white", cursor="fleur")
         img_lbl.pack(expand=True)
@@ -6509,12 +6594,26 @@ class OrderTab:
                        background="#fafafa", foreground="#444",
                        font=("", 9))
         cap.pack(fill="x", side="bottom")
-        # Drag bindings on the card and its children so a press anywhere works.
-        for w in (card, img_lbl, cap):
+        # Drag bindings on the card and its drag children (NOT the flip button).
+        for w in (card, img_lbl, cap, top):
             w.bind("<ButtonPress-1>", lambda e, k=key: self._on_press(e, k))
             w.bind("<B1-Motion>", self._on_motion)
             w.bind("<ButtonRelease-1>", self._on_release)
         self._cards[key] = card
+
+    def _flip_page(self, key):
+        """Per-page orientation override: rotate this one page +90° (cycles
+        through 4 turns). Ephemeral — cleared if the global size/orientation
+        changes (see App._on_page_mode_changed). Rebuilds the grid + preview."""
+        self.app.page_rotate[key] = (self.app.page_rotate.get(key, 0) + 1) % 4
+        if self.app.page_rotate[key] == 0:
+            self.app.page_rotate.pop(key, None)
+        self.invalidate()
+        self.refresh()
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+            if self.app._tab_is("Preview"):
+                self.app.preview.refresh_preview()
 
     def _slot_xy(self, idx):
         col = idx % self._cols
@@ -6617,6 +6716,12 @@ class OrderTab:
     # ---- drag handlers ----------------------------------------------------
     def _on_press(self, event, key):
         self._drag_key = key
+        # Sheet mode (only under 2-up): pick up the whole pair this page is in.
+        self._drag_pair = None
+        if self.drag_mode.get() == "sheet" and self._is_nup():
+            idx = self._order.index(key)
+            p = idx // 2
+            self._drag_pair = self._order[2 * p:2 * p + 2]
         cid = self._card_ids.get(key)
         if cid is not None:
             self.canvas.tag_raise(cid)
@@ -6667,8 +6772,16 @@ class OrderTab:
             return
         key = self._drag_key
         target = self._insert_idx if self._insert_idx is not None else 0
-        seq = [k for k in self._order if k != key]
-        seq.insert(min(target, len(seq)), key)
+        if self._drag_pair:
+            # Sheet mode: move the whole pair together, snapped to a sheet
+            # boundary (even index) so pairs stay intact.
+            pair = [k for k in self._drag_pair]
+            rest = [k for k in self._order if k not in pair]
+            pos = min((target // 2) * 2, len(rest))
+            seq = rest[:pos] + pair + rest[pos:]
+        else:
+            seq = [k for k in self._order if k != key]
+            seq.insert(min(target, len(seq)), key)
         changed = seq != self._order
         self._order = seq
         self.app.page_order = list(seq)
@@ -6678,6 +6791,7 @@ class OrderTab:
         if dropped is not None:
             dropped.config(relief="solid", bd=1)
         self._drag_key = None
+        self._drag_pair = None
         self._insert_idx = None
         # Renumber captions + settle the grid (animated glide into place).
         for i, k in enumerate(self._order):
@@ -7047,6 +7161,11 @@ class App:
         # (items in list order, each item's pages in document order). Keyed by
         # the same (uid, idx) tuples as excluded_pages so the two compose.
         self.page_order = []
+        # v1.57: per-page orientation override. (uid, idx) -> quarter turns
+        # (1 = 90° clockwise). Set by the per-page "flip" button on the Order
+        # tab; baked into that page at assembly so it overrides the global
+        # Content orientation without re-rendering the whole document.
+        self.page_rotate = {}
         # v1.55: Style-tab settings (watermark / page numbers / header-footer /
         # Bates / cover sheet). Applied as post-processing by apply_style() in
         # the preview, Create PDF, and Sign flows. Defaults = inactive (no-op).
@@ -7252,7 +7371,7 @@ class App:
         # --- Page size + Create -------------------------------------------
         opt = ttk.Frame(left)
         opt.pack(fill="x", **pad)
-        ttk.Label(opt, text="Page size:").pack(side="left")
+        ttk.Label(opt, text="Paper size:").pack(side="left")
         # Default page size: Letter for US/CA/MX/etc., A4 for the rest of
         # the world. "Original (images)" stays user-selectable but is no
         # longer the default — most users adding mixed content (PDFs,
@@ -7488,11 +7607,15 @@ class App:
             req_w = root.winfo_reqwidth()
             screen_w = root.winfo_screenwidth()
             screen_h = root.winfo_screenheight()
-            # Cap the auto-fit width: with the logo lifted to the top-right it
-            # no longer sits beside the wide Flatten/Orientation rows, so the
-            # window doesn't need to grow to clear it — keep it compact (≤780).
-            start_w = max(700, min(req_w + 16, 780, screen_w - 80))
+            # Open wide enough to show ALL content (the widest tab's controls),
+            # capped to the screen. We no longer cap to a compact width — never
+            # clip a button/control — but the wrapping toolbars keep tabs slim.
+            content_w = min(req_w + 16, screen_w - 40)
+            start_w = max(700, content_w)
             start_h = 720
+            # Floor the MIN size at the content size so the window can never be
+            # shrunk small enough to clip a clickable control.
+            root.minsize(max(680, content_w), 620)
             # Center on screen (top third vertically — looks better than dead
             # center on tall displays) instead of letting the WM drop it at 0,0.
             x = max(0, (screen_w - start_w) // 2)
@@ -7580,6 +7703,10 @@ class App:
                     key = (it.uid, local_idx)
                     if key in self.excluded_pages:
                         continue
+                    # Per-page flip: bake the override rotation into the page.
+                    turns = self.page_rotate.get(key, 0)
+                    if turns:
+                        pg = _rotate_page_baked(pg, turns)
                     pairs.append((key, pg))
                     labels[key] = it.label
         if not pairs:
@@ -7600,8 +7727,10 @@ class App:
         writer = PdfWriter()
         for key in ordered:
             if cell is not None:
+                # Flipped pages keep their baked orientation on the cell.
+                pc = "asis" if self.page_rotate.get(key) else layout.content
                 _place_page_on_sheet(writer, page_map[key],
-                                     cell[0], cell[1], layout.content)
+                                     cell[0], cell[1], pc)
             else:
                 writer.add_page(page_map[key])
         buf = io.BytesIO()
@@ -7613,6 +7742,11 @@ class App:
         orientation). Cached per-item renders used the OLD layout and are now
         stale — drop them and re-queue everything; the listbox flips back to
         '⏳ rendering' for each item."""
+        # A global orientation/size change re-renders every page, which would
+        # fight any per-page 'flip' overrides — so they're cleared here (the
+        # Order tab warns the user to Create first if they want to keep them).
+        if self.page_rotate:
+            self.page_rotate = {}
         for it in self.items:
             self._render_worker.reset_cache(it)
             self._render_worker.enqueue(it)
@@ -8753,9 +8887,16 @@ class App:
                     page_map[key] = pg
                     natural.append(key)
             # Emit in the custom page order (Order tab) so the signed PDF
-            # matches the arrangement shown in the preview.
-            for key in self.reorder_keys(natural):
-                writer.add_page(page_map[key])
+            # matches the arrangement shown in the preview, applying any
+            # per-page orientation flips.
+            asis_idx = set()
+            for out_i, key in enumerate(self.reorder_keys(natural)):
+                pg = page_map[key]
+                turns = self.page_rotate.get(key, 0)
+                if turns:
+                    pg = _rotate_page_baked(pg, turns)
+                    asis_idx.add(out_i)
+                writer.add_page(pg)
             if len(writer.pages) == 0:
                 self.work_queue.put((
                     "error", "No pages were created — nothing to sign."
@@ -8763,7 +8904,8 @@ class App:
                 return
             staged = io.BytesIO()
             writer.write(staged)
-            final = _apply_nup(staged.getvalue(), self._current_layout())
+            final = _apply_nup(staged.getvalue(), self._current_layout(),
+                               asis_idx)
             final = apply_style(final, self.style, self)
             self.work_queue.put(("ready_for_signing", final))
         except Exception as e:
@@ -8866,9 +9008,16 @@ class App:
             except Exception as e:
                 skipped.append(f"{it.label} ({e})")
 
-        # Emit pages in the custom Order-tab sequence (no-op when untouched).
-        for key in self.reorder_keys(natural):
-            writer.add_page(page_map[key])
+        # Emit pages in the custom Order-tab sequence (no-op when untouched),
+        # applying any per-page orientation flips.
+        asis_idx = set()
+        for out_i, key in enumerate(self.reorder_keys(natural)):
+            pg = page_map[key]
+            turns = self.page_rotate.get(key, 0)
+            if turns:
+                pg = _rotate_page_baked(pg, turns)
+                asis_idx.add(out_i)
+            writer.add_page(pg)
 
         if len(writer.pages) == 0:
             self.work_queue.put(("error", "No pages were created.\n\n" + "\n".join(skipped)))
@@ -8882,7 +9031,7 @@ class App:
             self.work_queue.put(("error", f"Could not assemble PDF: {e}"))
             return
         # Coupler: pair pages two-per-sheet onto the big landscape sheet.
-        orig_bytes = _apply_nup(staged.getvalue(), layout)
+        orig_bytes = _apply_nup(staged.getvalue(), layout, asis_idx)
         # Style pass: watermark / page numbers / header-footer / Bates / cover.
         orig_bytes = apply_style(orig_bytes, self.style, self)
         out_data = orig_bytes

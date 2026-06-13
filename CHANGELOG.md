@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.57
+- **Per-page orientation flip (Order tab).** Each page card has a ⟳ button to
+  rotate just that page 90° (cycles through 4 turns), overriding the global
+  Content orientation. Implemented as a baked rotation applied at assembly via
+  `_rotate_page_baked`; under 2-up the flipped page is imposed `asis` (no
+  double-rotation). Honoured by Preview, Create PDF, and Sign.
+  - **Ephemeral by design:** per-page flips are cleared by
+    `_on_page_mode_changed` (a global size/orientation change re-renders every
+    page), and the Order hint warns the user to Create the PDF first.
+- **Page vs Sheet drag (Order tab).** A "Drag: Pages / Sheets" switch. Pages
+  mode drags individual pages (changes 2-up pairings); Sheets mode (under 2-up)
+  picks up the whole pair and moves it as a unit, snapped to sheet boundaries.
+- **No clipped controls.** The window now opens at the content width (no longer
+  capped to a compact 780px) and its minimum size is floored at the content
+  size, so buttons like the Order tab's Refresh/Reset are never hidden. Order
+  toolbar split into a controls row + a wrapping hint row.
+- Renamed "Page size" → "Paper size" on the Pages tab.
+
 ## v1.56
 - **Choose 2-up pairings in the Order tab.** With 2-up on, the Order grid now
   lays out two pages per row inside a labeled "Sheet N" box, so each row is one
