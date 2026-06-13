@@ -102,12 +102,22 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.51"
+APP_VERSION = "1.52"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.52": [
+        "2-up now arranges pages either side-by-side or stacked one above the "
+        "other — pick it on the Preview tab's '2-up' control. Side-by-side "
+        "uses a landscape sheet, stacked uses a portrait one, so the pages fit "
+        "the sheet cleanly either way.",
+        "Tidier main window: the MyDocMaker logo moved up to the top-right of "
+        "the button area, reclaiming the empty space, and the window now opens "
+        "centered on screen at a more compact width instead of off in the "
+        "top-left corner.",
+    ],
     "1.51": [
         "Fixed: the live Preview could go blank (gray, no pages) while 2-up "
         "was turned on. The preview now renders the paired sheets correctly, "
@@ -831,9 +841,10 @@ def _page_size_pt(page_mode):
 #   size:    "original" | "a4" | "a3" | "letter" | "tabloid"
 #   paper:   "portrait" | "landscape"   (orientation of the OUTPUT sheet)
 #   content: "auto" | "portrait" | "landscape"  (how source content sits on it)
-#   nup:     1 | 2   (2 = "coupler": two pages side-by-side per sheet)
-PageLayout = namedtuple("PageLayout", "size paper content nup")
-DEFAULT_LAYOUT = PageLayout("original", "portrait", "auto", 1)
+#   nup:     1 | 2   (2 = "coupler": two pages per sheet)
+#   arrange: "side" | "stack"  (2-up layout: side-by-side or one-above-other)
+PageLayout = namedtuple("PageLayout", "size paper content nup arrange")
+DEFAULT_LAYOUT = PageLayout("original", "portrait", "auto", 1, "side")
 
 
 def _sheet_dims(size, paper="portrait"):
@@ -888,11 +899,13 @@ def _place_page_on_sheet(writer, src, sheet_w, sheet_h, content):
     dest.merge_transformed_page(src, ctm)
 
 
-def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto"):
-    """Coupler: place pages two-per-sheet, side by side, on a sheet_w×sheet_h
-    landscape sheet. Each page is fit into its half (sheet_w/2 × sheet_h),
-    rotated per content mode, centered, never enlarged. An odd final page
-    sits alone on the left half. 2× Letter-portrait → 11×17 landscape fits
+def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto", arrange="side"):
+    """Coupler: place pages two-per-sheet on a sheet_w×sheet_h sheet. With
+    arrange="side" the two pages sit left/right (each fit into sheet_w/2 ×
+    sheet_h); with arrange="stack" they sit top/bottom (each into sheet_w ×
+    sheet_h/2). Pages are rotated per content mode, centered, never enlarged.
+    An odd final page sits alone in slot 0. 2× Letter-portrait → 11×17
+    landscape (side) or 2× Letter-landscape → 11×17 portrait (stack) fit
     exactly (no scaling)."""
     try:
         reader = PdfReader(io.BytesIO(pdf_bytes))
@@ -900,19 +913,26 @@ def _impose_2up(pdf_bytes, sheet_w, sheet_h, content="auto"):
         if not pages:
             return pdf_bytes
         writer = PdfWriter()
-        half_w = sheet_w / 2.0
+        vertical = (arrange == "stack")
+        # The cell each page fits into. Side: two columns; stack: two rows.
+        half_w = sheet_w if vertical else sheet_w / 2.0
+        half_h = sheet_h / 2.0 if vertical else sheet_h
         for i in range(0, len(pages), 2):
             dest = writer.add_blank_page(width=sheet_w, height=sheet_h)
-            for slot, pg in enumerate(pages[i:i + 2]):   # 0 = left, 1 = right
+            # slot 0 = left/top, slot 1 = right/bottom.
+            for slot, pg in enumerate(pages[i:i + 2]):
                 sw = float(pg.mediabox.width)
                 sh = float(pg.mediabox.height)
                 if sw <= 0 or sh <= 0:
                     continue
-                rot = _wants_rotation(sw, sh, half_w, sheet_h, content)
+                rot = _wants_rotation(sw, sh, half_w, half_h, content)
                 ew, eh = (sh, sw) if rot else (sw, sh)
-                scale = min(half_w / ew, sheet_h / eh, 1.0)
-                dx = slot * half_w + (half_w - ew * scale) / 2.0
-                dy = (sheet_h - eh * scale) / 2.0
+                scale = min(half_w / ew, half_h / eh, 1.0)
+                # Cell origin (PDF y grows upward, so slot 0 is the TOP row).
+                cell_x = 0.0 if vertical else slot * half_w
+                cell_y = (1 - slot) * half_h if vertical else 0.0
+                dx = cell_x + (half_w - ew * scale) / 2.0
+                dy = cell_y + (half_h - eh * scale) / 2.0
                 if rot:
                     ctm = (Transformation().rotate(90).translate(sh, 0)
                            .scale(scale, scale).translate(dx, dy))
@@ -933,7 +953,8 @@ def _apply_nup(pdf_bytes, layout):
     if layout.nup == 2:
         sheet = _sheet_dims(layout.size, layout.paper)
         if sheet:
-            return _impose_2up(pdf_bytes, sheet[0], sheet[1], layout.content)
+            return _impose_2up(pdf_bytes, sheet[0], sheet[1], layout.content,
+                               layout.arrange)
     return pdf_bytes
 
 
@@ -5459,6 +5480,16 @@ class PreviewTab:
                             command=self.app._on_page_mode_changed
                             ).pack(side="left")
 
+        # 2-up arrangement — only matters when 2-up is on, but it lives here on
+        # the same row (room to spare) so all the on-sheet layout controls sit
+        # together. Side = pages left/right, Stacked = one above the other.
+        ttk.Label(bar, text="2-up:").pack(side="left", padx=(20, 4))
+        for _txt, _val in (("Side by side", "side"), ("Stacked", "stack")):
+            ttk.Radiobutton(bar, text=_txt, value=_val,
+                            variable=self.app.arrange_var,
+                            command=self.app._on_arrange_changed
+                            ).pack(side="left")
+
         ttk.Button(bar, text="↻ Refresh", command=self.refresh_preview
                    ).pack(side="right")
         # Restore hidden pages — only meaningful once the user has hidden at
@@ -6066,25 +6097,19 @@ class App:
         for ev in ("<Button-3>", "<Button-2>", "<Control-Button-1>"):
             self.listbox.bind(ev, self._on_listbox_right_click)
 
-        # --- Reorder / remove buttons -------------------------------------
-        btns = ttk.Frame(pages_tab)
-        btns.pack(fill="x", **pad)
-        # Row 1: reorder / remove (acts on the existing list)
-        ttk.Button(btns, text="↑ Up", command=self.move_up).pack(side="left")
-        ttk.Button(btns, text="↓ Down", command=self.move_down).pack(side="left", padx=4)
-        ttk.Button(btns, text="Remove", command=self.remove_sel).pack(side="left")
-        ttk.Button(btns, text="Clear all", command=self.clear_all).pack(side="left", padx=4)
-
-        # Row 2+: the add-source buttons, page-size and flatten options sit in
-        # a left column; the brand logo fills the empty space to their right
-        # (bottom-right of the Pages tab), per the logo-position spec.
-        controls = ttk.Frame(pages_tab)
-        controls.pack(fill="x")
-        left = ttk.Frame(controls)
+        # --- Button / options block with the brand logo at top-right ------
+        # One horizontal block: every action row stacks in a left column, and
+        # the brand logo sits at the TOP-right beside the reorder + add-source
+        # rows — filling space that used to sit empty. Anchoring it up here
+        # (rather than low beside the wide Flatten/Orientation rows) also keeps
+        # the window from auto-widening to clear it. (v1.52)
+        block = ttk.Frame(pages_tab)
+        block.pack(fill="x")
+        left = ttk.Frame(block)
 
         # Brand logo — transparent PNG (logoMDM.png). Packed before the left
         # column so it keeps its width when the column expands to fill the
-        # rest of the row. Anchored bottom-right; blends with the window bg.
+        # rest of the row. Anchored top-right; blends with the window bg.
         logo_path = _find_app_logo()
         if logo_path and PIL_TK_OK:
             try:
@@ -6093,10 +6118,10 @@ class App:
                 w = max(1, round(src.width * target_h / src.height))
                 self._brand_logo_ref = _ImageTk.PhotoImage(
                     src.resize((w, target_h), LANCZOS))
-                logo_lbl = ttk.Label(controls, image=self._brand_logo_ref,
+                logo_lbl = ttk.Label(block, image=self._brand_logo_ref,
                                      cursor="hand2")
-                logo_lbl.pack(side="right", anchor="se", padx=(8, 14),
-                              pady=(2, 8))
+                logo_lbl.pack(side="right", anchor="n", padx=(8, 14),
+                              pady=(2, 4))
                 logo_lbl.bind(
                     "<Button-1>",
                     lambda _e: webbrowser.open(WEBSITE_URL))
@@ -6105,6 +6130,14 @@ class App:
                 self._brand_logo_ref = None
 
         left.pack(side="left", fill="x", expand=True)
+
+        # Row 1: reorder / remove (acts on the existing list)
+        btns = ttk.Frame(left)
+        btns.pack(fill="x", **pad)
+        ttk.Button(btns, text="↑ Up", command=self.move_up).pack(side="left")
+        ttk.Button(btns, text="↓ Down", command=self.move_down).pack(side="left", padx=4)
+        ttk.Button(btns, text="Remove", command=self.remove_sel).pack(side="left")
+        ttk.Button(btns, text="Clear all", command=self.clear_all).pack(side="left", padx=4)
 
         # Add-from-source buttons. Their own line so the Scan button
         # doesn't get clipped on narrower windows.
@@ -6153,6 +6186,10 @@ class App:
         # it always exists; its radios live in the Preview tab) = how the
         # original content sits on the sheet. nup_var = the coupler.
         self.content_var = tk.StringVar(value="auto")
+        # 2-up arrangement: "side" (left/right) or "stack" (top/bottom). Its
+        # radios live on the Preview tab's Content row; set here so it always
+        # exists before _current_layout / PreviewTab are first used.
+        self.arrange_var = tk.StringVar(value="side")
         orient_row = ttk.Frame(left)
         orient_row.pack(fill="x", **pad)
         ttk.Label(orient_row, text="Orientation:").pack(side="left")
@@ -6343,8 +6380,17 @@ class App:
             root.update_idletasks()
             req_w = root.winfo_reqwidth()
             screen_w = root.winfo_screenwidth()
-            start_w = max(700, min(req_w + 16, screen_w - 80))
-            root.geometry(f"{start_w}x720")
+            screen_h = root.winfo_screenheight()
+            # Cap the auto-fit width: with the logo lifted to the top-right it
+            # no longer sits beside the wide Flatten/Orientation rows, so the
+            # window doesn't need to grow to clear it — keep it compact (≤780).
+            start_w = max(700, min(req_w + 16, 780, screen_w - 80))
+            start_h = 720
+            # Center on screen (top third vertically — looks better than dead
+            # center on tall displays) instead of letting the WM drop it at 0,0.
+            x = max(0, (screen_w - start_w) // 2)
+            y = max(0, (screen_h - start_h) // 3)
+            root.geometry(f"{start_w}x{start_h}+{x}+{y}")
         except Exception:
             pass
 
@@ -6372,6 +6418,7 @@ class App:
             self.orient_var.get() if hasattr(self, "orient_var") else "portrait",
             self.content_var.get() if hasattr(self, "content_var") else "auto",
             2 if (hasattr(self, "nup_var") and self.nup_var.get()) else 1,
+            self.arrange_var.get() if hasattr(self, "arrange_var") else "side",
         )
 
     def _on_page_mode_changed(self):
@@ -6387,17 +6434,29 @@ class App:
             self.preview.invalidate()
 
     def _on_nup_changed(self):
-        """2-up toggle. Turning it on auto-selects the matching big landscape
-        sheet (Letter⇒11×17, A4⇒A3) so two pages pair up cleanly; that change
-        re-renders items. Turning it off just refreshes the preview (the
+        """2-up toggle. Turning it on auto-selects the matching big sheet
+        (Letter⇒11×17, A4⇒A3) and the sheet orientation that pairs the two
+        pages cleanly — landscape for side-by-side, portrait for stacked; that
+        change re-renders items. Turning it off just refreshes the preview (the
         per-item renders don't depend on 2-up)."""
         if self.nup_var.get():
             big = {"a4": "a3", "a3": "a3"}.get(self.size_var.get(), "tabloid")
             self.size_var.set(big)
-            self.orient_var.set("landscape")
+            stacked = self.arrange_var.get() == "stack"
+            self.orient_var.set("portrait" if stacked else "landscape")
         # Either way: per-item rendering differs under 2-up (native vs imposed
         # on the sheet), so drop the caches, re-render, and rebuild the preview.
         self._on_page_mode_changed()
+
+    def _on_arrange_changed(self):
+        """2-up arrangement changed (side-by-side ↔ stacked). Only meaningful
+        while 2-up is on: flip the sheet orientation so the two halves fit
+        cleanly (side⇒landscape, stack⇒portrait), then re-impose. If 2-up is
+        off it's a no-op beyond remembering the choice for next time."""
+        if hasattr(self, "nup_var") and self.nup_var.get():
+            stacked = self.arrange_var.get() == "stack"
+            self.orient_var.set("portrait" if stacked else "landscape")
+            self._on_page_mode_changed()
 
     def _restore_session(self):
         items_data, page_mode, flatten, dropped = load_session_state()

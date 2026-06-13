@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.52
+- **2-up arrangement: side-by-side or stacked.** The Preview tab's Content row
+  now has a "2-up" control to choose whether the two pages sit left/right
+  (side-by-side, on a landscape sheet) or one above the other (stacked, on a
+  portrait sheet). Each arrangement auto-picks the sheet orientation that fits
+  the pair cleanly, and `_impose_2up` splits the sheet by width or height
+  accordingly. (`PageLayout` gained an `arrange` field carried through the
+  preview, Create PDF, and Sign & Create flows.)
+- **Tidier, more compact main window.** The brand logo moved from the
+  bottom-right up to the top-right of the button area (beside the reorder and
+  add-source rows), reclaiming previously empty space. With the logo no longer
+  beside the wide Flatten/Orientation rows, the start-up width is capped
+  (≤780px) instead of auto-expanding to ~900px, and the window now opens
+  centered on screen (top-third) rather than in the top-left corner.
+
 ## v1.51
 - **Fixed: blank/gray Preview while 2-up was enabled.** A regression from
   v1.50 (per-page Remove was gated off under 2-up, but the cleanup-list append
