@@ -102,12 +102,19 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.52"
+APP_VERSION = "1.53"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.53": [
+        "New Order tab — arrange your whole document visually. It shows every "
+        "page as a thumbnail; drag any page to a new spot and the rest slide "
+        "aside to make room. Drop it and the Preview and the saved PDF follow "
+        "the new order. Works across files too — pull page 3 of one PDF in "
+        "between pages of another. 'Reset to original order' undoes it all.",
+    ],
     "1.52": [
         "2-up now arranges pages either side-by-side or stacked one above the "
         "other — pick it on the Preview tab's '2-up' control. Side-by-side "
@@ -6012,8 +6019,10 @@ class OrderTab:
 
         # Drag state
         self._drag_key = None
-        self._drag_start = (0, 0)
+        self._drag_off = (0, 0)
         self._insert_idx = None
+        self._targets = {}        # key -> (x, y) the card is easing toward
+        self._anim_id = None      # pending after() id for the ease loop
 
         self._placeholder = None
 
@@ -6133,26 +6142,61 @@ class OrderTab:
         return x, y
 
     def _layout(self, animate=True, skip_key=None, insert_idx=None):
-        """Place every card at its grid slot. When dragging, `skip_key` is the
-        lifted card (positioned by the cursor instead) and `insert_idx` is the
-        slot held open for it."""
+        """Assign every card a target grid slot. When dragging, `skip_key` is
+        the lifted card (it follows the cursor, not a slot) and `insert_idx`
+        is the slot held open for it. With animate=True the cards ease toward
+        their new targets (smooth "make space"); with animate=False they snap
+        (used on first build and on resize)."""
         seq = [k for k in self._order if k != skip_key]
         if skip_key is not None and insert_idx is not None:
-            # Open a gap: cards at/after insert_idx shift one slot down.
+            # Open a gap: cards at/after insert_idx shift one slot along.
             display = seq[:insert_idx] + [None] + seq[insert_idx:]
         else:
             display = seq
+        self._targets = {}
         for idx, key in enumerate(display):
-            if key is None or key == skip_key:
+            if key is None:
                 continue
             x, y = self._slot_xy(idx)
+            self._targets[key] = (x, y)
             cid = self._card_ids.get(key)
             if cid is None:
                 self._card_ids[key] = self.canvas.create_window(
                     x, y, anchor="nw", window=self._cards[key])
-            else:
+            elif not animate:
                 self.canvas.coords(cid, x, y)
         self._update_scrollregion(len(self._order))
+        if animate:
+            self._kick_anim()
+
+    def _kick_anim(self):
+        if self._anim_id is None:
+            self._anim_id = self.canvas.after(16, self._animate)
+
+    def _animate(self):
+        """Ease each non-dragged card a fraction toward its target slot. (a):
+        gives the gap a smooth glide instead of a jump. Reschedules until
+        everything is within a pixel of its target."""
+        self._anim_id = None
+        moving = False
+        for key, (tx, ty) in self._targets.items():
+            if key == self._drag_key:
+                continue
+            cid = self._card_ids.get(key)
+            if cid is None:
+                continue
+            try:
+                x, y = self.canvas.coords(cid)
+            except (tk.TclError, ValueError):
+                continue
+            dx, dy = tx - x, ty - y
+            if abs(dx) < 1 and abs(dy) < 1:
+                self.canvas.coords(cid, tx, ty)
+                continue
+            self.canvas.coords(cid, x + dx * 0.4, y + dy * 0.4)
+            moving = True
+        if moving:
+            self._anim_id = self.canvas.after(16, self._animate)
 
     def _update_scrollregion(self, n):
         rows = (n + self._cols - 1) // self._cols
@@ -6166,6 +6210,7 @@ class OrderTab:
         cid = self._card_ids.get(key)
         if cid is not None:
             self.canvas.tag_raise(cid)
+            self._cards[key].config(relief="raised", bd=2)
         # offset of the cursor within the card, in canvas coords
         cx = self.canvas.canvasx(event.x_root - self.canvas.winfo_rootx())
         cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
@@ -6183,20 +6228,28 @@ class OrderTab:
         cy = self.canvas.canvasy(event.y_root - self.canvas.winfo_rooty())
         nx = cx - self._drag_off[0]
         ny = cy - self._drag_off[1]
-        self.canvas.coords(cid, nx, ny)
-        # Which slot is the card's center over?
-        idx = self._slot_at(cx, cy)
+        self.canvas.coords(cid, nx, ny)            # dragged card tracks cursor
+        # (b) accurate insert index: use the dragged card's CENTER and round to
+        # the nearest gap boundary, so the slot flips exactly at the midpoint.
+        idx = self._insert_index_at(nx + self.CARD_W / 2.0,
+                                    ny + self.CARD_H / 2.0)
         if idx != self._insert_idx:
             self._insert_idx = idx
             self._layout(skip_key=self._drag_key, insert_idx=idx)
             self.canvas.tag_raise(cid)
 
-    def _slot_at(self, x, y):
-        col = int((x - self.MARGIN) // (self.CARD_W + self.GAP))
-        row = int((y - self.MARGIN) // (self.CARD_H + self.GAP))
-        col = max(0, min(self._cols - 1, col))
+    def _insert_index_at(self, cx, cy):
+        """Map a point (the dragged card's center) to an insertion index among
+        the stationary cards. Rounds to the nearest column boundary so the gap
+        opens on the side the card's center has crossed."""
+        eff_w = self.CARD_W + self.GAP
+        eff_h = self.CARD_H + self.GAP
+        col = round((cx - self.MARGIN) / eff_w)
+        col = max(0, min(self._cols, col))
+        row = int((cy - self.MARGIN + eff_h / 2.0) // eff_h)
         row = max(0, row)
         idx = row * self._cols + col
+        # Stationary cards = len(order) - 1, so insert index spans [0, that].
         return max(0, min(len(self._order) - 1, idx))
 
     def _on_release(self, _event):
@@ -6209,16 +6262,21 @@ class OrderTab:
         changed = seq != self._order
         self._order = seq
         self.app.page_order = list(seq)
+        # Drop the lifted styling; clear drag state BEFORE laying out so the
+        # dropped card eases into its slot like the rest.
+        dropped = self._cards.get(key)
+        if dropped is not None:
+            dropped.config(relief="solid", bd=1)
         self._drag_key = None
         self._insert_idx = None
-        # Renumber captions + settle the grid.
+        # Renumber captions + settle the grid (animated glide into place).
         for i, k in enumerate(self._order):
             card = self._cards.get(k)
             if card is not None:
                 for child in card.winfo_children():
                     if isinstance(child, tk.Label) and child.cget("text").isdigit():
                         child.config(text=str(i + 1))
-        self._layout(animate=False)
+        self._layout(animate=True)
         self._update_reset_btn()
         if changed and hasattr(self.app, "preview"):
             self.app.preview.invalidate()
@@ -6249,6 +6307,13 @@ class OrderTab:
             fill="#666", font=("", 11), width=520)
 
     def _clear(self):
+        if self._anim_id is not None:
+            try:
+                self.canvas.after_cancel(self._anim_id)
+            except (tk.TclError, ValueError):
+                pass
+            self._anim_id = None
+        self._targets = {}
         self.canvas.delete("all")
         for card in self._cards.values():
             try:

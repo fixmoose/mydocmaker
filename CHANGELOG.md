@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.53
+- **New "Order" tab — visual page reordering.** A scrollable grid shows every
+  page across all added files as a thumbnail. Drag a page and the grid opens a
+  gap at the hovered slot (smooth animated "make space"); drop it to commit the
+  new sequence. Reordering is **per page across items** — you can pull page 3
+  of one PDF in between pages of another. The Preview, Create PDF, and Sign &
+  Create flows all honour the order, and it composes with per-page hiding.
+  "Reset to original order" restores the natural sequence.
+  - Implementation: `App.page_order` holds an ordered list of
+    `(item.uid, local_idx)` page keys; `App.reorder_keys()` reconciles it
+    against the current pages (kept pages hold their order, new pages append in
+    natural position, removed pages drop out). All three assembly sites collect
+    pages keyed by `(uid, idx)` and emit in that order.
+
 ## v1.52
 - **2-up arrangement: side-by-side or stacked.** The Preview tab's Content row
   now has a "2-up" control to choose whether the two pages sit left/right
