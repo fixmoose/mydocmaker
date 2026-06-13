@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.47
+- **Create-signature dialog defaults to Digital.** Creating a new signature
+  now always lands on the Digital (full business stamp) option instead of
+  Typed. Editing an existing signature still opens in that signature's own
+  mode.
+- **Sponsor ♡ button works.** The footer heart now opens
+  https://github.com/sponsors/fixmoose — it was previously a no-op.
+- **New "About / License" panel** in the footer. MyDocMaker is free for
+  personal use under the PolyForm Noncommercial License; commercial use
+  requires a separate license. The panel links the commercial-pricing page
+  (mydocmaker.com/pricing), a commercial-licensing contact, and the full
+  license + third-party license texts. Fixed a stray `License: MIT` note in
+  the source header (the project is PolyForm-NC).
+
 ## v1.46
 - **Signature picker in the Sign dialog** — when you have more than one
   saved signature, choose which one each placed signature uses. Previously

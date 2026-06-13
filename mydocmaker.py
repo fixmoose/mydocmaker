@@ -14,7 +14,9 @@ the app is already running, the new files are appended to the existing list
 in that window via a local IPC socket — so right-clicking "Open With" again
 adds to the same project instead of opening another window.
 
-Author: Dejan Obradovic  ·  License: MIT
+Author: Dejan Obradovic  ·  License: PolyForm Noncommercial 1.0.0
+(free for personal/charity/educational/research/government use; commercial
+use requires a separate license — contact licensing@mydocmaker.com)
 """
 
 import os
@@ -97,12 +99,23 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.46"
+APP_VERSION = "1.47"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.47": [
+        "Creating a signature now always starts on the Digital option (the "
+        "full business stamp) — no more landing on Typed by default. Editing "
+        "an existing signature still opens in that signature's own mode.",
+        "The ♡ button in the footer now opens the GitHub Sponsors page "
+        "(it previously did nothing).",
+        "New 'About / License' button in the footer: MyDocMaker is free for "
+        "personal use; commercial use needs a separate license. Includes a "
+        "commercial-pricing link and one-click access to the full license "
+        "and third-party license texts.",
+    ],
     "1.46": [
         "Sign dialog now has a visible signature picker — when you have more "
         "than one saved signature, choose which one each placed signature "
@@ -760,6 +773,17 @@ def _open_with_default_viewer(path):
 UPDATE_API_URL = "https://api.github.com/repos/fixmoose/mydocmaker/releases/latest"
 UPDATE_PAGE_URL = "https://github.com/fixmoose/mydocmaker/releases/latest"
 SPONSOR_URL = "https://github.com/sponsors/fixmoose"
+WEBSITE_URL = "https://mydocmaker.com"
+LICENSE_URL = "https://github.com/fixmoose/mydocmaker/blob/main/LICENSE"
+THIRD_PARTY_LICENSES_URL = (
+    "https://github.com/fixmoose/mydocmaker/blob/main/THIRD-PARTY-LICENSES.md"
+)
+# Commercial-licensing contact + pricing page. MyDocMaker is free for personal
+# use under the PolyForm Noncommercial License; for-profit/commercial use needs
+# a separate license. PRICING_URL is baked in ahead of the site going live so
+# that copies installed beforehand still point to the right page once it's up.
+LICENSE_CONTACT_EMAIL = "licensing@mydocmaker.com"
+PRICING_URL = "https://mydocmaker.com/pricing"
 
 
 def _parse_version(s):
@@ -5781,6 +5805,8 @@ class App:
         Tooltip(sponsor_btn, "Support this project from Dejan & Claudia")
         ttk.Button(center_btns, text="Check for updates",
                    command=self.check_for_updates).pack(side="left", padx=(0, 6))
+        ttk.Button(center_btns, text="About / License",
+                   command=self.show_about_dialog).pack(side="left", padx=(0, 6))
         ttk.Button(center_btns, text="Close",
                    command=self.root.destroy).pack(side="left")
 
@@ -6528,6 +6554,71 @@ class App:
             webbrowser.open(SPONSOR_URL)
         except Exception:
             pass
+
+    def show_about_dialog(self):
+        """About + licensing info, with links to the full license texts and a
+        commercial-licensing contact. MyDocMaker is free for personal use;
+        commercial use needs a separate license."""
+        def _open(url):
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+        dlg = tk.Toplevel(self.root)
+        dlg.title("About MyDocMaker")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+
+        wrap = ttk.Frame(dlg)
+        wrap.pack(fill="both", expand=True, padx=16, pady=14)
+
+        ttk.Label(wrap, text=f"{APP_NAME}  v{APP_VERSION}",
+                  font=("", 14, "bold")).pack(anchor="w")
+        ttk.Label(
+            wrap,
+            text="Drop files or paste a website link, build a combined PDF, "
+                 "and sign it.",
+            foreground="#555",
+        ).pack(anchor="w", pady=(0, 10))
+
+        lic = ttk.LabelFrame(wrap, text="License")
+        lic.pack(fill="x")
+        ttk.Label(
+            lic, justify="left", wraplength=460,
+            text=(
+                "MyDocMaker is FREE for personal, charity, educational, "
+                "research, and government use, under the PolyForm "
+                "Noncommercial License 1.0.0.\n\n"
+                "Commercial use — any use at, by, or on behalf of a "
+                "for-profit company, including internal use — requires a "
+                "separate commercial license.\n\n"
+                f"Commercial pricing: {PRICING_URL}\n"
+                f"Questions: {LICENSE_CONTACT_EMAIL}"
+            ),
+        ).pack(anchor="w", padx=10, pady=8)
+
+        row1 = ttk.Frame(wrap)
+        row1.pack(fill="x", pady=(12, 0))
+        ttk.Button(row1, text="See commercial pricing",
+                   command=lambda: _open(PRICING_URL)).pack(side="left")
+        ttk.Button(row1, text="Email about commercial use",
+                   command=lambda: _open(f"mailto:{LICENSE_CONTACT_EMAIL}")
+                   ).pack(side="left", padx=6)
+
+        row2 = ttk.Frame(wrap)
+        row2.pack(fill="x", pady=(6, 0))
+        ttk.Button(row2, text="Read the full license",
+                   command=lambda: _open(LICENSE_URL)).pack(side="left")
+        ttk.Button(row2, text="Third-party licenses",
+                   command=lambda: _open(THIRD_PARTY_LICENSES_URL)
+                   ).pack(side="left", padx=6)
+
+        ttk.Button(wrap, text="Close", command=dlg.destroy
+                   ).pack(anchor="e", pady=(14, 0))
+
+        dlg.update_idletasks()
+        dlg.minsize(dlg.winfo_reqwidth(), dlg.winfo_reqheight())
 
     # --- Check for updates ---------------------------------------------------
     def check_for_updates(self):
