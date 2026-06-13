@@ -102,12 +102,22 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.55"
+APP_VERSION = "1.56"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.56": [
+        "Choose your 2-up pairings. When '2-up' is on, the Order tab now shows "
+        "one sheet per row (a boxed 'Sheet 1', 'Sheet 2', …, each holding two "
+        "pages). Drag a page into another row to pick exactly which two pages "
+        "share a sheet — no more automatic 1+2, 3+4 pairing only.",
+        "The Order tab thumbnails now match the real output. Page size, "
+        "orientation, and 'Content' rotation are reflected in the thumbnails "
+        "(previously 2-up always showed the un-rotated original), and the grid "
+        "refreshes live as pages finish rendering.",
+    ],
     "1.55": [
         "New Style tab — dress up the whole document. Add a watermark (one-click "
         "DRAFT / CONFIDENTIAL / INTERNAL / COPY presets, your own text, or a "
@@ -6336,12 +6346,9 @@ class OrderTab:
         # ----- Toolbar
         bar = ttk.Frame(self.frame)
         bar.pack(fill="x", padx=8, pady=(8, 4))
-        ttk.Label(
-            bar,
-            text="Drag a page to reorder the whole document. "
-                 "The Preview and the saved PDF follow this order.",
-            foreground="#555",
-        ).pack(side="left")
+        # Hint text adapts to 2-up: it explains pairing when the grid is paired.
+        self.hint_lbl = ttk.Label(bar, text="", foreground="#555")
+        self.hint_lbl.pack(side="left")
         self.reset_btn = ttk.Button(bar, text="Reset to original order",
                                     command=self._reset_order)
         self.reset_btn.pack(side="right")
@@ -6413,7 +6420,19 @@ class OrderTab:
             self._cols = cols
             self._layout(animate=False)
 
+    GROUP_H = 22   # vertical room above each pair row for the "Sheet N" label
+
+    def _is_nup(self):
+        """True when 2-up is on — the Order grid then shows one sheet (a pair
+        of pages) per row so the user can choose which pages pair up."""
+        return bool(getattr(self.app, "nup_var", None)) and self.app.nup_var.get()
+
+    def _row_pitch(self):
+        return self.CARD_H + self.GAP + (self.GROUP_H if self._is_nup() else 0)
+
     def _compute_cols(self):
+        if self._is_nup():
+            return 2   # one sheet = two pages, side by side, per row
         w = self.canvas.winfo_width() or self.canvas.winfo_reqwidth()
         usable = max(1, w - 2 * self.MARGIN)
         return max(1, usable // (self.CARD_W + self.GAP))
@@ -6422,6 +6441,14 @@ class OrderTab:
     def refresh(self):
         """Re-assemble the native page set and rebuild the thumbnail grid."""
         self._clear()
+        if self._is_nup():
+            self.hint_lbl.config(
+                text="2-up is on — each boxed row is one sheet (2 pages). "
+                     "Drag a page to another row to change which pages pair up.")
+        else:
+            self.hint_lbl.config(
+                text="Drag a page to reorder the whole document. "
+                     "The Preview and the saved PDF follow this order.")
         if not (PIL_TK_OK and FLATTEN_OK):
             self._set_placeholder("Page thumbnails need pypdfium2 + Pillow.")
             self._dirty = False
@@ -6493,7 +6520,9 @@ class OrderTab:
         col = idx % self._cols
         row = idx // self._cols
         x = self.MARGIN + col * (self.CARD_W + self.GAP)
-        y = self.MARGIN + row * (self.CARD_H + self.GAP)
+        # When 2-up, leave GROUP_H above each row for its "Sheet N" label.
+        head = self.GROUP_H if self._is_nup() else 0
+        y = self.MARGIN + row * self._row_pitch() + head
         return x, y
 
     def _layout(self, animate=True, skip_key=None, insert_idx=None):
@@ -6521,8 +6550,34 @@ class OrderTab:
             elif not animate:
                 self.canvas.coords(cid, x, y)
         self._update_scrollregion(len(self._order))
+        self._draw_groups()
         if animate:
             self._kick_anim()
+
+    def _draw_groups(self):
+        """When 2-up is on, draw a labeled box behind each pair row so the user
+        can see which two pages share a sheet. Purely visual — the pairing is
+        determined by order (pages 1&2 → sheet 1, 3&4 → sheet 2, …), so drag a
+        page to another row to re-pair it."""
+        self.canvas.delete("group")
+        if not self._is_nup():
+            return
+        n = len(self._order)
+        pitch = self._row_pitch()
+        for p in range((n + 1) // 2):
+            y = self.MARGIN + p * pitch
+            x0 = self.MARGIN - 6
+            x1 = self.MARGIN + 2 * self.CARD_W + self.GAP + 6
+            top = y + self.GROUP_H - 2
+            bot = y + self.GROUP_H + self.CARD_H + 6
+            rid = self.canvas.create_rectangle(
+                x0, top, x1, bot, outline="#9cb8d6", width=2,
+                fill="#eef4fb", tags="group")
+            self.canvas.create_text(
+                x0 + 4, y + self.GROUP_H / 2.0, anchor="w",
+                text=f"Sheet {p + 1}", fill="#2b6cb0",
+                font=("", 9, "bold"), tags="group")
+            self.canvas.tag_lower(rid)   # keep the box behind the cards
 
     def _kick_anim(self):
         if self._anim_id is None:
@@ -6555,7 +6610,7 @@ class OrderTab:
 
     def _update_scrollregion(self, n):
         rows = (n + self._cols - 1) // self._cols
-        h = self.MARGIN * 2 + rows * (self.CARD_H + self.GAP)
+        h = self.MARGIN * 2 + rows * self._row_pitch()
         w = self.canvas.winfo_width()
         self.canvas.config(scrollregion=(0, 0, w, max(h, 1)))
 
@@ -6598,10 +6653,10 @@ class OrderTab:
         the stationary cards. Rounds to the nearest column boundary so the gap
         opens on the side the card's center has crossed."""
         eff_w = self.CARD_W + self.GAP
-        eff_h = self.CARD_H + self.GAP
+        pitch = self._row_pitch()
         col = round((cx - self.MARGIN) / eff_w)
         col = max(0, min(self._cols, col))
-        row = int((cy - self.MARGIN + eff_h / 2.0) // eff_h)
+        row = int((cy - self.MARGIN + pitch / 2.0) // pitch)
         row = max(0, row)
         idx = row * self._cols + col
         # Stationary cards = len(order) - 1, so insert index spans [0, that].
@@ -7502,12 +7557,17 @@ class App:
         return ordered
 
     def build_ordered_native(self):
-        """Assemble the combined NATIVE pages (no 2-up imposition) from cached
-        per-item bytes, honouring per-page exclusions and the custom page
-        order. Returns (pdf_bytes, ordered_keys, labels): ordered_keys[i] is
-        the (uid, idx) source of page i, and labels maps each key to its item
-        label. Used by the Order tab to render its thumbnail grid. Returns
-        (b"", [], {}) when nothing is ready yet."""
+        """Assemble the per-page set for the Order grid from cached per-item
+        bytes, honouring exclusions + custom order. The thumbnails are rendered
+        the way each page will actually appear in the output:
+
+        - Normal mode: the cached bytes are already imposed at the current
+          size/orientation/content, so they're used as-is.
+        - 2-up mode: the cache is native (2-up pairs at assembly time), so each
+          page is imposed here onto its HALF-sheet cell (rotated/scaled per the
+          content setting) — matching how it'll sit on the paired sheet.
+
+        Returns (pdf_bytes, ordered_keys, labels). (b"", [], {}) when empty."""
         pairs = []
         labels = {}
         for it in self.items:
@@ -7527,9 +7587,23 @@ class App:
             return b"", [], {}
         page_map = dict(pairs)
         ordered = self.reorder_keys([k for k, _ in pairs])
+
+        layout = self._current_layout()
+        cell = None
+        if layout.nup == 2:
+            sheet = _sheet_dims(layout.size, layout.paper) or letter
+            if layout.arrange == "stack":
+                cell = (sheet[0], sheet[1] / 2.0)
+            else:
+                cell = (sheet[0] / 2.0, sheet[1])
+
         writer = PdfWriter()
         for key in ordered:
-            writer.add_page(page_map[key])
+            if cell is not None:
+                _place_page_on_sheet(writer, page_map[key],
+                                     cell[0], cell[1], layout.content)
+            else:
+                writer.add_page(page_map[key])
         buf = io.BytesIO()
         writer.write(buf)
         return buf.getvalue(), ordered, labels
@@ -8982,6 +9056,11 @@ class App:
                     # cache so the next debounce rebuild picks up the new
                     # bytes.
                     self._refresh()
+                    # If the Order tab is the one on screen, rebuild it now so
+                    # newly-rendered (or re-oriented) thumbnails appear live.
+                    if (msg[0] == "item_rendered" and hasattr(self, "order_tab")
+                            and self._tab_is("Order")):
+                        self.order_tab.refresh()
         except queue.Empty:
             pass
         self.root.after(120, self._poll_queue)

@@ -1,5 +1,18 @@
 # Changelog
 
+## v1.56
+- **Choose 2-up pairings in the Order tab.** With 2-up on, the Order grid now
+  lays out two pages per row inside a labeled "Sheet N" box, so each row is one
+  output sheet. Dragging a page into another row changes which two pages pair
+  up (pairing follows page order, which the drag controls). Replaces the old
+  fixed 1+2 / 3+4 pairing with full manual control.
+- **Order thumbnails now match the output.** `build_ordered_native` imposes
+  each page the way it will appear: normal mode uses the already-imposed cache;
+  2-up mode (whose cache is native) re-imposes each page onto its half-sheet
+  cell with the current content rotation. Fixes the Order tab showing the
+  un-rotated original when size/orientation/Content were changed.
+- **Order grid refreshes live** as items finish rendering while it's on screen.
+
 ## v1.55
 - **New "Style" tab** — document-wide finishing applied as a post-processing
   pass (`apply_style`), honoured identically by Preview, Create PDF, and Sign:
