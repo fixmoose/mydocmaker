@@ -37,6 +37,7 @@ import subprocess
 import threading
 import queue
 import urllib.request
+import urllib.error
 import uuid
 import webbrowser
 import traceback
@@ -102,12 +103,19 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.60"
+APP_VERSION = "1.61"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.61": [
+        "MyDocMaker now does a quick license check when it starts, so it needs "
+        "an internet connection to run. If you're offline you'll see “License "
+        "check failed. Please connect to internet.” — just reconnect and click "
+        "Retry. (The app already checks for updates about once a month; this "
+        "keeps it current as new features and licensing arrive.)",
+    ],
     "1.60": [
         "The per-page ⟳ flip now responds the instant you click — the button "
         "lights up and the page spins and resizes in a smooth little animation, "
@@ -1445,6 +1453,13 @@ THIRD_PARTY_LICENSES_URL = (
 # that copies installed beforehand still point to the right page once it's up.
 LICENSE_CONTACT_EMAIL = "licensing@mydocmaker.com"
 PRICING_URL = "https://mydocmaker.com/pricing"
+# Startup license/connectivity check. The app phones this endpoint on every
+# launch (the "keep-alive string"): it confirms the device is online, and the
+# JSON it returns is reserved for FUTURE licensing/trial/pricing enforcement —
+# a later release will read fields from it (e.g. trial_days, blocked_versions,
+# pricing nag). It may 404 or return {} today; that's fine — reaching it (or,
+# as a fallback, GitHub) proves connectivity, which is all the gate needs now.
+LICENSE_CHECK_URL = "https://mydocmaker.com/license.json"
 
 
 def _parse_version(s):
@@ -1458,6 +1473,47 @@ def _parse_version(s):
         if digits:
             parts.append(int(digits))
     return tuple(parts) if parts else (0,)
+
+
+def license_check(timeout=4.0):
+    """Startup license / connectivity check. Returns (online, info):
+
+    - `online` is True if the device can reach the internet. It is False ONLY
+      when every probe fails (genuinely offline) — a hiccup on mydocmaker.com
+      alone won't lock anyone out, because we fall back to GitHub.
+    - `info` is the parsed JSON from LICENSE_CHECK_URL when available (reserved
+      for future licensing/trial/pricing enforcement), else {}.
+
+    This is the per-launch "keep-alive string": forcing clients online means the
+    monthly update check will reach them, so a future release can roll out real
+    licensing. Today it only verifies connectivity."""
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    # 1) Phone home to mydocmaker.com — the control point + (future) licensing.
+    try:
+        req = urllib.request.Request(LICENSE_CHECK_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            try:
+                info = json.loads(resp.read().decode("utf-8"))
+                if not isinstance(info, dict):
+                    info = {}
+            except (ValueError, UnicodeDecodeError):
+                info = {}
+            return True, info
+    except urllib.error.HTTPError:
+        # Server answered (even a 404) → the internet is up.
+        return True, {}
+    except Exception:
+        pass
+    # 2) Fallback connectivity probe (GitHub API, already a dependency) so that
+    #    a mydocmaker.com outage doesn't block users who ARE online.
+    try:
+        req = urllib.request.Request(UPDATE_API_URL, headers=headers)
+        with urllib.request.urlopen(req, timeout=timeout):
+            return True, {}
+    except urllib.error.HTTPError:
+        return True, {}
+    except Exception:
+        return False, {}
 
 
 def fetch_latest_release_info(timeout=8.0):
@@ -1899,8 +1955,10 @@ def save_session_state(items, page_mode=None, flatten=None):
     if flatten is not None:
         data["flatten"] = bool(flatten)
     # Preserve non-session fields (archive_folder, auto-update bookkeeping,
-    # future prefs) so a session save doesn't blow them away.
-    for k in ("archive_folder", "auto_update_check", "last_update_check"):
+    # license-gate bookkeeping, future prefs) so a session save doesn't blow
+    # them away.
+    for k in ("archive_folder", "auto_update_check", "last_update_check",
+              "install_date", "last_license_check"):
         if k in existing:
             data[k] = existing[k]
     try:
@@ -9474,6 +9532,37 @@ def main():
         except tk.TclError:
             pass
 
+    # --- Startup license / connectivity gate --------------------------------
+    # The app phones home every launch; if the device is offline it won't start.
+    # This keeps clients online so the monthly update check can reach them (the
+    # channel for a future licensing/pricing rollout). A source/dev run can set
+    # MYDOCMAKER_SKIP_LICENSE=1 to bypass (ignored in shipped/frozen builds).
+    _dev_skip = (not getattr(sys, "frozen", False)
+                 and os.environ.get("MYDOCMAKER_SKIP_LICENSE"))
+    if not _dev_skip:
+        root.withdraw()   # keep the main window hidden until the check passes
+        while True:
+            online, lic_info = license_check()
+            if online:
+                break
+            retry = messagebox.askretrycancel(
+                APP_NAME,
+                "License check failed. Please connect to internet.",
+            )
+            if not retry:
+                root.destroy()
+                return
+        # First successful launch: stamp the install date (anchor for the
+        # future 60-day trial). Also record this check time.
+        try:
+            if not _get_pref("install_date"):
+                _set_pref("install_date", time.time())
+            _set_pref("last_license_check", time.time())
+        except Exception:
+            pass
+        # Stays withdrawn until the App is fully built (deiconified before the
+        # mainloop) so the user never sees an empty window during the check.
+
     app = App(root)
     if cli_paths:
         app.add_paths(cli_paths)
@@ -9495,6 +9584,13 @@ def main():
             root.createcommand("::tk::mac::OpenDocument", _mac_open_documents)
         except tk.TclError:
             pass
+
+    # Reveal the window now that it's fully built (it was hidden during the
+    # startup license check). No-op if it was never withdrawn.
+    try:
+        root.deiconify()
+    except tk.TclError:
+        pass
 
     root.mainloop()
 

@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.61
+- **Startup license / connectivity gate.** Every launch the app phones home
+  (`license_check`) before the window opens; if the device is offline it shows
+  "License check failed. Please connect to internet." with Retry/Cancel and
+  won't start. Blocks only when *genuinely* offline — it tries
+  `mydocmaker.com/license.json` first (the future licensing/trial/pricing
+  endpoint, reserved for a later release to read) and falls back to the GitHub
+  API, so a mydocmaker.com hiccup alone never locks anyone out.
+  - This is the "keep-alive string": forcing clients online ensures the
+    existing monthly update check (`UPDATE_CHECK_INTERVAL_DAYS = 30`) reaches
+    them, so licensing/pricing can roll out via a future update.
+  - Records `install_date` once (anchor for the planned 60-day commercial
+    trial) and `last_license_check` each launch; both added to
+    `save_session_state`'s preserved-keys so a session save can't drop them.
+  - Source/dev runs can set `MYDOCMAKER_SKIP_LICENSE=1` to bypass; ignored in
+    shipped (frozen) builds.
+
 ## v1.60
 - **Instant, animated per-page flip.** Clicking ⟳ now responds on the same
   frame: the button recolours immediately and a short rotate-and-resize spin of
