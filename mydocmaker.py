@@ -100,12 +100,19 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.47"
+APP_VERSION = "1.48"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.48": [
+        "New app icon — the MyDocMaker logo mark in blue, replacing the old "
+        "red 'MD' tile.",
+        "Linux: you can now pin MyDocMaker to the taskbar / Add to Favorites "
+        "(GNOME, Pop!_OS, KDE). The window now correctly links to its app "
+        "launcher, so the pin sticks instead of showing as an unknown app.",
+    ],
     "1.47": [
         "Creating a signature now always starts on the Digital option (the "
         "full business stamp) — no more landing on Typed by default. Editing "
@@ -7357,10 +7364,14 @@ def main():
     if cli_paths and send_paths_to_existing(cli_paths):
         return
 
+    # className sets the window's WM_CLASS (instance "mydocmaker"), which must
+    # match the .desktop file id + its StartupWMClass so GNOME/Pop!_OS/KDE can
+    # tie the running window back to the launcher — otherwise "Pin to taskbar /
+    # Add to Favorites" won't stick (the window looks like an unknown app).
     if DND_OK:
-        root = TkinterDnD.Tk()
+        root = TkinterDnD.Tk(className="mydocmaker")
     else:
-        root = tk.Tk()
+        root = tk.Tk(className="mydocmaker")
 
     # Set the window/taskbar icon early so the app's identity is right
     # before any other UI shows. iconphoto works on all three OSes;

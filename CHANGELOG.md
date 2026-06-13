@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.48
+- **New app icon** — the MyDocMaker logo mark (document + pencil) in brand
+  blue, replacing the old red "MD" tile.
+- **Linux taskbar pinning fixed.** The app now sets a `WM_CLASS`
+  (`mydocmaker`) that matches its `.desktop` launcher's new `StartupWMClass`,
+  so GNOME / Pop!_OS / KDE link the running window to the launcher and
+  "Pin to taskbar / Add to Favorites" sticks. (This was never Pop!_OS-specific
+  — it affected every GNOME-based desktop.)
+
 ## v1.47
 - **Create-signature dialog defaults to Digital.** Creating a new signature
   now always lands on the Digital (full business stamp) option instead of

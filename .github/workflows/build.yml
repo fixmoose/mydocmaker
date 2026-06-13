@@ -440,6 +440,10 @@ jobs:
           Terminal=false
           Categories=Office;Utility;
           Keywords=pdf;merge;combine;convert;image;office;
+          # Ties the running window back to this launcher so "Pin to taskbar /
+          # Add to Favorites" sticks on GNOME/Pop!_OS/KDE. Must equal the app's
+          # WM_CLASS instance — the Tk root sets className="${PKG}".
+          StartupWMClass=${PKG}
           MimeType=image/png;image/jpeg;image/gif;image/bmp;image/tiff;image/webp;image/x-icon;image/heic;image/heif;image/avif;application/pdf;text/plain;text/markdown;text/csv;text/html;text/css;text/x-python;application/json;application/xml;application/x-yaml;application/x-shellscript;application/rtf;application/msword;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.oasis.opendocument.text;application/vnd.ms-excel;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/vnd.oasis.opendocument.spreadsheet;application/vnd.ms-powerpoint;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.oasis.opendocument.presentation;
           StartupNotify=true
           EOF
