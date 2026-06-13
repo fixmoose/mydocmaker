@@ -759,6 +759,7 @@ def _open_with_default_viewer(path):
 
 UPDATE_API_URL = "https://api.github.com/repos/fixmoose/mydocmaker/releases/latest"
 UPDATE_PAGE_URL = "https://github.com/fixmoose/mydocmaker/releases/latest"
+SPONSOR_URL = "https://github.com/sponsors/fixmoose"
 
 
 def _parse_version(s):
@@ -3048,20 +3049,25 @@ class SignatureCreatorDialog:
 
         # ----- Mode chooser
         # v1.35: migrate from old internal name 'create_full' → 'digital'.
-        # Edit-mode opens with the saved signature's mode (or a sensible
-        # default based on its style — v1.32–v1.37 didn't persist
-        # creator_mode, so we have to infer it from style for those).
-        existing_mode = self.existing.get("creator_mode")
-        if existing_mode == "create_full":  # legacy migration
-            existing_mode = "digital"
-        if existing_mode not in ("digital", "type", "draw"):
-            style = self.existing.get("style")
-            if style == "drawn":
-                existing_mode = "draw"
-            elif style == "digital":
+        if self.existing:
+            # Edit-mode opens with the saved signature's mode (or a sensible
+            # default based on its style — v1.32–v1.37 didn't persist
+            # creator_mode, so we infer it from style for those).
+            existing_mode = self.existing.get("creator_mode")
+            if existing_mode == "create_full":  # legacy migration
                 existing_mode = "digital"
-            else:
-                existing_mode = "type"
+            if existing_mode not in ("digital", "type", "draw"):
+                style = self.existing.get("style")
+                if style == "drawn":
+                    existing_mode = "draw"
+                elif style == "digital":
+                    existing_mode = "digital"
+                else:
+                    existing_mode = "type"
+        else:
+            # Creating a new signature: always land on Digital, regardless of
+            # why the dialog was opened.
+            existing_mode = "digital"
         self.mode_var = tk.StringVar(value=existing_mode)
         chooser = ttk.LabelFrame(self.win, text="What kind of signature?")
         chooser.pack(fill="x", padx=12, pady=(4, 8))
@@ -5767,8 +5773,8 @@ class App:
 
         center_btns = ttk.Frame(foot)
         center_btns.grid(row=0, column=1)
-        # ♡ — sponsor button. Click is a no-op for now (link wires up when
-        # the GitHub Sponsors profile is approved); hover shows a tooltip.
+        # ♡ — sponsor button. Opens the GitHub Sponsors page; hover shows a
+        # tooltip.
         sponsor_btn = ttk.Button(center_btns, text="♡", width=3,
                                  command=self._on_sponsor_click)
         sponsor_btn.pack(side="left", padx=(0, 6))
@@ -6517,10 +6523,11 @@ class App:
 
     # --- Sponsor button ------------------------------------------------------
     def _on_sponsor_click(self):
-        """No-op for now — we're showing the heart + tooltip ahead of the
-        GitHub Sponsors profile being approved. Once the link goes live
-        we'll wire this to webbrowser.open(SPONSOR_URL)."""
-        return
+        """Open the GitHub Sponsors page in the user's browser."""
+        try:
+            webbrowser.open(SPONSOR_URL)
+        except Exception:
+            pass
 
     # --- Check for updates ---------------------------------------------------
     def check_for_updates(self):
