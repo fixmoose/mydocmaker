@@ -3,7 +3,7 @@
 ## v1.49
 - **Company logo on digital signatures (optional).** The signature creator's
   Digital mode now has a "Company logo" picker. If set, the logo is rendered
-  on the signed stamp just below the company name. Any image type/size is
+  on the signed stamp under your signature, on the left side. Any image type/size is
   accepted — it's opened (PNG/JPG/WebP/HEIC/…), EXIF-rotated, trimmed and
   downscaled by a normalizer, then stored with the signature.
 - **Click the empty page list to browse.** Clicking anywhere in the empty

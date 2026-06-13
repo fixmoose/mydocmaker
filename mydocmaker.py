@@ -109,8 +109,8 @@ APP_VERSION = "1.49"
 WHATS_NEW = {
     "1.49": [
         "Digital signatures can now carry your company logo. It's optional — "
-        "add it in the signature creator and it appears just below your "
-        "company name on the signed stamp. Any image type or size works "
+        "add it in the signature creator and it appears under your signature "
+        "on the left side of the stamp. Any image type or size works "
         "(it's cropped and resized automatically).",
         "Click anywhere in the empty page list to browse for files — not "
         "just on the small 'click to browse' hint.",
@@ -2345,7 +2345,9 @@ def _compose_signature_appearance(signature_png_bytes, meta, timestamp_str):
     W, H = 880, 264
     img = Image.new("RGBA", (W, H), (255, 255, 255, 0))
 
-    # Left 42% — signature image.
+    # Left 42% — signature image, with the optional company logo stacked
+    # below it (v1.49: logo lives on the left under the signature, not in the
+    # cramped right-hand text column).
     left_w = int(W * 0.42)
     sig = Image.open(io.BytesIO(signature_png_bytes)).convert("RGBA")
     # v1.43: crop the source PNG to its non-transparent bounding box so
@@ -2355,20 +2357,44 @@ def _compose_signature_appearance(signature_png_bytes, meta, timestamp_str):
     bbox = sig.getbbox()
     if bbox:
         sig = sig.crop(bbox)
-    target_w = left_w - 10
-    target_h = H - 16
-    src_ratio = sig.width / sig.height
-    box_ratio = target_w / target_h
-    if src_ratio > box_ratio:
-        new_w = target_w
-        new_h = max(1, int(target_w / src_ratio))
+
+    # Decode + trim the optional company logo up front so we know whether to
+    # split the left pane between signature (top) and logo (bottom).
+    logo_im = None
+    logo_b64 = meta.get("logo_png") or ""
+    if logo_b64:
+        try:
+            logo_im = Image.open(
+                io.BytesIO(base64.b64decode(logo_b64))).convert("RGBA")
+            lb = logo_im.getbbox()
+            if lb:
+                logo_im = logo_im.crop(lb)
+        except Exception:
+            logo_im = None
+
+    def _fit_center(im, bx, by, bw, bh):
+        """Scale `im` to fit (bw, bh) preserving aspect, paste centered in the
+        box at (bx, by)."""
+        if bw <= 0 or bh <= 0:
+            return
+        r = im.width / im.height
+        if r > bw / bh:
+            nw, nh = bw, max(1, int(bw / r))
+        else:
+            nh, nw = bh, max(1, int(bh * r))
+        im2 = im.resize((nw, nh), LANCZOS)
+        img.paste(im2, (bx + (bw - nw) // 2, by + (bh - nh) // 2), im2)
+
+    lp = 5  # left-pane horizontal padding
+    bw = left_w - 2 * lp
+    if logo_im is not None:
+        # Signature on the top ~52%, logo in the space below it.
+        sig_h = int(H * 0.52)
+        _fit_center(sig, lp, 8, bw, sig_h)
+        logo_y = 8 + sig_h + 6
+        _fit_center(logo_im, lp, logo_y, bw, H - logo_y - 8)
     else:
-        new_h = target_h
-        new_w = max(1, int(target_h * src_ratio))
-    sig = sig.resize((new_w, new_h), LANCZOS)
-    sx = (left_w - new_w) // 2
-    sy = (H - new_h) // 2
-    img.paste(sig, (sx, sy), sig)
+        _fit_center(sig, lp, 8, bw, H - 16)
 
     draw = ImageDraw.Draw(img)
     draw.line([(left_w, 10), (left_w, H - 10)],
@@ -2444,27 +2470,6 @@ def _compose_signature_appearance(signature_png_bytes, meta, timestamp_str):
     if company:
         for line in _wrap_to_width(company, font_value):
             _draw_line(line, font_value, (45, 45, 70, 255), line_h=34)
-
-    # v1.49: optional company logo, drawn right below the company name.
-    # Scaled to fit the right pane's width and whatever vertical room is
-    # left above the badge (so it degrades gracefully when many text lines
-    # are present). Skipped entirely if there's no usable space.
-    logo_b64 = meta.get("logo_png") or ""
-    if logo_b64 and y < H - 44:
-        try:
-            logo_im = Image.open(
-                io.BytesIO(base64.b64decode(logo_b64))).convert("RGBA")
-            max_h = min((H - 36) - y, 80)
-            if max_h >= 16:
-                lw, lh = logo_im.size
-                sc = min(text_w / lw, max_h / lh)
-                nw, nh = max(1, int(lw * sc)), max(1, int(lh * sc))
-                logo_im = logo_im.resize((nw, nh), LANCZOS)
-                img.paste(logo_im, (text_x, y + 2), logo_im)
-                y += nh + 6
-        except Exception:
-            pass
-
     if address:
         for line in _wrap_to_width(address, font_caption):
             _draw_line(line, font_caption, (80, 80, 80, 255), line_h=30)
