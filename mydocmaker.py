@@ -26,6 +26,7 @@ import io
 import json
 import socket
 import datetime
+import time
 import hashlib
 import getpass
 import platform as _platform_mod
@@ -115,6 +116,9 @@ WHATS_NEW = {
         "personal use; commercial use needs a separate license. Includes a "
         "commercial-pricing link and one-click access to the full license "
         "and third-party license texts.",
+        "The app now quietly checks for updates about once a month (only "
+        "speaks up when a newer version exists). Turn it off anytime in "
+        "About / License.",
     ],
     "1.46": [
         "Sign dialog now has a visible signature picker — when you have more "
@@ -772,6 +776,9 @@ def _open_with_default_viewer(path):
 
 UPDATE_API_URL = "https://api.github.com/repos/fixmoose/mydocmaker/releases/latest"
 UPDATE_PAGE_URL = "https://github.com/fixmoose/mydocmaker/releases/latest"
+# How often the background auto-check phones GitHub for a newer release.
+# Tighten this around a big rollout if you want faster uptake.
+UPDATE_CHECK_INTERVAL_DAYS = 30
 SPONSOR_URL = "https://github.com/sponsors/fixmoose"
 WEBSITE_URL = "https://mydocmaker.com"
 LICENSE_URL = "https://github.com/fixmoose/mydocmaker/blob/main/LICENSE"
@@ -1145,6 +1152,36 @@ def _save_archive_folder(path):
         pass
 
 
+# Generic preference get/set in state.json. Read-modify-write so unrelated
+# state (items, archive_folder, etc.) survives. Used for the auto-update
+# check bookkeeping (last check time + opt-out flag). NOTE: any key persisted
+# here must also be listed in save_session_state's preserved-keys tuple, or a
+# session save will drop it.
+def _get_pref(key, default=None):
+    try:
+        with open(_state_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return default
+    return data.get(key, default)
+
+
+def _set_pref(key, value):
+    try:
+        try:
+            with open(_state_file(), "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {"version": _STATE_VERSION}
+        data[key] = value
+        tmp = _state_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _state_file())
+    except OSError:
+        pass
+
+
 def archive_signed_pdf(signed_pdf_path, audit_path=None):
     """v1.45: copy the freshly-signed PDF into the user's configured
     archive folder, FLATTENED (rasterized) for compact long-term
@@ -1207,8 +1244,9 @@ def save_session_state(items, page_mode=None, flatten=None):
         data["page_mode"] = page_mode
     if flatten is not None:
         data["flatten"] = bool(flatten)
-    # Preserve non-session fields (archive_folder, future prefs).
-    for k in ("archive_folder",):
+    # Preserve non-session fields (archive_folder, auto-update bookkeeping,
+    # future prefs) so a session save doesn't blow them away.
+    for k in ("archive_folder", "auto_update_check", "last_update_check"):
         if k in existing:
             data[k] = existing[k]
     try:
@@ -5868,6 +5906,11 @@ class App:
         # ensure the final state is flushed before the process exits.
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
+        # Background, throttled update check (~monthly). Delayed a few seconds
+        # so it never competes with startup; silent unless a newer release
+        # exists. This is how future releases reach existing users.
+        self.root.after(4000, self._maybe_auto_check_updates)
+
     # --- Tab + page-mode UI hooks --------------------------------------------
     def _on_tab_changed(self, _event=None):
         """Called when the user switches Notebook tabs. The Preview tab
@@ -6614,35 +6657,66 @@ class App:
                    command=lambda: _open(THIRD_PARTY_LICENSES_URL)
                    ).pack(side="left", padx=6)
 
+        # Auto-update opt-out. Default on; persisted in state.json.
+        auto_var = tk.BooleanVar(value=bool(_get_pref("auto_update_check", True)))
+        ttk.Checkbutton(
+            wrap,
+            text="Check for updates automatically (about once a month)",
+            variable=auto_var,
+            command=lambda: _set_pref("auto_update_check", bool(auto_var.get())),
+        ).pack(anchor="w", pady=(12, 0))
+
         ttk.Button(wrap, text="Close", command=dlg.destroy
-                   ).pack(anchor="e", pady=(14, 0))
+                   ).pack(anchor="e", pady=(10, 0))
 
         dlg.update_idletasks()
         dlg.minsize(dlg.winfo_reqwidth(), dlg.winfo_reqheight())
 
     # --- Check for updates ---------------------------------------------------
-    def check_for_updates(self):
+    def check_for_updates(self, silent=False):
         """Asynchronously hit the GitHub releases API. If a newer version is
         available, open the auto-update dialog with a download progress bar
         (or fall back to a browser link if we can't match the install kind
-        to a release asset — e.g. running from source)."""
-        self.status.config(text="Checking for updates…")
+        to a release asset — e.g. running from source).
+
+        silent=True is used by the periodic background check: no "checking…"
+        / "up to date" / error popups — only a genuinely newer version
+        surfaces (it still opens the update dialog)."""
+        if not silent:
+            self.status.config(text="Checking for updates…")
 
         def worker():
             try:
                 info = fetch_latest_release_info()
             except Exception as e:
-                self.work_queue.put(("update_check", "error", str(e)))
+                self.work_queue.put(("update_check", "error", str(e), silent))
                 return
             latest_tag = info.get("tag_name", "")
             latest = _parse_version(latest_tag)
             current = _parse_version(APP_VERSION)
             if latest > current:
-                self.work_queue.put(("update_check", "newer", latest_tag, info))
+                self.work_queue.put(("update_check", "newer", latest_tag, info, silent))
             else:
-                self.work_queue.put(("update_check", "current", latest_tag, info))
+                self.work_queue.put(("update_check", "current", latest_tag, info, silent))
 
         threading.Thread(target=worker, daemon=True).start()
+
+    def _maybe_auto_check_updates(self):
+        """Run a background update check at most once every
+        UPDATE_CHECK_INTERVAL_DAYS, unless the user opted out. Silent unless a
+        newer version is found. This is the adoption channel for future
+        releases — keep it quiet and unobtrusive."""
+        try:
+            if not _get_pref("auto_update_check", True):
+                return
+            last = float(_get_pref("last_update_check", 0) or 0)
+            now = time.time()
+            if (now - last) < UPDATE_CHECK_INTERVAL_DAYS * 86400:
+                return
+            _set_pref("last_update_check", now)
+            self.check_for_updates(silent=True)
+        except Exception:
+            pass
 
     # --- Auto-update dialog (download + handoff) -----------------------------
     def open_update_dialog(self, latest_tag, release_info):
@@ -7156,23 +7230,29 @@ class App:
                     else:
                         messagebox.showwarning(APP_NAME, message)
                 elif msg[0] == "update_check":
-                    # Two trailing fields when error/current, three (+release_info) when newer.
+                    # status, then payload, then a trailing `silent` flag.
+                    # silent (background auto-check): suppress the error /
+                    # up-to-date popups; only a genuinely newer version
+                    # surfaces (it still opens the update dialog).
                     status = msg[1]
+                    silent = bool(msg[-1]) if isinstance(msg[-1], bool) else False
                     if status == "error":
-                        self.status.config(text="Update check failed.")
-                        messagebox.showwarning(
-                            APP_NAME,
-                            f"Couldn't reach GitHub:\n{msg[2]}",
-                        )
+                        if not silent:
+                            self.status.config(text="Update check failed.")
+                            messagebox.showwarning(
+                                APP_NAME,
+                                f"Couldn't reach GitHub:\n{msg[2]}",
+                            )
                     elif status == "current":
-                        self.status.config(text=f"Up to date (v{APP_VERSION}).")
-                        messagebox.showinfo(
-                            APP_NAME,
-                            f"You're on the latest version (v{APP_VERSION}).",
-                        )
+                        if not silent:
+                            self.status.config(text=f"Up to date (v{APP_VERSION}).")
+                            messagebox.showinfo(
+                                APP_NAME,
+                                f"You're on the latest version (v{APP_VERSION}).",
+                            )
                     elif status == "newer":
                         latest_tag = msg[2]
-                        release_info = msg[3] if len(msg) > 3 else {}
+                        release_info = msg[3] if len(msg) > 3 and isinstance(msg[3], dict) else {}
                         self.status.config(text=f"Update available: {latest_tag}")
                         self.open_update_dialog(latest_tag, release_info)
                 elif msg[0] == "update_dl_progress":

@@ -13,6 +13,10 @@
   (mydocmaker.com/pricing), a commercial-licensing contact, and the full
   license + third-party license texts. Fixed a stray `License: MIT` note in
   the source header (the project is PolyForm-NC).
+- **Automatic update check.** On launch the app now checks GitHub for a newer
+  release at most once every 30 days, in the background — silent unless a
+  newer version is found, then it offers the existing Download & install
+  flow. Opt out anytime via a checkbox in About / License.
 
 ## v1.46
 - **Signature picker in the Sign dialog** — when you have more than one
