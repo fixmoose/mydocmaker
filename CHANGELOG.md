@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.51
+- **Fixed: blank/gray Preview while 2-up was enabled.** A regression from
+  v1.50 (per-page Remove was gated off under 2-up, but the cleanup-list append
+  still referenced the now-unbuilt button, raising an error that left the
+  canvas cleared but undrawn). The Remove button is now tracked only when
+  created, the preview renders the paired sheets correctly, and `_render_all_
+  pages` fails safe to a placeholder instead of a blank canvas. Toggling 2-up
+  off now also re-renders pages onto the selected sheet (was showing stale
+  native pages).
+
 ## v1.50
 - **Page orientation (Portrait / Landscape)** for the output sheet, next to
   Page size. Flows through every input type (images, text, webpages via

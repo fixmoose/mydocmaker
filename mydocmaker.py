@@ -102,12 +102,18 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.50"
+APP_VERSION = "1.51"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.51": [
+        "Fixed: the live Preview could go blank (gray, no pages) while 2-up "
+        "was turned on. The preview now renders the paired sheets correctly, "
+        "and falls back to a clear message instead of a blank screen if a "
+        "page ever can't be drawn.",
+    ],
     "1.50": [
         "Page orientation: choose Portrait or Landscape for the output sheet "
         "(next to Page size).",
@@ -5845,7 +5851,9 @@ class PreviewTab:
                 self.canvas.create_window(
                     x + pil.width - 4, y + 4, anchor="ne", window=rm_btn,
                 )
-            self._page_btn_widgets.append(rm_btn)
+                # Track for cleanup — only when actually created (under 2-up
+                # there's no Remove button, so nothing to append).
+                self._page_btn_widgets.append(rm_btn)
             # Page number label below each page so users can see where they are.
             label_y = y + pil.height + 4
             self.canvas.create_text(
@@ -5856,6 +5864,12 @@ class PreviewTab:
             max_w = max(max_w, pil.width)
             y += pil.height + 28  # gap between pages
 
+        # Safety net: never leave the canvas cleared-but-blank (the old
+        # "gray, no preview" state). If nothing rendered, show a placeholder.
+        if not self._cached_image_refs:
+            self._set_placeholder("Preview couldn't render these pages — "
+                                  "click ↻ Refresh.")
+            return
         self.canvas.config(
             scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100))
         )
@@ -6381,9 +6395,9 @@ class App:
             big = {"a4": "a3", "a3": "a3"}.get(self.size_var.get(), "tabloid")
             self.size_var.set(big)
             self.orient_var.set("landscape")
-            self._on_page_mode_changed()
-        elif hasattr(self, "preview"):
-            self.preview.invalidate()
+        # Either way: per-item rendering differs under 2-up (native vs imposed
+        # on the sheet), so drop the caches, re-render, and rebuild the preview.
+        self._on_page_mode_changed()
 
     def _restore_session(self):
         items_data, page_mode, flatten, dropped = load_session_state()
