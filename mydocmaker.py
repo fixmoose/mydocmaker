@@ -36,6 +36,7 @@ import tempfile
 import subprocess
 import threading
 import queue
+import random
 import urllib.request
 import urllib.error
 import uuid
@@ -103,12 +104,25 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.61"
+APP_VERSION = "1.62"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.62": [
+        "Sharper signatures. The visible signature was being drawn twice, one "
+        "layer on top of the other, which made it look slightly blurry/heavy. "
+        "It's now a single crisp layer (still cryptographically signed and "
+        "listed in the PDF's signature panel).",
+        "Clearer signing: if you try to sign without a saved signature, you now "
+        "get a friendly notice to create and save one first.",
+        "Saved PDFs get a unique name by default (e.g. output-4821.pdf) so you "
+        "aren't asked about overwriting an existing file every time.",
+        "More reliable startup check: the license/connectivity check no longer "
+        "mistakenly reports 'offline' on some systems (e.g. Fedora) when you're "
+        "actually online.",
+    ],
     "1.61": [
         "MyDocMaker now does a quick license check when it starts, so it needs "
         "an internet connection to run. If you're offline you'll see “License "
@@ -1488,32 +1502,46 @@ def license_check(timeout=4.0):
     monthly update check will reach them, so a future release can roll out real
     licensing. Today it only verifies connectivity."""
     headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    info = {}
     # 1) Phone home to mydocmaker.com — the control point + (future) licensing.
     try:
         req = urllib.request.Request(LICENSE_CHECK_URL, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             try:
-                info = json.loads(resp.read().decode("utf-8"))
-                if not isinstance(info, dict):
-                    info = {}
+                parsed = json.loads(resp.read().decode("utf-8"))
+                if isinstance(parsed, dict):
+                    info = parsed
             except (ValueError, UnicodeDecodeError):
-                info = {}
-            return True, info
+                pass
+        return True, info
     except urllib.error.HTTPError:
         # Server answered (even a 404) → the internet is up.
-        return True, {}
+        return True, info
     except Exception:
         pass
-    # 2) Fallback connectivity probe (GitHub API, already a dependency) so that
-    #    a mydocmaker.com outage doesn't block users who ARE online.
+    # 2) HTTPS to GitHub (already a dependency) so a mydocmaker.com outage
+    #    doesn't block users who ARE online.
     try:
         req = urllib.request.Request(UPDATE_API_URL, headers=headers)
         with urllib.request.urlopen(req, timeout=timeout):
-            return True, {}
+            return True, info
     except urllib.error.HTTPError:
-        return True, {}
+        return True, info
     except Exception:
-        return False, {}
+        pass
+    # 3) Raw TCP probes to well-known anycast IPs. These need no DNS, no TLS
+    #    and no CA bundle — crucially, they DON'T false-fail in frozen builds
+    #    where the bundled certificates may be missing/stale (which would
+    #    otherwise lock out perfectly-online users). If any connects, we're
+    #    online. Only when ALL probes fail do we report offline.
+    for host, port in (("1.1.1.1", 443), ("8.8.8.8", 443),
+                       ("1.1.1.1", 53), ("9.9.9.9", 443)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True, info
+        except OSError:
+            continue
+    return False, info
 
 
 def fetch_latest_release_info(timeout=8.0):
@@ -3407,47 +3435,40 @@ def sign_pdf_with_appearance_multi(pdf_bytes, positions, output_path,
             w_pt=pos["width_pt"], h_pt=pos["height_pt"],
         )
 
-        # Step 2: cryptographic widget on top.
+        # Step 2: the cryptographic signature. The VISIBLE mark is the baked
+        # overlay from step 1 (single, crisp, tamper-proof); the signature
+        # field itself is INVISIBLE (no box) so pyhanko doesn't render the
+        # appearance a SECOND time on top of it. Stacking those two
+        # anti-aliased layers made signatures look blurry / heavy in some
+        # viewers (v1.62 fix). The signature still appears in the PDF
+        # signature panel and verifies in Acrobat.
         w = IncrementalPdfFileWriter(io.BytesIO(current_bytes))
-        stamp_pdf = _png_to_stamp_pdf(
-            appearance_png, pos["width_pt"], pos["height_pt"],
+        # Step 3: first sig certifies; subsequent sigs are regular.
+        certify_this = (i == 1)
+        docmdp = (MDPPerm.FILL_FORMS
+                   if (certify_this and MDPPerm is not None) else None)
+        sig_meta_kwargs = dict(
+            field_name=field_name,
+            reason=None, location=None,
+            subfilter=fields.SigSeedSubFilter.PADES,
         )
-        with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as t:
-            t.write(stamp_pdf)
-            stamp_tmp = t.name
-        try:
-            stamp_style = StaticStampStyle.from_pdf_file(stamp_tmp)
-            # Step 3: first sig certifies; subsequent sigs are regular.
-            certify_this = (i == 1)
-            docmdp = (MDPPerm.FILL_FORMS
-                       if (certify_this and MDPPerm is not None) else None)
-            sig_meta_kwargs = dict(
-                field_name=field_name,
-                reason=None, location=None,
-                subfilter=fields.SigSeedSubFilter.PADES,
-            )
-            if certify_this:
-                sig_meta_kwargs["certify"] = True
-                if docmdp is not None:
-                    sig_meta_kwargs["docmdp_permissions"] = docmdp
-            sig_meta = PdfSignatureMetadata(**sig_meta_kwargs)
-            new_field_spec = fields.SigFieldSpec(
-                sig_field_name=field_name,
-                on_page=pos["page"] - 1, box=box,
-            )
-            pdf_signer = signers.PdfSigner(
-                signature_meta=sig_meta, signer=signer,
-                stamp_style=stamp_style,
-                new_field_spec=new_field_spec,
-            )
-            out = io.BytesIO()
-            pdf_signer.sign_pdf(w, output=out)
-            current_bytes = out.getvalue()
-        finally:
-            try:
-                os.unlink(stamp_tmp)
-            except OSError:
-                pass
+        if certify_this:
+            sig_meta_kwargs["certify"] = True
+            if docmdp is not None:
+                sig_meta_kwargs["docmdp_permissions"] = docmdp
+        sig_meta = PdfSignatureMetadata(**sig_meta_kwargs)
+        new_field_spec = fields.SigFieldSpec(
+            sig_field_name=field_name,
+            on_page=pos["page"] - 1,   # no box → invisible signature widget
+        )
+        pdf_signer = signers.PdfSigner(
+            signature_meta=sig_meta, signer=signer,
+            stamp_style=None,
+            new_field_spec=new_field_spec,
+        )
+        out = io.BytesIO()
+        pdf_signer.sign_pdf(w, output=out)
+        current_bytes = out.getvalue()
 
     with open(output_path, "wb") as f:
         f.write(current_bytes)
@@ -5743,7 +5764,7 @@ class SignDialog:
             title="Save prepared PDF as",
             defaultextension=".pdf",
             initialdir=default_save_dir(),
-            initialfile="prepared-for-signing.pdf",
+            initialfile=f"prepared-for-signing-{random.randint(1000, 9999)}.pdf",
             filetypes=[("PDF files", "*.pdf")],
         )
         if not out_path:
@@ -5817,7 +5838,7 @@ class SignDialog:
             title="Save signed PDF as",
             defaultextension=".pdf",
             initialdir=default_save_dir(),
-            initialfile="signed.pdf",
+            initialfile=f"signed-{random.randint(1000, 9999)}.pdf",
             filetypes=[("PDF files", "*.pdf")],
         )
         if not out_path:
@@ -9078,6 +9099,13 @@ class App:
         # If no saved signature yet, prompt the user to create one. After
         # creation, fall straight through into the sign dialog.
         if not has_saved_signature():
+            # Prompt the user with a clear notice first, then open the creator
+            # so they can make + save one (which re-enters the sign flow).
+            messagebox.showinfo(
+                APP_NAME,
+                "Please create and save a signature first before proceeding "
+                "to sign.",
+            )
             def _after_create(png_bytes, label, style):
                 save_signature(png_bytes, label=label, style=style)
                 # Re-enter the flow now that we have a signature.
@@ -9176,7 +9204,7 @@ class App:
         out_path = filedialog.asksaveasfilename(
             title="Save PDF as", defaultextension=".pdf",
             initialdir=default_save_dir(),
-            initialfile="output.pdf",
+            initialfile=f"output-{random.randint(1000, 9999)}.pdf",
             filetypes=[("PDF files", "*.pdf")],
         )
         if not out_path:

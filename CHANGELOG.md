@@ -1,5 +1,27 @@
 # Changelog
 
+## v1.62
+- **License gate no longer false-locks online users.** `license_check` now
+  falls back to raw TCP probes (Cloudflare/Google/Quad9 anycast IPs on 443/53)
+  after the HTTPS attempts. Frozen builds with a missing/stale CA bundle (seen
+  on Fedora) were failing every HTTPS request and reporting "offline" even with
+  working internet; the TCP probes need no DNS/TLS/cert, so it only blocks when
+  genuinely offline.
+- **Crisper signatures (single-layer appearance).** The signing flow used to
+  render the appearance twice — baked into the page content AND as a visible
+  signature widget on top — which stacked two anti-aliased layers and looked
+  blurry/heavy in some viewers. The widget is now **invisible** (no box, no
+  stamp style), leaving the crisp baked overlay as the sole visible mark. The
+  signature is still cryptographically valid and listed in the signature panel;
+  cropping/crypto is otherwise unchanged. (Removed the per-position
+  `_png_to_stamp_pdf`/`StaticStampStyle` round-trip.)
+- **Sign-without-signature prompt.** `sign_and_create_pdf` now shows "Please
+  create and save a signature first before proceeding to sign." before opening
+  the signature creator.
+- **Unique default output names.** The Create-PDF / signed / prepared-for-
+  signing save dialogs default to `…-NNNN.pdf` (random 4-digit suffix) so an
+  existing `output.pdf` doesn't trigger an overwrite prompt each time.
+
 ## v1.61
 - **Startup license / connectivity gate.** Every launch the app phones home
   (`license_check`) before the window opens; if the device is offline it shows
