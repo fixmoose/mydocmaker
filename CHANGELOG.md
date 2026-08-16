@@ -1,5 +1,22 @@
 # Changelog
 
+## v1.64
+- **Add text on the Preview** (fill forms / annotate). A new text tool on the
+  Preview tab: tick "✎ Add text", click a page to place a note and type it
+  inline (multi-line; Esc/Ctrl+Enter/click-away commits). Pick font
+  (Helvetica/Times/Courier), size, bold and italic; drag to move, double-click
+  to edit, select + Delete to remove. Clicking an existing note edits it rather
+  than stacking a new one on top.
+  - Model: `App.text_notes` — `{page, x_pt, y_pt, text, font, size, bold,
+    italic}` keyed by final display page index. `apply_text_notes()` bakes them
+    onto the output after `apply_style` in the Create PDF and Sign flows; the
+    Preview draws them live as canvas items (so preview and output match).
+  - `PreviewTab` now records each page's canvas box + render scale to map
+    clicks <-> PDF points (`_canvas_to_pdf` / `_pdf_to_canvas`).
+  - Note: notes are positioned on the final layout, so add them last — changing
+    Paper size / orientation / 2-up / Order after placing can shift a note to a
+    different page.
+
 ## v1.63
 - **Wrapped, delayed hover tooltips everywhere.** `Tooltip` now word-wraps to a
   tidy multi-line box (no more super-long single line), positions below the

@@ -104,12 +104,20 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.63"
+APP_VERSION = "1.64"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.64": [
+        "Add text right on the Preview — perfect for filling in forms or "
+        "annotating a document. Tick '✎ Add text', click where you want it, "
+        "and type. Choose font, size, bold and italic; drag a note to move it, "
+        "double-click to edit, select it and press Delete to remove. Your text "
+        "is baked into the PDF when you Create or Sign it. Clicking an existing "
+        "note edits it instead of stacking a new one on top.",
+    ],
     "1.63": [
         "Helpful hover tips on the buttons — rest the mouse on a button for a "
         "few seconds and a short, multi-line explanation appears. It only shows "
@@ -1441,6 +1449,87 @@ def apply_style(pdf_bytes, style, app=None):
         except Exception:
             return marked
     return marked
+
+
+# ---------------------------------------------------------------------------
+# Text notes (v1.64): free-text the user places on the Preview to fill forms or
+# annotate. Each note is {page (final display index), x_pt, y_pt (baseline from
+# the bottom-left), text, font, size, bold, italic}. Baked into the output PDF
+# by apply_text_notes() after apply_style, and drawn interactively on the
+# Preview canvas by PreviewTab (so preview and output match).
+# ---------------------------------------------------------------------------
+TEXT_NOTE_FONTS = ("Helvetica", "Times", "Courier")
+
+
+def _reportlab_font(family, bold, italic):
+    """Map a friendly family + bold/italic to a reportlab base-14 font name."""
+    if family == "Times":
+        if bold and italic:
+            return "Times-BoldItalic"
+        if bold:
+            return "Times-Bold"
+        if italic:
+            return "Times-Italic"
+        return "Times-Roman"
+    if family == "Courier":
+        base = "Courier"
+    else:
+        base = "Helvetica"
+    if bold and italic:
+        return f"{base}-BoldOblique"
+    if bold:
+        return f"{base}-Bold"
+    if italic:
+        return f"{base}-Oblique"
+    return base
+
+
+def apply_text_notes(pdf_bytes, notes):
+    """Overlay the user's text notes onto the matching pages of the already-
+    assembled+styled document. `notes` are keyed by final display page index;
+    x_pt/y_pt are the text baseline in PDF points from the bottom-left. No-op
+    when there are no notes."""
+    if not notes:
+        return pdf_bytes
+    by_page = {}
+    for n in notes:
+        if n.get("text", "").strip():
+            by_page.setdefault(int(n["page"]), []).append(n)
+    if not by_page:
+        return pdf_bytes
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return pdf_bytes
+    writer = PdfWriter()
+    for idx, page in enumerate(reader.pages):
+        page_notes = by_page.get(idx)
+        if page_notes:
+            w = float(page.mediabox.width)
+            h = float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=(w, h))
+            for n in page_notes:
+                size = max(4, int(n.get("size", 14)))
+                fontname = _reportlab_font(
+                    n.get("font", "Helvetica"), n.get("bold"), n.get("italic"))
+                c.setFont(fontname, size)
+                c.setFillColorRGB(0, 0, 0)
+                # Multi-line: successive lines go DOWN from the baseline.
+                for j, line in enumerate(str(n["text"]).split("\n")):
+                    c.drawString(float(n["x_pt"]),
+                                 float(n["y_pt"]) - j * size * 1.25, line)
+            c.showPage()
+            c.save()
+            try:
+                overlay = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+                page.merge_page(overlay)
+            except Exception:
+                pass
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
 
 
 def _open_with_default_viewer(path):
@@ -5995,6 +6084,16 @@ class PreviewTab:
         self._hidden_count = 0
         self._page_btn_widgets = []    # per-page Remove buttons (kept from GC)
 
+        # v1.64: text-notes tool state. _page_boxes[i] = (x, y, w_px, h_px) of
+        # display page i on the canvas; _page_render_scale = px per PDF point.
+        # These map canvas clicks <-> PDF coordinates for placing notes.
+        self._page_boxes = []
+        self._page_render_scale = 1.0
+        self._note_item_ids = {}       # canvas text id -> note dict
+        self._selected_note = None
+        self._edit_widget = None       # inline Text editor while typing
+        self._note_drag = None         # (note, start_cx, start_cy, moved)
+
         # ----- Toolbar
         bar = ttk.Frame(self.frame)
         bar.pack(fill="x", padx=8, pady=(8, 4))
@@ -6047,6 +6146,37 @@ class PreviewTab:
         self.restore_btn.pack(side="right", padx=(0, 6))
         self.restore_btn.pack_forget()
 
+        # ----- Text-notes toolbar (v1.64): its own row so nothing clips.
+        tbar = ttk.Frame(self.frame)
+        tbar.pack(fill="x", padx=8, pady=(0, 2))
+        self.text_mode = tk.BooleanVar(value=False)
+        tip(ttk.Checkbutton(tbar, text="✎ Add text", variable=self.text_mode,
+                            command=self._on_text_mode),
+            "Turn on, then click a page to type a note or fill a form. Click "
+            "an existing note to select and edit it; drag to move it.").pack(side="left")
+        ttk.Label(tbar, text="Font:").pack(side="left", padx=(10, 2))
+        self.note_font = tk.StringVar(value="Helvetica")
+        fcb = ttk.Combobox(tbar, textvariable=self.note_font, width=9,
+                           state="readonly", values=TEXT_NOTE_FONTS)
+        fcb.pack(side="left")
+        fcb.bind("<<ComboboxSelected>>", lambda _e: self._apply_style_to_selected())
+        ttk.Label(tbar, text="Size:").pack(side="left", padx=(8, 2))
+        self.note_size = tk.StringVar(value="14")
+        ssb = ttk.Spinbox(tbar, from_=6, to=96, width=4, textvariable=self.note_size,
+                          command=self._apply_style_to_selected)
+        ssb.pack(side="left")
+        ssb.bind("<KeyRelease>", lambda _e: self._apply_style_to_selected())
+        self.note_bold = tk.BooleanVar(value=False)
+        self.note_italic = tk.BooleanVar(value=False)
+        ttk.Checkbutton(tbar, text="Bold", variable=self.note_bold,
+                        command=self._apply_style_to_selected).pack(side="left", padx=(8, 0))
+        ttk.Checkbutton(tbar, text="Italic", variable=self.note_italic,
+                        command=self._apply_style_to_selected).pack(side="left")
+        self.note_del_btn = ttk.Button(tbar, text="Delete note",
+                                       command=self._delete_selected)
+        self.note_del_btn.pack(side="left", padx=(10, 0))
+        tip(self.note_del_btn, "Delete the selected text note.")
+
         # ----- Status line
         self.status_lbl = ttk.Label(self.frame, text="",
                                     foreground="#666", anchor="w")
@@ -6077,6 +6207,14 @@ class PreviewTab:
         # scroll from the Pages tab's listbox.
         self.canvas.bind("<Enter>", self._bind_wheel)
         self.canvas.bind("<Leave>", self._unbind_wheel)
+
+        # Text-notes interactions (v1.64): click to add/select, drag to move,
+        # double-click to edit, Delete to remove.
+        self.canvas.bind("<Button-1>", self._on_canvas_press)
+        self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
+        self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
+        self.canvas.bind_all("<Delete>", self._on_delete_key, add="+")
 
         self._set_placeholder("Add some files in the Pages tab to see a preview here.")
 
@@ -6410,6 +6548,9 @@ class PreviewTab:
         self.canvas.delete("all")
         self._cached_image_refs = []
         self._page_y_positions = []
+        self._page_boxes = []
+        self._note_item_ids = {}
+        self._page_render_scale = scale
         y = 8
         max_w = 0
 
@@ -6422,6 +6563,7 @@ class PreviewTab:
                 # Skip unrenderable pages but record an empty slot so
                 # Prev/Next stays accurate.
                 self._page_y_positions.append(y)
+                self._page_boxes.append((8, y, 0, 0))
                 continue
             if not PIL_TK_OK:
                 self._set_placeholder("Install Pillow ImageTk to render preview.")
@@ -6430,6 +6572,7 @@ class PreviewTab:
             self._cached_image_refs.append(photo)
             self._page_y_positions.append(y)
             x = max((cw - pil.width) // 2, 8)
+            self._page_boxes.append((x, y, pil.width, pil.height))
             self.canvas.create_image(x, y, anchor="nw", image=photo)
             # v1.45: a "✕ Remove page" button floating at the page's top-right.
             # Clicking it hides just this page from the output (and preview).
@@ -6468,7 +6611,230 @@ class PreviewTab:
         self.canvas.config(
             scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100))
         )
+        self._redraw_notes()
         self._update_page_indicator()
+
+    # ---- Text notes (v1.64) ---------------------------------------------
+    def _pdf_to_canvas(self, page, x_pt, y_pt):
+        """(page idx, PDF point) -> canvas (cx, cy) of the text's top-left."""
+        if page < 0 or page >= len(self._page_boxes):
+            return None
+        px, py, pw, ph = self._page_boxes[page]
+        s = self._page_render_scale
+        cx = px + x_pt * s
+        # y_pt is the baseline from the bottom; convert to a canvas y.
+        cy = py + (ph - y_pt * s)
+        return cx, cy
+
+    def _canvas_to_pdf(self, cx, cy):
+        """Canvas (cx, cy) -> (page idx, x_pt, y_pt baseline-from-bottom) for
+        the page under the point, or None if not over a page."""
+        s = self._page_render_scale or 1.0
+        for idx, (px, py, pw, ph) in enumerate(self._page_boxes):
+            if pw <= 0 or ph <= 0:
+                continue
+            if px <= cx <= px + pw and py <= cy <= py + ph:
+                x_pt = (cx - px) / s
+                y_pt = (ph - (cy - py)) / s
+                return idx, x_pt, y_pt
+        return None
+
+    def _note_canvas_font(self, note):
+        fam = {"Helvetica": "Helvetica", "Times": "Times", "Courier": "Courier"}\
+            .get(note.get("font", "Helvetica"), "Helvetica")
+        # Match the on-page size at the current zoom.
+        px_size = max(6, int(round(note.get("size", 14) * self._page_render_scale)))
+        styles = []
+        if note.get("bold"):
+            styles.append("bold")
+        if note.get("italic"):
+            styles.append("italic")
+        return (fam, px_size, " ".join(styles)) if styles else (fam, px_size)
+
+    def _redraw_notes(self):
+        """Draw every text note that falls on a currently-visible page as a
+        canvas text item (interactive). Called after each page render."""
+        self._note_item_ids = {}
+        for note in self.app.text_notes:
+            pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
+            if pos is None:
+                continue
+            cx, cy = pos
+            fill = "#c00000" if note is self._selected_note else "#111111"
+            item = self.canvas.create_text(
+                cx, cy, anchor="sw", text=note.get("text", ""),
+                font=self._note_canvas_font(note), fill=fill, tags="note")
+            self._note_item_ids[item] = note
+
+    def _note_at(self, cx, cy):
+        """Return the note whose canvas item is at/near (cx, cy), or None."""
+        for item in self.canvas.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2):
+            if item in self._note_item_ids:
+                return self._note_item_ids[item]
+        return None
+
+    def _on_text_mode(self):
+        cur = "crosshair" if self.text_mode.get() else ""
+        try:
+            self.canvas.config(cursor=cur)
+        except tk.TclError:
+            pass
+
+    def _on_canvas_press(self, event):
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        note = self._note_at(cx, cy)
+        if note is not None:
+            # Select existing note (never stack a new one on top of it).
+            self._select_note(note)
+            self._note_drag = [note, cx, cy, False]
+            return
+        if self.text_mode.get() and self._canvas_to_pdf(cx, cy) is not None:
+            self._create_note_at(cx, cy)
+        else:
+            self._select_note(None)
+
+    def _on_canvas_drag(self, event):
+        if not self._note_drag:
+            return
+        note, sx, sy, _moved = self._note_drag
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        loc = self._canvas_to_pdf(cx, cy)
+        if loc is None:
+            return
+        self._note_drag[3] = True
+        note["page"], note["x_pt"], note["y_pt"] = loc
+        # Move its canvas item live.
+        for item, n in self._note_item_ids.items():
+            if n is note:
+                self.canvas.coords(item, cx, cy)
+                break
+
+    def _on_canvas_release(self, _event):
+        if self._note_drag and self._note_drag[3]:
+            self._invalidate_output_only()
+        self._note_drag = None
+
+    def _on_canvas_double(self, event):
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        note = self._note_at(cx, cy)
+        if note is not None:
+            self._select_note(note)
+            self._begin_edit(note)
+
+    def _on_delete_key(self, _event=None):
+        # Only act when the Preview tab is active and a note is selected.
+        if (self.app._tab_is("Preview") and self._selected_note is not None
+                and self._edit_widget is None):
+            self._delete_selected()
+
+    def _create_note_at(self, cx, cy):
+        loc = self._canvas_to_pdf(cx, cy)
+        if loc is None:
+            return
+        page, x_pt, y_pt = loc
+        note = {
+            "page": page, "x_pt": x_pt, "y_pt": y_pt, "text": "",
+            "font": self.note_font.get(),
+            "size": _safe_int(self.note_size.get(), 14),
+            "bold": bool(self.note_bold.get()),
+            "italic": bool(self.note_italic.get()),
+        }
+        self.app.text_notes.append(note)
+        self._select_note(note)
+        self._begin_edit(note, is_new=True)
+
+    def _begin_edit(self, note, is_new=False):
+        """Inline multi-line editor at the note's position."""
+        self._cancel_edit()
+        pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
+        if pos is None:
+            return
+        cx, cy = pos
+        txt = tk.Text(self.canvas, width=24, height=2, wrap="word",
+                      font=self._note_canvas_font(note), bd=1, relief="solid")
+        txt.insert("1.0", note.get("text", ""))
+        txt.focus_set()
+        win = self.canvas.create_window(cx, cy, anchor="sw", window=txt)
+        self._edit_widget = (txt, win, note, is_new)
+        txt.bind("<Escape>", lambda _e: self._commit_edit())
+        # Ctrl+Enter or focus-out commits; plain Enter adds a newline.
+        txt.bind("<Control-Return>", lambda _e: self._commit_edit())
+        txt.bind("<FocusOut>", lambda _e: self._commit_edit())
+
+    def _commit_edit(self, _event=None):
+        if not self._edit_widget:
+            return
+        txt, win, note, is_new = self._edit_widget
+        try:
+            value = txt.get("1.0", "end-1c")
+        except tk.TclError:
+            value = ""
+        self._edit_widget = None
+        try:
+            self.canvas.delete(win)
+            txt.destroy()
+        except tk.TclError:
+            pass
+        note["text"] = value
+        if not value.strip():
+            # Empty note → drop it.
+            if note in self.app.text_notes:
+                self.app.text_notes.remove(note)
+            if note is self._selected_note:
+                self._selected_note = None
+        self._redraw_notes()
+        self._invalidate_output_only()
+
+    def _cancel_edit(self):
+        if self._edit_widget:
+            txt, win, _n, _new = self._edit_widget
+            self._edit_widget = None
+            try:
+                self.canvas.delete(win)
+                txt.destroy()
+            except tk.TclError:
+                pass
+
+    def _select_note(self, note):
+        self._selected_note = note
+        if note is not None:
+            # Reflect its style in the toolbar.
+            self.note_font.set(note.get("font", "Helvetica"))
+            self.note_size.set(str(note.get("size", 14)))
+            self.note_bold.set(bool(note.get("bold")))
+            self.note_italic.set(bool(note.get("italic")))
+        self._redraw_notes()
+
+    def _apply_style_to_selected(self):
+        note = self._selected_note
+        if note is None:
+            return
+        note["font"] = self.note_font.get()
+        note["size"] = _safe_int(self.note_size.get(), 14)
+        note["bold"] = bool(self.note_bold.get())
+        note["italic"] = bool(self.note_italic.get())
+        self._redraw_notes()
+        self._invalidate_output_only()
+
+    def _delete_selected(self):
+        note = self._selected_note
+        if note is None:
+            return
+        if note in self.app.text_notes:
+            self.app.text_notes.remove(note)
+        self._selected_note = None
+        self._cancel_edit()
+        self._redraw_notes()
+        self._invalidate_output_only()
+
+    def _invalidate_output_only(self):
+        """Notes are drawn live on the canvas, so we don't need to re-render
+        the page bitmaps — just remember the output changed (session save)."""
+        if hasattr(self.app, "_schedule_save"):
+            self.app._schedule_save()
 
     # ---- Per-page removal (v1.45) ---------------------------------------
     def _remove_page(self, display_idx):
@@ -7456,6 +7822,10 @@ class App:
         # Bates / cover sheet). Applied as post-processing by apply_style() in
         # the preview, Create PDF, and Sign flows. Defaults = inactive (no-op).
         self.style = StyleSettings()
+        # v1.64: free-text notes placed on the Preview (fill forms / annotate).
+        # Each: {page, x_pt, y_pt, text, font, size, bold, italic}. Baked into
+        # the output by apply_text_notes; drawn interactively by PreviewTab.
+        self.text_notes = []
         self.work_queue = queue.Queue()
         self._update_dialog_state = None  # populated while auto-update is open
         self._install_dialog = None       # populated while install-deps dialog is open
@@ -9236,6 +9606,7 @@ class App:
             final = _apply_nup(staged.getvalue(), self._current_layout(),
                                asis_idx)
             final = apply_style(final, self.style, self)
+            final = apply_text_notes(final, self.text_notes)
             self.work_queue.put(("ready_for_signing", final))
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
@@ -9363,6 +9734,8 @@ class App:
         orig_bytes = _apply_nup(staged.getvalue(), layout, asis_idx)
         # Style pass: watermark / page numbers / header-footer / Bates / cover.
         orig_bytes = apply_style(orig_bytes, self.style, self)
+        # Text notes placed on the Preview (fill forms / annotate).
+        orig_bytes = apply_text_notes(orig_bytes, self.text_notes)
         out_data = orig_bytes
         flatten_note = ""
         if flatten:
