@@ -104,12 +104,20 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.62"
+APP_VERSION = "1.63"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.63": [
+        "Helpful hover tips on the buttons — rest the mouse on a button for a "
+        "few seconds and a short, multi-line explanation appears. It only shows "
+        "after a 3-second pause, so it never gets in your way while you work.",
+        "Flatten output is now ON by default (smaller, tamper-resistant files). "
+        "Uncheck it if you need the text, links or form fields to stay "
+        "selectable — the file will be larger. Hover the option for details.",
+    ],
     "1.62": [
         "Sharper signatures. The visible signature was being drawn twice, one "
         "layer on top of the other, which made it look slightly blurry/heavy. "
@@ -3801,15 +3809,23 @@ class RenderWorker:
 # is hand-rolled. Used for the footer ♡ sponsor button.
 # ---------------------------------------------------------------------------
 class Tooltip:
-    def __init__(self, widget, text, delay_ms=400):
+    """Hover help. Multi-line (word-wrapped, never a super-long single line),
+    and shown only after the pointer rests for `delay_ms` so it never obstructs
+    normal clicking/workflow. Default delay is 3 s per the app's UX rule.
+
+    Use the module-level `tip(widget, text)` helper to attach one anywhere."""
+
+    WRAP = 300   # px — wrap long notes into a tidy multi-line box
+
+    def __init__(self, widget, text, delay_ms=3000):
         self.widget = widget
         self.text = text
         self.delay_ms = delay_ms
         self._tipwin = None
         self._after_id = None
-        widget.bind("<Enter>", self._schedule)
-        widget.bind("<Leave>", self._hide)
-        widget.bind("<ButtonPress>", self._hide)
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
 
     def _schedule(self, _event=None):
         self._cancel_scheduled()
@@ -3824,17 +3840,26 @@ class Tooltip:
             self._after_id = None
 
     def _show(self):
-        if self._tipwin is not None:
+        if self._tipwin is not None or not self.text:
             return
-        x = self.widget.winfo_rootx() + self.widget.winfo_width() // 2 - 80
-        y = self.widget.winfo_rooty() - 30
+        try:
+            # Position just below the widget, clamped onto the screen so a
+            # wrapped multi-line box is never pushed off the edge.
+            bx = self.widget.winfo_rootx()
+            by = self.widget.winfo_rooty() + self.widget.winfo_height() + 4
+            sw = self.widget.winfo_screenwidth()
+            if bx + self.WRAP + 24 > sw:
+                bx = max(4, sw - self.WRAP - 24)
+        except tk.TclError:
+            return
         self._tipwin = tw = tk.Toplevel(self.widget)
         tw.wm_overrideredirect(True)
-        tw.wm_geometry(f"+{x}+{y}")
+        tw.wm_geometry(f"+{bx}+{by}")
         ttk.Label(
             tw, text=self.text,
             background="#ffffd0", foreground="#222",
-            relief="solid", borderwidth=1, padding=(8, 4),
+            relief="solid", borderwidth=1, padding=(8, 5),
+            wraplength=self.WRAP, justify="left",
         ).pack()
 
     def _hide(self, _event=None):
@@ -3845,6 +3870,13 @@ class Tooltip:
             except tk.TclError:
                 pass
             self._tipwin = None
+
+
+def tip(widget, text):
+    """Attach a wrapped, 3-second-delay tooltip to any clickable widget.
+    Convenience wrapper so hover-help can be added consistently everywhere."""
+    Tooltip(widget, text)
+    return widget
 
 
 # ---------------------------------------------------------------------------
@@ -7505,8 +7537,9 @@ class App:
         url_entry = ttk.Entry(urlframe, textvariable=self.url_var)
         url_entry.pack(side="left", fill="x", expand=True, padx=8, pady=8)
         url_entry.insert(0, "https://")
-        ttk.Button(urlframe, text="Add webpage", command=self.add_url
-                   ).pack(side="left", padx=8)
+        tip(ttk.Button(urlframe, text="Add webpage", command=self.add_url),
+            "Paste a web address above and add the live webpage as a page in "
+            "your PDF (captured with its current layout).").pack(side="left", padx=8)
 
         # --- File list -----------------------------------------------------
         listframe = ttk.LabelFrame(pages_tab, text="Pages (in order)")
@@ -7606,21 +7639,29 @@ class App:
         # Row 1: reorder / remove (acts on the existing list)
         btns = ttk.Frame(left)
         btns.pack(fill="x", **pad)
-        ttk.Button(btns, text="↑ Up", command=self.move_up).pack(side="left")
-        ttk.Button(btns, text="↓ Down", command=self.move_down).pack(side="left", padx=4)
-        ttk.Button(btns, text="Remove", command=self.remove_sel).pack(side="left")
-        ttk.Button(btns, text="Clear all", command=self.clear_all).pack(side="left", padx=4)
+        tip(ttk.Button(btns, text="↑ Up", command=self.move_up),
+            "Move the selected page up — earlier in the document.").pack(side="left")
+        tip(ttk.Button(btns, text="↓ Down", command=self.move_down),
+            "Move the selected page down — later in the document.").pack(side="left", padx=4)
+        tip(ttk.Button(btns, text="Remove", command=self.remove_sel),
+            "Remove the selected file from the list. Doesn't delete anything "
+            "on disk.").pack(side="left")
+        tip(ttk.Button(btns, text="Clear all", command=self.clear_all),
+            "Remove every file from the list and start over.").pack(side="left", padx=4)
 
         # Add-from-source buttons. Their own line so the Scan button
         # doesn't get clipped on narrower windows.
         add_row = ttk.Frame(left)
         add_row.pack(fill="x", **pad)
-        ttk.Button(add_row, text="+ Browse files…",
-                   command=self.browse).pack(side="left")
-        ttk.Button(add_row, text="📱 From phone (QR)",
-                   command=self.add_from_phone).pack(side="left", padx=4)
-        ttk.Button(add_row, text="🖨 Scan",
-                   command=self.add_from_scanner).pack(side="left")
+        tip(ttk.Button(add_row, text="+ Browse files…", command=self.browse),
+            "Pick files from your computer to add — PDFs, images, Word/Excel/"
+            "PowerPoint, text, and more.").pack(side="left")
+        tip(ttk.Button(add_row, text="📱 From phone (QR)",
+                       command=self.add_from_phone),
+            "Show a QR code to send a photo or file straight from your phone "
+            "into the list over your local network.").pack(side="left", padx=4)
+        tip(ttk.Button(add_row, text="🖨 Scan", command=self.add_from_scanner),
+            "Scan a page from a connected scanner directly into the list.").pack(side="left")
 
         # --- Page size + Create -------------------------------------------
         opt = ttk.Frame(left)
@@ -7681,9 +7722,10 @@ class App:
         ).pack(side="left", padx=(16, 0))
 
         # Flatten option — rasterizes pages into JPEG to shrink the output.
-        # Disabled if pypdfium2 isn't available (e.g. dev environment missing
-        # the dep). In the shipped bundle it is always present.
-        self.flatten_var = tk.BooleanVar(value=False)
+        # v1.63: ON by default (when available) — most users want the compact,
+        # tamper-resistant flattened output; uncheck it to keep text selectable.
+        # Disabled if pypdfium2 isn't available (dev env missing the dep).
+        self.flatten_var = tk.BooleanVar(value=FLATTEN_OK)
         flatten_text = "Flatten output (smaller file — page becomes image, text not selectable)"
         if not FLATTEN_OK:
             flatten_text = "Flatten output (unavailable — install pypdfium2)"
@@ -7696,6 +7738,12 @@ class App:
         )
         if not FLATTEN_OK:
             self.flatten_chk.state(["disabled"])
+        else:
+            tip(self.flatten_chk,
+                "On by default — pages become flat images, so the PDF is "
+                "smaller and can't be easily edited. Uncheck it to keep the "
+                "text, links and form fields selectable, but the file will be "
+                "much larger.")
         self.flatten_chk.pack(anchor="w")
 
         # Savings preview, sits right under the checkbox label so the
@@ -7732,11 +7780,17 @@ class App:
         self.create_btn = ttk.Button(create_row, text="Create PDF",
                                      command=lambda: self.create_pdf("none"))
         self.create_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        tip(self.create_btn,
+            "Combine everything in the list into one PDF and save it, using "
+            "your Paper size / orientation / Order / Style settings.")
         self.sign_create_btn = ttk.Button(
             create_row, text="🔏 Sign and Create PDF",
             command=self.sign_and_create_pdf,
         )
         self.sign_create_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
+        tip(self.sign_create_btn,
+            "Build the PDF, then place your saved signature on it and sign it "
+            "with a tamper-evident digital signature.")
         if not SIGNING_OK:
             # pyhanko / cryptography not installed — keep button grayed.
             self.sign_create_btn.state(["disabled"])
@@ -7749,11 +7803,16 @@ class App:
             command=lambda: self.create_pdf("open"),
         )
         self.create_open_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        tip(self.create_open_btn,
+            "Same as Create PDF, then opens the finished file in your default "
+            "PDF viewer.")
         self.create_print_btn = ttk.Button(
             action_row, text="Create and print PDF",
             command=lambda: self.create_pdf("print"),
         )
         self.create_print_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
+        tip(self.create_print_btn,
+            "Same as Create PDF, then sends the finished file to your printer.")
 
         self.status = ttk.Label(root, text="Ready. Drop files or paste a URL to begin.",
                                 foreground="#444")
@@ -7778,6 +7837,7 @@ class App:
                                 foreground="#666", cursor="hand2")
         version_lbl.grid(row=0, column=0, sticky="w")
         version_lbl.bind("<Button-1>", lambda _e: self.show_whats_new())
+        tip(version_lbl, "Click to see what's new in this version.")
 
         center_btns = ttk.Frame(foot)
         center_btns.grid(row=0, column=1)
@@ -7787,12 +7847,17 @@ class App:
                                  command=self._on_sponsor_click)
         sponsor_btn.pack(side="left", padx=(0, 6))
         Tooltip(sponsor_btn, "Support this project from Dejan & Claudia")
-        ttk.Button(center_btns, text="Check for updates",
-                   command=self.check_for_updates).pack(side="left", padx=(0, 6))
-        ttk.Button(center_btns, text="About / License",
-                   command=self.show_about_dialog).pack(side="left", padx=(0, 6))
-        ttk.Button(center_btns, text="Close",
-                   command=self.root.destroy).pack(side="left")
+        tip(ttk.Button(center_btns, text="Check for updates",
+                       command=self.check_for_updates),
+            "Check now for a newer version of MyDocMaker and install it.").pack(
+            side="left", padx=(0, 6))
+        tip(ttk.Button(center_btns, text="About / License",
+                       command=self.show_about_dialog),
+            "About MyDocMaker, license terms (free for personal use), and "
+            "commercial pricing.").pack(side="left", padx=(0, 6))
+        tip(ttk.Button(center_btns, text="Close", command=self.root.destroy),
+            "Close MyDocMaker. Your current list is remembered for next "
+            "time.").pack(side="left")
 
         # v1.32+: My Signatures + (v1.45) Archive live in the footer's
         # right column. Both are setup-once actions so they sit out of
@@ -7819,6 +7884,9 @@ class App:
             command=self.show_my_signatures,
         )
         self.my_sigs_btn.pack(side="left")
+        tip(self.my_sigs_btn,
+            "Create, edit and manage your saved signatures (typed, drawn, or a "
+            "full business stamp with logo). Set one up here before signing.")
         if not SIGNING_OK:
             self.my_sigs_btn.state(["disabled"])
         self._refresh_archive_button()

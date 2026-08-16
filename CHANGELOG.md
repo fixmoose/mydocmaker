@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.63
+- **Wrapped, delayed hover tooltips everywhere.** `Tooltip` now word-wraps to a
+  tidy multi-line box (no more super-long single line), positions below the
+  widget clamped on-screen, and only appears after a 3-second hover so it never
+  obstructs the workflow. Added a `tip(widget, text)` helper and attached
+  descriptive tooltips to the main buttons (Create / Sign / Create-and-open /
+  print, Up/Down/Remove/Clear, Browse/Phone/Scan, Add webpage, Check for
+  updates, About/License, Close, My Signatures, Flatten).
+- **Flatten output ON by default** (when available) — smaller, tamper-resistant
+  files for most users. Its tooltip explains unchecking keeps text/links/forms
+  selectable at the cost of a much larger file.
+
 ## v1.62
 - **License gate no longer false-locks online users.** `license_check` now
   falls back to raw TCP probes (Cloudflare/Google/Quad9 anycast IPs on 443/53)
