@@ -103,6 +103,29 @@ try:
 except Exception:
     PIL_TK_OK = False
 
+# Crash diagnostics. faulthandler costs nothing until the process dies, and
+# turns an opaque "Segmentation fault" into a Python traceback naming the call
+# that did it — the difference between a bug report we can act on and one we
+# can't. MYDOCMAKER_DEBUG_STARTUP=1 additionally traces window construction.
+import faulthandler
+try:
+    faulthandler.enable()
+except Exception:
+    pass
+
+_DEBUG_STARTUP = bool(os.environ.get("MYDOCMAKER_DEBUG_STARTUP"))
+
+
+def _dbg(stage):
+    """Breadcrumb for tracking down startup crashes in packaged builds."""
+    if _DEBUG_STARTUP:
+        try:
+            sys.stderr.write(f"[startup] {stage}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+
 APP_NAME = "MyDocMaker"
 APP_VERSION = "1.65.1"
 
@@ -8585,6 +8608,7 @@ class App:
         topbar = ttk.Frame(root)
         topbar.pack(fill="x", padx=10, pady=(4, 0))
 
+        _dbg("notebook")
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(2, 4))
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -8792,18 +8816,22 @@ class App:
         # and renders pages via pypdfium2. Items not yet rendered show as
         # placeholders; PreviewTab listens to "item_rendered" events
         # forwarded by _poll_queue.
+        _dbg("PreviewTab")
         self.preview = PreviewTab(preview_tab, self)
 
         # OrderTab (v1.53): drag-to-reorder thumbnail grid. Built after the
         # preview so its reorders can invalidate/refresh the preview.
+        _dbg("OrderTab")
         self.order_tab = OrderTab(order_tab, self)
 
         # StyleTab (v1.55): watermark / page numbers / header-footer / Bates /
         # cover sheet. Writes into self.style and refreshes the preview live.
+        _dbg("StyleTab")
         self.style_tab = StyleTab(style_tab, self)
 
         # EditorTab (v1.65): scaffold for the per-page editor. The tab and its
         # page picker are live; the editor itself lands in a later release.
+        _dbg("EditorTab")
         self.editor_tab = EditorTab(editor_tab, self)
 
         # v1.65.1: ONE primary action. The four buttons (Create / Sign and
@@ -8913,6 +8941,7 @@ class App:
         # Restore the page list from last session. Files that no longer
         # exist on disk are silently dropped — we surface the count in the
         # status bar so the user knows what happened.
+        _dbg("restore_session")
         self._restore_session()
 
         # Save state on window close, and also intercept window close to
@@ -8923,8 +8952,10 @@ class App:
         # behind the bottom-right logo (the long Flatten label is the widest
         # line, and its width varies with the system font/DPI). Floored at the
         # original 700, capped to the screen so it always fits on-screen.
+        _dbg("first layout pass (update_idletasks)")
         try:
             root.update_idletasks()
+            _dbg("layout pass survived")
             req_w = root.winfo_reqwidth()
             screen_w = root.winfo_screenwidth()
             screen_h = root.winfo_screenheight()
@@ -11428,7 +11459,9 @@ def main():
         # Stays withdrawn until the App is fully built (deiconified before the
         # mainloop) so the user never sees an empty window during the check.
 
+    _dbg("building App")
     app = App(root)
+    _dbg("App built")
     if cli_paths:
         app.add_paths(cli_paths)
 
@@ -11457,6 +11490,7 @@ def main():
     except tk.TclError:
         pass
 
+    _dbg("entering mainloop")
     root.mainloop()
 
 
