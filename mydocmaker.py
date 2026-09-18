@@ -142,6 +142,15 @@ TAB_EDITOR = "Editor"
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
     "1.65.2": [
+        "Closing the app no longer throws away unfinished work. If you "
+        "haven't created a document from your files yet, it asks first — "
+        "create it now, close anyway, or go back.",
+        "The Editor tab works. Pick a page and it finds the text that's "
+        "already on it: drag to select, or click a single letter, then "
+        "delete. It also lists any form fills on the page so you can clear "
+        "them. Deleted text really is gone — the edited page is rasterised "
+        "so nothing can be recovered from underneath, while every other page "
+        "keeps its selectable text.",
         "Text on the page works properly now. Typing happens right on the "
         "document instead of in a big white box that covered it — you see "
         "exactly what you'll get, with a blinking cursor, arrow keys and "
@@ -1594,6 +1603,80 @@ def _reportlab_font(family, bold, italic):
     if italic:
         return f"{base}-Oblique"
     return base
+
+
+def apply_page_edits(page, edits):
+    """Apply one page's Editor-tab edits: paint out deleted text and empty
+    any cleared form fills.
+
+    Painting is only half of a deletion — the original glyphs would still be
+    under the white box, selectable and searchable — so a page carrying
+    redactions is rasterised at build time (see `redacted_keys` in the build
+    worker). Clearing a form fill needs no such help: the value is genuinely
+    removed here."""
+    if not edits:
+        return page
+    rects = edits.get("redactions") or []
+    if rects:
+        try:
+            w = float(page.mediabox.width)
+            h = float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=(w, h))
+            c.setFillColorRGB(1, 1, 1)
+            for (x0, y0, x1, y1) in rects:
+                c.rect(float(x0), float(y0),
+                       max(0.5, float(x1) - float(x0)),
+                       max(0.5, float(y1) - float(y0)), fill=1, stroke=0)
+            c.showPage()
+            c.save()
+            overlay = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+            page.merge_page(overlay)
+        except Exception:
+            pass
+    names = set(edits.get("cleared_fields") or [])
+    if names:
+        try:
+            from pypdf.generic import NameObject, TextStringObject
+            for a in (page.get("/Annots") or []):
+                obj = a.get_object()
+                if obj.get("/Subtype") != "/Widget":
+                    continue
+                nm = obj.get("/T")
+                if nm is None:
+                    parent = obj.get("/Parent")
+                    nm = parent.get_object().get("/T") if parent else None
+                if nm is None or str(nm) not in names:
+                    continue
+                if obj.get("/FT") == "/Btn":
+                    obj[NameObject("/V")] = NameObject("/Off")
+                    obj[NameObject("/AS")] = NameObject("/Off")
+                else:
+                    obj[NameObject("/V")] = TextStringObject("")
+                if "/AP" in obj:
+                    del obj["/AP"]
+        except Exception:
+            pass
+    return page
+
+
+def rasterize_page(page):
+    """Render one page to an image and hand back a replacement page.
+
+    Used for pages with Editor deletions: the white boxes hide the glyphs but
+    leave them in the file, so the page is rasterised to make the removal
+    real. Only the edited page pays this cost — flattening the whole document
+    to delete one word would needlessly strip every other page of selectable
+    text."""
+    try:
+        w = PdfWriter()
+        w.add_page(page)
+        buf = io.BytesIO()
+        w.write(buf)
+        flat = flatten_pdf_bytes(buf.getvalue())
+        return PdfReader(flat).pages[0]
+    except Exception:
+        return page
 
 
 def apply_text_notes(pdf_bytes, notes):
@@ -8754,68 +8837,373 @@ class StyleTab:
 # itself lands in a later version.
 # ---------------------------------------------------------------------------
 class EditorTab:
+    """Per-page editing (v1.65.2): find the text and form fills that are
+    already on a page, and take them out.
+
+    Deliberately not a PDF word processor. A PDF stores positioned glyphs,
+    not paragraphs, so re-flowing text is a specialist problem. What is
+    tractable — and what was actually asked for — is *removal*: select
+    existing letters and delete them, or clear a form fill, then type your
+    own replacement with the text tool on Preview Pages.
+
+    How removal works: PDFium gives us an exact box per character, so a
+    selection is a set of rectangles. Those are painted out at build time and
+    the affected page is rasterised, which is what makes the deletion real —
+    paint alone would leave the original text sitting underneath, selectable
+    and searchable. Form fills are different: clearing a field value removes
+    it properly, no rasterising needed.
+    """
+
+    SCALE = 1.4                       # on-screen render scale
+
     def __init__(self, parent, app):
         self.app = app
         self.frame = parent
+        self._pages = []              # [(item, local_idx, label)]
+        self._cur = None              # (uid, local_idx)
+        self._cur_size = (612, 792)   # page size in points
+        self._chars = []              # [(char, x0, y0, x1, y1)] in points
+        self._fields = []             # [(name, kind, value, rect_pts)]
+        self._sel = set()             # selected char indices
+        self._drag_from = None
+        self._photo = None
 
-        ttk.Label(parent, text="Page editor",
-                  font=("", 13, "bold")).pack(anchor="w", padx=12,
-                                              pady=(12, 2))
+        ttk.Label(parent, text="Page editor", font=("", 13, "bold")
+                  ).pack(anchor="w", padx=12, pady=(10, 0))
         ttk.Label(
-            parent, wraplength=640, justify="left", foreground="#444",
-            text="Pick a page, edit it, save — and that page is replaced in "
-                 "your document. Multi-format: PDFs, Word/Excel/PowerPoint, "
-                 "images and plain text.",
-        ).pack(anchor="w", padx=12, pady=(0, 8))
+            parent, wraplength=900, justify="left", foreground="#444",
+            text="Select text that's already on the page and delete it, or "
+                 "clear a form fill. To put your own words in its place, use "
+                 "✎ Add text on the Preview Pages tab.",
+        ).pack(anchor="w", padx=12, pady=(0, 6))
 
-        box = ttk.LabelFrame(parent, text="Pick a page to edit")
-        box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
-        self.listbox = tk.Listbox(box, selectmode=tk.SINGLE,
-                                  activestyle="dotbox")
-        self.listbox.pack(side="left", fill="both", expand=True,
-                          padx=(8, 0), pady=8)
-        sb = ttk.Scrollbar(box, orient="vertical",
-                           command=self.listbox.yview)
-        sb.pack(side="left", fill="y", pady=8)
-        self.listbox.config(yscrollcommand=sb.set)
-        self.listbox.bind("<Double-Button-1>", lambda _e: self._not_yet())
+        body = ttk.Frame(parent)
+        body.pack(fill="both", expand=True, padx=12, pady=(0, 6))
 
-        row = ttk.Frame(parent)
-        row.pack(fill="x", padx=12, pady=(0, 6))
-        self.edit_btn = ttk.Button(row, text="✎ Edit this page…",
-                                   command=self._not_yet)
-        self.edit_btn.pack(side="left")
-        tip(self.edit_btn,
-            "Open the selected page in the editor, change it, and save — the "
-            "page in your document updates to match.")
-        ttk.Button(row, text="↻ Refresh list", command=self.on_show
-                   ).pack(side="left", padx=6)
+        left = ttk.LabelFrame(body, text="Pages")
+        left.pack(side="left", fill="y")
+        self.listbox = tk.Listbox(left, width=30, activestyle="dotbox",
+                                  exportselection=False)
+        self.listbox.pack(side="left", fill="y", padx=(6, 0), pady=6)
+        lsb = ttk.Scrollbar(left, orient="vertical",
+                            command=self.listbox.yview)
+        lsb.pack(side="left", fill="y", pady=6)
+        self.listbox.config(yscrollcommand=lsb.set)
+        self.listbox.bind("<<ListboxSelect>>", self._on_pick)
 
-        ttk.Label(
-            parent, foreground="#7a4500", wraplength=640, justify="left",
-            text="Coming soon — the editor itself isn't wired up in this "
-                 "release. The list above already shows what you'll be able "
-                 "to edit.",
-        ).pack(anchor="w", padx=12, pady=(0, 12))
+        right = ttk.Frame(body)
+        right.pack(side="left", fill="both", expand=True, padx=(8, 0))
 
+        bar = ttk.Frame(right)
+        bar.pack(fill="x")
+        self.del_btn = ttk.Button(bar, text="🗑 Delete selected text",
+                                  command=self._delete_selection)
+        self.del_btn.pack(side="left")
+        self.del_btn.state(["disabled"])
+        tip(self.del_btn, "Paint out the characters you've selected. Drag "
+                          "across the page to select; click a letter for one.")
+        self.selall_btn = ttk.Button(bar, text="Select all text",
+                                     command=self._select_all)
+        self.selall_btn.pack(side="left", padx=(6, 0))
+        self.clear_btn = ttk.Button(bar, text="↺ Undo edits on this page",
+                                    command=self._clear_page_edits)
+        self.clear_btn.pack(side="left", padx=(6, 0))
+        tip(self.clear_btn, "Put back everything you removed from this page.")
+        self.info = ttk.Label(bar, text="", foreground="#666")
+        self.info.pack(side="left", padx=(12, 0))
+
+        canvas_wrap = ttk.Frame(right, borderwidth=1, relief="sunken")
+        canvas_wrap.pack(fill="both", expand=True, pady=(6, 0))
+        self.canvas = tk.Canvas(canvas_wrap, background="#dadada",
+                                highlightthickness=0)
+        vsb = ttk.Scrollbar(canvas_wrap, orient="vertical",
+                            command=self.canvas.yview)
+        hsb = ttk.Scrollbar(canvas_wrap, orient="horizontal",
+                            command=self.canvas.xview)
+        self.canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side="right", fill="y")
+        hsb.pack(side="bottom", fill="x")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.canvas.bind("<Button-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+
+        fills = ttk.LabelFrame(parent, text="Form fills on this page")
+        fills.pack(fill="x", padx=12, pady=(0, 10))
+        self.fill_list = tk.Listbox(fills, height=3, activestyle="dotbox",
+                                    exportselection=False)
+        self.fill_list.pack(side="left", fill="x", expand=True,
+                            padx=(6, 0), pady=6)
+        self.fill_del_btn = ttk.Button(fills, text="Clear this fill",
+                                       command=self._clear_fill)
+        self.fill_del_btn.pack(side="left", padx=6)
+        self.fill_del_btn.state(["disabled"])
+        tip(self.fill_del_btn,
+            "Empty this form field. Unlike deleting text, this removes the "
+            "value outright — nothing is painted over.")
+        self.fill_list.bind("<<ListboxSelect>>",
+                            lambda _e: self._on_fill_pick())
+
+        self._set_placeholder(f"Add files on the {TAB_FILES} tab, then pick a "
+                              f"page here.")
+
+    # ---- page list -------------------------------------------------------
     def on_show(self):
-        """Repopulate the picker from the current file list. Called on every
-        switch to this tab so it can never show a stale list."""
+        """Rebuild the page list. Called on every switch to this tab."""
+        self._pages = []
         self.listbox.delete(0, tk.END)
         for it in self.app.items:
-            self.listbox.insert(tk.END, it.label)
-        if not self.app.items:
-            self.listbox.insert(
-                tk.END,
-                f"(nothing added yet — add files on the {TAB_FILES} tab)")
+            if not it.cached_pdf_bytes:
+                continue
+            try:
+                n = len(PdfReader(io.BytesIO(it.cached_pdf_bytes)).pages)
+            except Exception:
+                continue
+            for i in range(n):
+                self._pages.append((it, i))
+                edits = self.app.page_edits.get((it.uid, i))
+                mark = "  •" if edits else ""
+                self.listbox.insert(
+                    tk.END, f"{it.label[:24]} — p{i + 1}{mark}")
+        if not self._pages:
+            self._set_placeholder(
+                f"Nothing to edit yet — add files on the {TAB_FILES} tab.")
 
-    def _not_yet(self):
-        messagebox.showinfo(
-            APP_NAME,
-            "The page editor is on its way.\n\n"
-            "When it lands you'll pick a page here, edit it in place, and "
-            "save — the page in your document updates to match.",
-        )
+    def _on_pick(self, _event=None):
+        sel = self.listbox.curselection()
+        if not sel or sel[0] >= len(self._pages):
+            return
+        item, idx = self._pages[sel[0]]
+        self._load_page(item, idx)
+
+    # ---- load + render ---------------------------------------------------
+    def _load_page(self, item, idx):
+        self._cur = (item.uid, idx)
+        self._sel = set()
+        self._chars = []
+        self._fields = []
+        try:
+            writer = PdfWriter()
+            reader = PdfReader(io.BytesIO(item.cached_pdf_bytes))
+            page = reader.pages[idx]
+            writer.add_page(page)
+            buf = io.BytesIO()
+            writer.write(buf)
+            one = buf.getvalue()
+        except Exception as e:
+            self._set_placeholder(f"Couldn't open that page: {e}")
+            return
+
+        # Characters + their boxes, straight from PDFium.
+        try:
+            doc = pdfium.PdfDocument(one)
+            pg = doc[0]
+            self._cur_size = pg.get_size()
+            tp = pg.get_textpage()
+            for i in range(tp.count_chars()):
+                ch = tp.get_text_range(i, 1)
+                try:
+                    box = tp.get_charbox(i)
+                except Exception:
+                    continue
+                self._chars.append((ch,) + tuple(box))
+            bitmap = pg.render(scale=self.SCALE)
+            pil = bitmap.to_pil()
+            doc.close()
+        except Exception as e:
+            self._set_placeholder(f"Couldn't render that page: {e}")
+            return
+
+        self._load_fields(item, idx)
+        self._draw(pil)
+        self._update_info()
+
+    def _load_fields(self, item, idx):
+        """Form fields whose widget sits on this page."""
+        self.fill_list.delete(0, tk.END)
+        try:
+            reader = PdfReader(io.BytesIO(item.cached_pdf_bytes))
+            page = reader.pages[idx]
+            annots = page.get("/Annots") or []
+            cleared = set(self.app.page_edits.get(self._cur, {})
+                          .get("cleared_fields", []))
+            for a in annots:
+                try:
+                    obj = a.get_object()
+                except Exception:
+                    continue
+                if obj.get("/Subtype") != "/Widget":
+                    continue
+                name = obj.get("/T")
+                if name is None:
+                    parent = obj.get("/Parent")
+                    name = parent.get_object().get("/T") if parent else None
+                if name is None:
+                    continue
+                val = obj.get("/V")
+                rect = [float(v) for v in (obj.get("/Rect") or [0, 0, 0, 0])]
+                self._fields.append((str(name), str(val), rect))
+                shown = "(cleared)" if str(name) in cleared else repr(str(val))
+                self.fill_list.insert(tk.END, f"{name} = {shown}")
+        except Exception:
+            pass
+
+    def _draw(self, pil=None):
+        if pil is not None:
+            if not PIL_TK_OK:
+                self._set_placeholder("Install Pillow ImageTk to edit pages.")
+                return
+            self._photo = _ImageTk.PhotoImage(pil)
+        if self._photo is None:
+            return
+        self.canvas.delete("all")
+        self.canvas.create_image(8, 8, anchor="nw", image=self._photo)
+        w, h = self._photo.width(), self._photo.height()
+        self.canvas.config(scrollregion=(0, 0, w + 16, h + 16))
+        # Already-removed regions, so the page shows what the output will.
+        for (x0, y0, x1, y1) in self._redactions():
+            a, b = self._pdf_to_canvas(x0, y1)
+            c, d = self._pdf_to_canvas(x1, y0)
+            self.canvas.create_rectangle(a, b, c, d, fill="#ffffff",
+                                         outline="#d40000", width=1)
+        # Current selection.
+        for i in self._sel:
+            _ch, x0, y0, x1, y1 = self._chars[i]
+            a, b = self._pdf_to_canvas(x0, y1)
+            c, d = self._pdf_to_canvas(x1, y0)
+            self.canvas.create_rectangle(a, b, c, d, outline="",
+                                         fill="#0a64d8", stipple="gray50")
+
+    def _pdf_to_canvas(self, x_pt, y_pt):
+        _w, h = self._cur_size
+        return 8 + x_pt * self.SCALE, 8 + (h - y_pt) * self.SCALE
+
+    def _canvas_to_pdf(self, cx, cy):
+        _w, h = self._cur_size
+        return (cx - 8) / self.SCALE, h - (cy - 8) / self.SCALE
+
+    def _set_placeholder(self, text):
+        self.canvas.delete("all")
+        self._photo = None
+        self.canvas.create_text(12, 12, anchor="nw", text=text,
+                                fill="#666", font=("", 11))
+
+    # ---- selection -------------------------------------------------------
+    def _on_press(self, event):
+        if not self._chars:
+            return
+        self._drag_from = (self.canvas.canvasx(event.x),
+                           self.canvas.canvasy(event.y))
+        self._sel = set()
+        hit = self._char_at(*self._drag_from)
+        if hit is not None:
+            self._sel = {hit}
+        self._draw()
+        self._update_info()
+
+    def _on_drag(self, event):
+        if self._drag_from is None:
+            return
+        x0, y0 = self._drag_from
+        x1, y1 = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        self._sel = self._chars_in_box(x0, y0, x1, y1)
+        self._draw()
+        self._update_info()
+
+    def _on_release(self, _event):
+        self._drag_from = None
+        self._update_info()
+
+    def _char_at(self, cx, cy):
+        px, py = self._canvas_to_pdf(cx, cy)
+        for i, (_ch, x0, y0, x1, y1) in enumerate(self._chars):
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                return i
+        return None
+
+    def _chars_in_box(self, cx0, cy0, cx1, cy1):
+        ax0, ay0 = self._canvas_to_pdf(min(cx0, cx1), max(cy0, cy1))
+        ax1, ay1 = self._canvas_to_pdf(max(cx0, cx1), min(cy0, cy1))
+        out = set()
+        for i, (_ch, x0, y0, x1, y1) in enumerate(self._chars):
+            if x1 >= ax0 and x0 <= ax1 and y1 >= ay0 and y0 <= ay1:
+                out.add(i)
+        return out
+
+    def _select_all(self):
+        self._sel = set(range(len(self._chars)))
+        self._draw()
+        self._update_info()
+
+    def _update_info(self):
+        n = len(self._sel)
+        picked = "".join(self._chars[i][0] for i in sorted(self._sel))[:40]
+        if n:
+            self.info.config(text=f"{n} character(s) selected: {picked!r}")
+            self.del_btn.state(["!disabled"])
+        else:
+            nred = len(self._redactions())
+            self.info.config(
+                text=f"{len(self._chars)} characters on this page"
+                     + (f"  ·  {nred} removal(s) pending" if nred else ""))
+            self.del_btn.state(["disabled"])
+
+    # ---- edits -----------------------------------------------------------
+    def _redactions(self):
+        return self.app.page_edits.get(self._cur, {}).get("redactions", [])
+
+    def _edits(self):
+        return self.app.page_edits.setdefault(
+            self._cur, {"redactions": [], "cleared_fields": []})
+
+    def _delete_selection(self):
+        if not self._sel or self._cur is None:
+            return
+        # One rectangle per contiguous run keeps the output tidy.
+        boxes = [self._chars[i][1:] for i in sorted(self._sel)]
+        self._edits()["redactions"].extend(
+            [tuple(round(v, 2) for v in b) for b in boxes])
+        self._sel = set()
+        self.app._doc_dirty = True
+        self._after_edit()
+
+    def _clear_fill(self):
+        sel = self.fill_list.curselection()
+        if not sel or sel[0] >= len(self._fields) or self._cur is None:
+            return
+        name = self._fields[sel[0]][0]
+        cleared = self._edits()["cleared_fields"]
+        if name not in cleared:
+            cleared.append(name)
+        self.app._doc_dirty = True
+        self._after_edit()
+
+    def _on_fill_pick(self):
+        self.fill_del_btn.state(
+            ["!disabled"] if self.fill_list.curselection() else ["disabled"])
+
+    def _clear_page_edits(self):
+        if self._cur in self.app.page_edits:
+            del self.app.page_edits[self._cur]
+        self._sel = set()
+        self.app._doc_dirty = True
+        self._after_edit()
+
+    def _after_edit(self):
+        """Repaint here, refresh the list marks, and invalidate the preview so
+        the rest of the app reflects the change."""
+        item = next((i for i in self.app.items
+                     if self._cur and i.uid == self._cur[0]), None)
+        if item is not None:
+            self._load_fields(item, self._cur[1])
+        self._draw()
+        self._update_info()
+        keep = self.listbox.curselection()
+        self.on_show()
+        if keep:
+            self.listbox.selection_set(keep[0])
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
 
 
 # ---------------------------------------------------------------------------
@@ -8830,6 +9218,12 @@ class App:
         # so reordering/removing other items doesn't disturb it. Honoured by
         # the Preview tab, the final Create-PDF build, and the sign build.
         self.excluded_pages = set()
+        # True once the document has changed without being written out; drives
+        # the "you haven't created this yet" prompt on close.
+        self._doc_dirty = False
+        # Editor-tab edits, keyed like excluded_pages by (item.uid, local_idx):
+        # {"redactions": [(x0,y0,x1,y1)...], "cleared_fields": [name...]}
+        self.page_edits = {}
         # Pending signing passes (v1.65). Signing A and B is two passes —
         # a digital signature covers one whole file, so it can't be copied.
         self._sign_queue = []
@@ -9556,7 +9950,27 @@ class App:
         self.status.config(text=msg)
 
     def _on_close(self):
-        # Final flush before tearing down the window.
+        """Don't let a closed window quietly throw away unfinished work.
+
+        The page list survives (it's in the session file), but the *document*
+        — the text you typed on it, the pages you hid, the styling — only
+        becomes a real file when you Create it. Closing without doing that
+        used to lose it silently."""
+        if self._doc_dirty and self.items:
+            answer = messagebox.askyesnocancel(
+                APP_NAME,
+                "You haven't created a document from these "
+                f"{len(self.items)} item(s) yet.\n\n"
+                "Yes — create it now (this window stays open)\n"
+                "No — close and discard the unsaved work\n"
+                "Cancel — go back",
+                default=messagebox.YES,
+            )
+            if answer is None:          # Cancel → stay put
+                return
+            if answer:                  # Yes → build it, don't close
+                self.create_doc()
+                return
         self._save_state_now()
         try:
             self.root.destroy()
@@ -9565,7 +9979,12 @@ class App:
 
     def _schedule_save(self):
         """Debounce frequent save_session_state calls. Multiple drops in
-        quick succession collapse into one disk write."""
+        quick succession collapse into one disk write.
+
+        Every path that changes the document funnels through here — adding or
+        removing files, typing a note, hiding a page, restyling — so it's also
+        where we notice there is unsaved work to warn about on close."""
+        self._doc_dirty = True
         if self._save_pending:
             return
         self._save_pending = True
@@ -10861,6 +11280,11 @@ class App:
         asis_idx = set()
         for out_i, key in enumerate(ordered_out):
             pg = page_map[key]
+            edits = self.page_edits.get(key)
+            if edits:
+                pg = apply_page_edits(pg, edits)
+                if edits.get("redactions") and FLATTEN_OK:
+                    pg = rasterize_page(pg)
             turns = self.page_rotate.get(key, 0)
             if turns:
                 pg = _rotate_page_baked(pg, turns)
@@ -10872,8 +11296,9 @@ class App:
         writer.write(staged)
         final = _apply_nup(staged.getvalue(), layout, asis_idx)
         final = apply_style(final, self.style, self)
-        return apply_text_notes(
+        final = apply_text_notes(
             final, self._notes_for(ordered_all, ordered_out, layout))
+        return final
 
     def _notes_for(self, ordered_all, ordered_out, layout):
         """Re-key the text notes for a filtered document.
@@ -10915,6 +11340,7 @@ class App:
         """One part signed and saved. If the user chose to sign both halves,
         walk straight on to the next one — cancelling that dialog just ends
         the run."""
+        self._doc_dirty = False
         self.status.config(text=f"Signed: {os.path.basename(path)}")
         if not self._sign_queue:
             return
@@ -11438,11 +11864,17 @@ class App:
         asis_idx = set()
         for out_i, key in enumerate(self.reorder_keys(natural)):
             pg = page_map[key]
+            edits = self.page_edits.get(key)
+            if edits:
+                pg = apply_page_edits(pg, edits)
+                if edits.get("redactions") and FLATTEN_OK:
+                    pg = rasterize_page(pg)
             turns = self.page_rotate.get(key, 0)
             if turns:
                 pg = _rotate_page_baked(pg, turns)
                 asis_idx.add(out_i)
             writer.add_page(pg)
+
 
         if len(writer.pages) == 0:
             self.work_queue.put(("error", "No pages were created.\n\n" + "\n".join(skipped)))
@@ -11542,6 +11974,7 @@ class App:
                     self.progress.config(value=self.progress["maximum"])
                     self.status.config(
                         text=f"Done. Saved {pages} page(s).")
+                    self._doc_dirty = False
                     # v1.65.1: what to do with the file is asked here rather
                     # than chosen up front by a dedicated button.
                     self._show_saved_dialog(path, text)
@@ -11554,6 +11987,7 @@ class App:
                         f"{'' if n == 1 else 's'})" for p, n in written)
                     self.status.config(
                         text=f"Exported {len(written)} file(s).")
+                    self._doc_dirty = False
                     messagebox.showinfo(
                         APP_NAME,
                         f"Exported to {os.path.dirname(written[0][0])}:\n\n"

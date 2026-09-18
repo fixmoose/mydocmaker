@@ -1,6 +1,30 @@
 # Changelog
 
 ## v1.65.2
+- **Closing no longer discards unfinished work.** `_on_close()` now prompts
+  when the document has changed without being written out (Yes creates it and
+  keeps the window open, No closes, Cancel goes back). `_doc_dirty` is set in
+  `_schedule_save()` — the single funnel every document change already passes
+  through — and cleared on a successful Create, Export or Sign.
+- **The Editor tab does something.** `EditorTab` finds the text already on a
+  page and removes it: drag-select or click a single glyph, then delete. It
+  also lists the page's form fills and can clear them.
+  - No new dependency and no licence risk: **pypdfium2**, already bundled and
+    permissively licensed, exposes an exact box per character
+    (`get_charbox`). PyMuPDF — the usual first reach — is AGPL and would be
+    incompatible with shipping PolyForm Noncommercial plus a commercial tier.
+  - Deletion is real, not cosmetic. `apply_page_edits()` paints the selection
+    out, and `rasterize_page()` then rasterises **just that page**, so the
+    original glyphs can't be recovered from underneath. Every other page keeps
+    its selectable text — flattening the whole document to delete one word
+    would have been a poor trade. Clearing a form fill needs none of this: the
+    value is removed outright.
+  - Edits are keyed by `(item.uid, local_idx)` like `excluded_pages`, so they
+    survive re-render, reorder and zoom, and apply on every output path
+    (Create, Export, Sign).
+  - Not attempted: re-flowing or retyping existing text in place. A PDF stores
+    positioned glyphs, not paragraphs; type replacements with the Preview text
+    tool instead.
 - **Fixed: "Delete note" did nothing.** `_redraw_notes()` created fresh canvas
   items on every redraw but never removed the old ones, so deleted text stayed
   painted, dragged text left ghosts, and `_note_at()` matched invisible
