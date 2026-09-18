@@ -1,17 +1,32 @@
 # Changelog
 
 ## v1.65.1
-- **Fixed: the packaged Linux build segfaulted on startup.** v1.65 `place()`d
-  the My Signatures button *inside* the `ttk::Notebook` so it would sit level
-  with the tabs. A notebook manages its own children, and a place()d non-pane
-  child corrupts that bookkeeping — it survived running from source but killed
-  the frozen build during the first layout pass (`root.update_idletasks()`).
-  Now packed in its own row above the notebook.
-  - Ruled out by bisection first: not the changed dependencies (swapping
-    v1.64's pillow-heif/pyhanko/playwright/cryptography into the v1.65 bundle
-    still crashed), not tkinterdnd2 0.6.3, not the bundled font libraries, not
-    Pillow's ImageTk, and not any individual emoji glyph (all render fine in
-    system Tk). v1.64's bundle runs fine on the same machine.
+- **Fixed: the packaged Linux build segfaulted on startup.** A
+  `ttk::radiobutton` whose `-value` already matches its `-variable` selects
+  itself *during construction*. Doing that to the **first** `ttk::radiobutton`
+  in the process, inside a notebook pane that has not been mapped yet,
+  NULL-dereferences inside Tk in the frozen build. v1.65 moved the Paper size
+  and Orientation radios off the (visible) Files tab onto Preview Pages and hit
+  exactly that: the `Letter` radio matched `default_page_size()` and killed the
+  window before it drew. On an A4 locale it would have died on the `A4` radio
+  instead.
+  - Fix: the layout variables start empty so every radio is created
+    unselected, and `_apply_layout_defaults()` sets the defaults once the
+    widgets exist. `_current_layout()` falls back sensibly if read during
+    construction.
+  - It never reproduced from source because system Python 3.10 does not take
+    the same path as the bundled 3.12. Found by adding `faulthandler` (which
+    named the exact file and line) plus per-iteration breadcrumbs (which named
+    the exact radio).
+  - Ruled out first: the changed dependencies (swapping v1.64's
+    pillow-heif/pyhanko/playwright/cryptography into the v1.65 bundle still
+    crashed), tkinterdnd2 0.6.3, the bundled font libraries, Pillow's ImageTk,
+    every emoji glyph, the saved session state, and a place()d button inside
+    the notebook (fixed anyway — it was genuinely unsound).
+- **`faulthandler` is now always on.** It costs nothing until the process dies
+  and turns a bare "Segmentation fault" into a Python traceback naming the
+  call that caused it. `MYDOCMAKER_DEBUG_STARTUP=1` additionally traces window
+  construction.
 - **One "Create MyDoc" button replaces four.** `Create PDF`, `Sign and Create
   PDF`, `Create and open PDF` and `Create and print PDF` were one build with
   four tails. Now `create_doc()` asks what to make, then `_show_saved_dialog()`

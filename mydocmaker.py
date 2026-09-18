@@ -114,6 +114,8 @@ except Exception:
     pass
 
 _DEBUG_STARTUP = bool(os.environ.get("MYDOCMAKER_DEBUG_STARTUP"))
+# Temporary: lets one packaged build run several crash experiments.
+_EXP = os.environ.get("MYDOCMAKER_EXP", "")
 
 
 def _dbg(stage):
@@ -142,11 +144,11 @@ TAB_EDITOR = "Editor"
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
     "1.65.1": [
-        "Fixed: the Linux build crashed on startup. The ✎ My Signatures "
-        "button was being drawn inside the tab strip itself, which isn't a "
-        "supported arrangement — it took down the whole window on the "
-        "packaged Linux build. It now sits in its own row just above the "
-        "tabs.",
+        "Fixed: the Linux app wouldn't start at all. Moving the Paper size "
+        "and Orientation controls onto the Preview Pages tab tripped a bug in "
+        "the windowing toolkit that closed the app before the window "
+        "appeared. The controls are still on Preview Pages — they're just "
+        "set up in a way that avoids it.",
         "One button instead of four. 'Create PDF', 'Sign and Create PDF', "
         "'Create and open' and 'Create and print' are now a single "
         "'Create MyDoc'. It asks what to make — PDF, PNG or JPG images, "
@@ -6529,30 +6531,42 @@ class PreviewTab:
         # Paper size + Orientation moved here from the Files tab: changing
         # them re-renders the preview immediately, so the user sees the effect
         # on the actual page instead of having to switch tabs to check.
-        lbar = ttk.Frame(self.frame)
-        lbar.pack(fill="x", padx=8, pady=(8, 0))
-        ttk.Label(lbar, text="Paper size:").pack(side="left")
-        for _txt, _val in (("Original (images)", "original"), ("A4", "a4"),
-                           ("A3", "a3"), ("Letter", "letter"),
-                           ("11×17", "tabloid")):
-            ttk.Radiobutton(lbar, text=_txt, value=_val,
-                            variable=self.app.size_var,
-                            command=self.app._on_page_mode_changed
-                            ).pack(side="left", padx=4)
+        _RB = tk.Radiobutton if _EXP == "tk_radio" else ttk.Radiobutton
+        if _EXP == "skip_layout_bar":
+            _dbg("  SKIPPING the paper-size/orientation bar (experiment)")
+        else:
+            _dbg("  lbar frame")
+            lbar = ttk.Frame(self.frame)
+            lbar.pack(fill="x", padx=8, pady=(8, 0))
+            _dbg("  lbar label")
+            ttk.Label(lbar, text="Paper size:").pack(side="left")
+            for _i, (_txt, _val) in enumerate((
+                    ("Original (images)", "original"), ("A4", "a4"),
+                    ("A3", "a3"), ("Letter", "letter"),
+                    ("11×17", "tabloid"))):
+                _dbg(f"  size radio #{_i} {_val!r} text={_txt!r}")
+                _RB(lbar, text=_txt, value=_val,
+                    variable=self.app.size_var,
+                    command=self.app._on_page_mode_changed
+                    ).pack(side="left", padx=4)
+            _dbg("  size radios done")
 
-        lbar2 = ttk.Frame(self.frame)
-        lbar2.pack(fill="x", padx=8, pady=(2, 0))
-        ttk.Label(lbar2, text="Orientation:").pack(side="left")
-        for _txt, _val in (("Portrait", "portrait"),
-                           ("Landscape", "landscape")):
-            ttk.Radiobutton(lbar2, text=_txt, value=_val,
-                            variable=self.app.orient_var,
-                            command=self.app._on_page_mode_changed
-                            ).pack(side="left", padx=4)
-        ttk.Checkbutton(
-            lbar2, text="2-up (2 pages per sheet)",
-            variable=self.app.nup_var, command=self.app._on_nup_changed,
-        ).pack(side="left", padx=(16, 0))
+            lbar2 = ttk.Frame(self.frame)
+            lbar2.pack(fill="x", padx=8, pady=(2, 0))
+            ttk.Label(lbar2, text="Orientation:").pack(side="left")
+            for _txt, _val in (("Portrait", "portrait"),
+                               ("Landscape", "landscape")):
+                _dbg(f"  orient radio {_val!r}")
+                _RB(lbar2, text=_txt, value=_val,
+                    variable=self.app.orient_var,
+                    command=self.app._on_page_mode_changed
+                    ).pack(side="left", padx=4)
+            _dbg("  nup checkbutton")
+            ttk.Checkbutton(
+                lbar2, text="2-up (2 pages per sheet)",
+                variable=self.app.nup_var, command=self.app._on_nup_changed,
+            ).pack(side="left", padx=(16, 0))
+            _dbg("  layout bar done")
 
         # ----- Toolbar
         bar = ttk.Frame(self.frame)
@@ -6577,6 +6591,7 @@ class PreviewTab:
         # Content orientation: how the original document sits on the sheet
         # (separate from the paper Orientation set on the row above). Auto
         # rotates each page to best match the sheet.
+        _dbg("  content radios")
         ttk.Label(bar, text="Content:").pack(side="left", padx=(20, 4))
         for _txt, _val in (("Auto", "auto"), ("Portrait", "portrait"),
                            ("Landscape", "landscape")):
