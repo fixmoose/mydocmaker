@@ -127,7 +127,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.1"
+APP_VERSION = "1.65.2"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -141,6 +141,25 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.2": [
+        "Text on the page works properly now. Typing happens right on the "
+        "document instead of in a big white box that covered it — you see "
+        "exactly what you'll get, with a blinking cursor, arrow keys and "
+        "Home/End. Click text to select it (it gets a dashed outline you can "
+        "actually see), drag it anywhere, double-click to edit it again.",
+        "Fixed: 'Delete note' did nothing. Deleted text stayed on screen, "
+        "moved text left a ghost behind, and clicks could hit leftovers you "
+        "couldn't see. All gone.",
+        "Undo and redo for text (Ctrl+Z / Ctrl+Y), plus a ✓ Done button. "
+        "Adding text where some already sits now nudges clear instead of "
+        "stacking on top invisibly.",
+        "Zoom got − and + buttons and a slider, from 25% to 400%, with a "
+        "readout that shows the real percentage — including what 'Fit' works "
+        "out to. The preset dropdown is still there.",
+        "The page tick-box is just a small square in the margin now, instead "
+        "of a 'Mark to delete' label sitting on top of your document. Tick "
+        "pages, then choose Delete or Export.",
+    ],
     "1.65.1": [
         "Fixed: the Linux app wouldn't start at all. Moving the Paper size "
         "and Orientation controls onto the Preview Pages tab tripped a bug in "
@@ -6490,6 +6509,7 @@ class SignDialog:
 class PreviewTab:
     REFRESH_DEBOUNCE_MS = 500
     ZOOM_PRESETS = ("Fit", "50%", "75%", "100%", "125%", "150%", "200%")
+    ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 25, 400, 10
 
     def __init__(self, parent_frame, app):
         self.app = app
@@ -6502,6 +6522,7 @@ class PreviewTab:
         self._cached_image_refs = []   # holds PhotoImage list so Tcl doesn't GC them
         self._page_y_positions = []    # y of each page in the canvas (for Prev/Next nav)
         self._configure_after_id = None  # debounce window-resize re-renders
+        self._zoom_after_id = None       # debounce slider-drag re-renders
         # v1.45: per-page removal. _page_sources[i] = (item.uid, local_idx)
         # for the i-th currently-shown page; _hidden_count tracks how many
         # are excluded so the Restore button can label itself.
@@ -6522,8 +6543,12 @@ class PreviewTab:
         self._page_render_scale = 1.0
         self._note_item_ids = {}       # canvas text id -> note dict
         self._selected_note = None
-        self._edit_widget = None       # inline Text editor while typing
+        self._edit_widget = None       # in-place edit state while typing
         self._note_drag = None         # (note, start_cx, start_cy, moved)
+        self._undo_stack = []          # snapshots of the whole note list
+        self._redo_stack = []
+        self._blink_id = None          # caret blink timer
+        self._blink_on = True
 
         # ----- Page-layout bar (v1.65)
         # Paper size + Orientation moved here from the Files tab: changing
@@ -6559,6 +6584,13 @@ class PreviewTab:
             lbar2, text="2-up (2 pages per sheet)",
             variable=self.app.nup_var, command=self.app._on_nup_changed,
         ).pack(side="left", padx=(16, 0))
+        # Its arrangement setting belongs right next to it (it used to sit up
+        # in the toolbar, which also left no room there for the zoom slider).
+        for _txt, _val in (("Side by side", "side"), ("Stacked", "stack")):
+            tk.Radiobutton(lbar2, text=_txt, value=_val,
+                           variable=self.app.arrange_var,
+                           command=self.app._on_arrange_changed
+                           ).pack(side="left", padx=2)
         _dbg("  layout bar done")
 
         # ----- Toolbar
@@ -6574,12 +6606,30 @@ class PreviewTab:
                                    command=self._next_page)
         self.next_btn.pack(side="left")
 
+        # Zoom. The preset dropdown alone was too coarse and jumpy, so it now
+        # sits alongside − / + steppers and a continuous slider, with a label
+        # that always shows the percentage actually in use (including the one
+        # "Fit" works out to).
         ttk.Label(bar, text="Zoom:").pack(side="left", padx=(20, 4))
         self.zoom_var = tk.StringVar(value="Fit")
         zoom_box = ttk.Combobox(bar, textvariable=self.zoom_var, width=6,
                                 values=self.ZOOM_PRESETS, state="readonly")
         zoom_box.pack(side="left")
         zoom_box.bind("<<ComboboxSelected>>", lambda e: self._on_zoom_changed())
+        tip(ttk.Button(bar, text="−", width=2,
+                       command=lambda: self._step_zoom(-self.ZOOM_STEP)),
+            "Zoom out").pack(side="left", padx=(6, 0))
+        self.zoom_scale = ttk.Scale(
+            bar, from_=self.ZOOM_MIN, to=self.ZOOM_MAX, orient="horizontal",
+            length=120, command=self._on_zoom_slider,
+        )
+        self.zoom_scale.set(100)
+        self.zoom_scale.pack(side="left", padx=2)
+        tip(ttk.Button(bar, text="+", width=2,
+                       command=lambda: self._step_zoom(self.ZOOM_STEP)),
+            "Zoom in").pack(side="left")
+        self.zoom_pct_lbl = ttk.Label(bar, text="Fit", width=7, anchor="w")
+        self.zoom_pct_lbl.pack(side="left", padx=(4, 0))
 
         # Content orientation: how the original document sits on the sheet
         # (separate from the paper Orientation set on the row above). Auto
@@ -6590,16 +6640,6 @@ class PreviewTab:
             ttk.Radiobutton(bar, text=_txt, value=_val,
                             variable=self.app.content_var,
                             command=self.app._on_page_mode_changed
-                            ).pack(side="left")
-
-        # 2-up arrangement — only matters when 2-up is on, but it lives here on
-        # the same row (room to spare) so all the on-sheet layout controls sit
-        # together. Side = pages left/right, Stacked = one above the other.
-        ttk.Label(bar, text="2-up:").pack(side="left", padx=(20, 4))
-        for _txt, _val in (("Side by side", "side"), ("Stacked", "stack")):
-            ttk.Radiobutton(bar, text=_txt, value=_val,
-                            variable=self.app.arrange_var,
-                            command=self.app._on_arrange_changed
                             ).pack(side="left")
 
         ttk.Button(bar, text="↻ Refresh", command=self.refresh_preview
@@ -6618,6 +6658,7 @@ class PreviewTab:
         tip(self.del_btn,
             "Removes every page you've ticked from the document. They're only "
             "hidden — 'Restore hidden pages' brings them all back.")
+        self.del_btn.configure(text="🗑 Delete marked pages")
         self.export_btn = ttk.Button(pbar, text="⇱ Export marked…",
                                      command=self._export_marked_pages)
         self.export_btn.pack(side="left", padx=(6, 0))
@@ -6634,7 +6675,8 @@ class PreviewTab:
             "Untick every page without deleting anything.")
         self.mark_hint = ttk.Label(
             pbar, foreground="#666",
-            text="Tick “Mark to delete” on any page above, then hit Delete.",
+            text="Tick the box beside any page, then choose what to do "
+                 "with it.",
         )
         self.mark_hint.pack(side="left", padx=(10, 0))
 
@@ -6681,10 +6723,25 @@ class PreviewTab:
                         command=self._apply_style_to_selected).pack(side="left", padx=(8, 0))
         ttk.Checkbutton(tbar, text="Italic", variable=self.note_italic,
                         command=self._apply_style_to_selected).pack(side="left")
-        self.note_del_btn = ttk.Button(tbar, text="Delete note",
+        self.done_btn = ttk.Button(tbar, text="✓ Done",
+                                   command=self._commit_edit)
+        self.done_btn.pack(side="left", padx=(10, 0))
+        tip(self.done_btn, "Finish editing this text. Esc does the same, and "
+                           "so does clicking anywhere else.")
+        self.undo_btn = ttk.Button(tbar, text="↶ Undo",
+                                   command=self._undo_text)
+        self.undo_btn.pack(side="left", padx=(6, 0))
+        tip(self.undo_btn, "Undo the last text change (Ctrl+Z).")
+        self.redo_btn = ttk.Button(tbar, text="↷ Redo",
+                                   command=self._redo_text)
+        self.redo_btn.pack(side="left", padx=(2, 0))
+        tip(self.redo_btn, "Redo the change you just undid (Ctrl+Y).")
+        self.note_del_btn = ttk.Button(tbar, text="Delete text",
                                        command=self._delete_selected)
-        self.note_del_btn.pack(side="left", padx=(10, 0))
-        tip(self.note_del_btn, "Delete the selected text note.")
+        self.note_del_btn.pack(side="left", padx=(6, 0))
+        tip(self.note_del_btn,
+            "Delete the selected text. Select it by clicking it on the page; "
+            "the Delete key does the same.")
 
         # ----- Status line
         self.status_lbl = ttk.Label(self.frame, text="",
@@ -6723,11 +6780,17 @@ class PreviewTab:
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
+        # Typing goes to the canvas itself while a note is being edited.
+        self.canvas.configure(takefocus=1)
+        self.canvas.bind("<Key>", self._bind_edit_key)
+        self.canvas.bind("<Control-z>", lambda _e: (self._undo_text(), "break")[1])
+        self.canvas.bind("<Control-y>", lambda _e: (self._redo_text(), "break")[1])
         self.canvas.bind_all("<Delete>", self._on_delete_key, add="+")
         # Esc cancels an armed placement (the inline editor binds its own Esc
         # while it's open, so this only fires when nothing is being typed).
         self.canvas.bind_all("<Escape>", self._disarm_text_mode, add="+")
 
+        self._update_text_buttons()
         self._set_placeholder(
             f"Add some files in the {TAB_FILES} tab to see a preview here.")
 
@@ -6980,8 +7043,62 @@ class PreviewTab:
         self.canvas.yview_moveto(frac)
         self._update_page_indicator()
 
+    def _current_zoom_pct(self):
+        """The zoom currently in force, as a number. "Fit" resolves to
+        whatever it actually worked out to on the last render."""
+        z = self._current_zoom
+        if z == "Fit":
+            return max(self.ZOOM_MIN, min(self.ZOOM_MAX,
+                                          round(self._page_render_scale * 100)))
+        try:
+            return int(str(z).rstrip("%"))
+        except ValueError:
+            return 100
+
+    def _set_zoom_pct(self, pct, from_slider=False):
+        """Apply a numeric zoom, keeping the slider, dropdown and label in
+        step. Slider drags are debounced — re-rendering every page on each
+        pixel of travel would crawl."""
+        pct = int(max(self.ZOOM_MIN, min(self.ZOOM_MAX, round(pct))))
+        self._current_zoom = f"{pct}%"
+        self.zoom_var.set(f"{pct}%")
+        self.zoom_pct_lbl.config(text=f"{pct}%")
+        if not from_slider:
+            try:
+                self.zoom_scale.set(pct)
+            except tk.TclError:
+                pass
+        if self._zoom_after_id is not None:
+            try:
+                self.canvas.after_cancel(self._zoom_after_id)
+            except tk.TclError:
+                pass
+        self._zoom_after_id = self.canvas.after(120, self._zoom_render_now)
+
+    def _zoom_render_now(self):
+        self._zoom_after_id = None
+        self._render_all_pages()
+
+    def _on_zoom_slider(self, value):
+        try:
+            pct = float(value)
+        except (TypeError, ValueError):
+            return
+        if abs(pct - self._current_zoom_pct()) < 1:
+            return
+        self._set_zoom_pct(pct, from_slider=True)
+
+    def _step_zoom(self, delta):
+        self._set_zoom_pct(self._current_zoom_pct() + delta)
+
     def _on_zoom_changed(self):
+        """The preset dropdown changed. Keep the slider and label with it."""
         self._current_zoom = self.zoom_var.get()
+        if self._current_zoom != "Fit":
+            try:
+                self.zoom_scale.set(self._current_zoom_pct())
+            except tk.TclError:
+                pass
         self._render_all_pages()
 
     def _on_canvas_configure(self, _event=None):
@@ -7105,18 +7222,24 @@ class PreviewTab:
                 src = (self._page_sources[idx]
                        if idx < len(self._page_sources) else None)
                 var = tk.BooleanVar(value=src in self._marked)
+                # Just a square. No label, and parked in the margin beside the
+                # page rather than on top of the artwork — a caption sitting
+                # over the document was both ugly and in the way.
                 chk = tk.Checkbutton(
-                    self.canvas, text=" Mark to delete",
-                    variable=var, font=("", 9, "bold"),
-                    fg="#a30000", bg="#ffffff",
-                    activeforeground="#a30000", activebackground="#ffecec",
-                    selectcolor="#ffffff", cursor="hand2",
-                    relief="raised", bd=1, padx=6, pady=2,
+                    self.canvas, variable=var, cursor="hand2",
+                    bg="#dadada", activebackground="#dadada",
+                    selectcolor="#ffffff", highlightthickness=0,
+                    bd=0, padx=0, pady=0, takefocus=0,
                     command=lambda sk=src, v=var: self._on_mark_toggle(sk, v),
                 )
-                self.canvas.create_window(
-                    x + pil.width - 6, y + 6, anchor="ne", window=chk,
-                )
+                Tooltip(chk, "Select this page, then use Delete or Export "
+                             "on the toolbar above.")
+                if x >= 30:          # room in the left margin
+                    self.canvas.create_window(x - 6, y, anchor="ne",
+                                              window=chk)
+                else:                # narrow window - tuck it just inside
+                    self.canvas.create_window(x + 3, y + 3, anchor="nw",
+                                              window=chk)
                 # Track for cleanup — only when actually created (under 2-up
                 # there's no tick-box, so nothing to append).
                 self._page_btn_widgets.append(chk)
@@ -7140,6 +7263,19 @@ class PreviewTab:
         self.canvas.config(
             scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100))
         )
+        # Sync the zoom readout with what was actually rendered, so "Fit"
+        # shows the percentage it worked out to.
+        if hasattr(self, "zoom_pct_lbl"):
+            shown = int(round(scale * 100))
+            self.zoom_pct_lbl.config(
+                text=f"Fit {shown}%" if self._current_zoom == "Fit"
+                else f"{shown}%")
+            if self._current_zoom == "Fit":
+                try:
+                    self.zoom_scale.set(
+                        max(self.ZOOM_MIN, min(self.ZOOM_MAX, shown)))
+                except tk.TclError:
+                    pass
         self._redraw_mark_outlines()
         self._update_delete_button(nup_on=nup_on)
         self._redraw_notes()
@@ -7184,18 +7320,38 @@ class PreviewTab:
 
     def _redraw_notes(self):
         """Draw every text note that falls on a currently-visible page as a
-        canvas text item (interactive). Called after each page render."""
+        canvas text item (interactive). Called after each page render.
+
+        The delete() is essential: without it every redraw stacked a fresh
+        item on top of the old one, so deleted notes stayed on screen, moved
+        notes left a ghost behind, and _note_at() matched invisible leftovers
+        (which is why "Delete note" appeared to do nothing)."""
+        self.canvas.delete("note")
+        self.canvas.delete("notebox")
         self._note_item_ids = {}
         for note in self.app.text_notes:
             pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
             if pos is None:
                 continue
             cx, cy = pos
-            fill = "#c00000" if note is self._selected_note else "#111111"
+            selected = note is self._selected_note
             item = self.canvas.create_text(
                 cx, cy, anchor="sw", text=note.get("text", ""),
-                font=self._note_canvas_font(note), fill=fill, tags="note")
+                font=self._note_canvas_font(note),
+                fill="#111111", tags="note")
             self._note_item_ids[item] = note
+            if selected:
+                # A thin box so the selected note is unmistakable — the old
+                # "turn the text red" cue was almost invisible on a page.
+                x1, y1, x2, y2 = self.canvas.bbox(item)
+                self.canvas.create_rectangle(
+                    x1 - 3, y1 - 2, x2 + 3, y2 + 2,
+                    outline="#0a64d8", width=1, dash=(3, 2), tags="notebox")
+                self.canvas.tag_raise(item)
+        # Keep the caret alive across redraws, otherwise it vanishes after
+        # every keystroke until the next blink tick.
+        if self._editing():
+            self._draw_caret()
 
     def _note_at(self, cx, cy):
         """Return the note whose canvas item is at/near (cx, cy), or None."""
@@ -7230,25 +7386,35 @@ class PreviewTab:
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         note = self._note_at(cx, cy)
-        if note is not None:
-            # Select existing note (never stack a new one on top of it).
-            self._select_note(note)
-            self._note_drag = [note, cx, cy, False]
-            return
+        # Clicking away from the note you're editing finishes that edit.
+        if self._editing() and note is not self._edit_widget["note"]:
+            self._commit_edit()
+        # Armed to add? Then add — _create_note_at nudges clear of anything
+        # already there, so a new note can't be hidden under an old one.
         if self.text_mode.get() and self._canvas_to_pdf(cx, cy) is not None:
             self._create_note_at(cx, cy)
-        else:
-            self._select_note(None)
+            return
+        if note is not None:
+            # Select the existing note and start a drag — never drop a new
+            # one on top of it.
+            self._select_note(note)
+            self._note_drag = [note, cx, cy, False]
+            self._update_text_buttons()
+            return
+        self._select_note(None)
+        self._update_text_buttons()
 
     def _on_canvas_drag(self, event):
         if not self._note_drag:
             return
-        note, sx, sy, _moved = self._note_drag
+        note, sx, sy, moved = self._note_drag
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         loc = self._canvas_to_pdf(cx, cy)
         if loc is None:
             return
+        if not moved:
+            self._push_undo()      # so a drag can be undone
         self._note_drag[3] = True
         note["page"], note["x_pt"], note["y_pt"] = loc
         # Move its canvas item live.
@@ -7260,6 +7426,7 @@ class PreviewTab:
     def _on_canvas_release(self, _event):
         if self._note_drag and self._note_drag[3]:
             self._invalidate_output_only()
+            self._redraw_notes()      # repaint the selection box at the new spot
         self._note_drag = None
 
     def _on_canvas_double(self, event):
@@ -7280,6 +7447,15 @@ class PreviewTab:
         loc = self._canvas_to_pdf(cx, cy)
         if loc is None:
             return
+        # Nudge clear of anything already sitting here, so a new note can
+        # never land invisibly on top of an existing one.
+        for _ in range(12):
+            if self._note_at(cx, cy) is None:
+                break
+            cy += 14
+            loc = self._canvas_to_pdf(cx, cy)
+            if loc is None:
+                return
         page, x_pt, y_pt = loc
         note = {
             "page": page, "x_pt": x_pt, "y_pt": y_pt, "text": "",
@@ -7288,65 +7464,191 @@ class PreviewTab:
             "bold": bool(self.note_bold.get()),
             "italic": bool(self.note_italic.get()),
         }
+        self._push_undo()
         self.app.text_notes.append(note)
         # One click, one text box — the button re-arms for the next one.
         self._disarm_text_mode()
         self._select_note(note)
         self._begin_edit(note, is_new=True)
 
+    # ---- In-place text editing (v1.65.2) --------------------------------
+    # The old editor dropped an opaque tk.Text box on the page, which covered
+    # the very thing you were annotating. Now the keystrokes go straight into
+    # the canvas text item: you type ON the page, over the background, with a
+    # blinking caret and a dashed selection box.
+
     def _begin_edit(self, note, is_new=False):
-        """Inline multi-line editor at the note's position."""
+        """Start editing `note` in place. No popup, nothing opaque."""
         self._cancel_edit()
+        if self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"]) is None:
+            return
+        self._push_undo()
+        self._edit_widget = {
+            "note": note, "is_new": is_new,
+            "before": note.get("text", ""),
+            "caret": len(note.get("text", "")),
+        }
+        self._select_note(note)
+        self.canvas.focus_set()
+        self._blink_on = True
+        self._redraw_notes()
+        self._blink_caret()
+        self._update_text_buttons()
+
+    def _editing(self):
+        return self._edit_widget is not None
+
+    def _blink_caret(self):
+        if not self._editing():
+            self.canvas.delete("caret")
+            return
+        self._draw_caret()
+        self._blink_on = not self._blink_on
+        self._blink_id = self.canvas.after(530, self._blink_caret)
+
+    def _draw_caret(self):
+        self.canvas.delete("caret")
+        st = self._edit_widget
+        if not st or not self._blink_on:
+            return
+        note = st["note"]
         pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
         if pos is None:
             return
         cx, cy = pos
-        txt = tk.Text(self.canvas, width=24, height=2, wrap="word",
-                      font=self._note_canvas_font(note), bd=1, relief="solid")
-        txt.insert("1.0", note.get("text", ""))
-        txt.focus_set()
-        win = self.canvas.create_window(cx, cy, anchor="sw", window=txt)
-        self._edit_widget = (txt, win, note, is_new)
-        txt.bind("<Escape>", lambda _e: self._commit_edit())
-        # Ctrl+Enter or focus-out commits; plain Enter adds a newline.
-        txt.bind("<Control-Return>", lambda _e: self._commit_edit())
-        txt.bind("<FocusOut>", lambda _e: self._commit_edit())
+        from tkinter import font as tkfont
+        try:
+            f = tkfont.Font(font=self._note_canvas_font(note))
+        except tk.TclError:
+            return
+        text = note.get("text", "")
+        before = text[:st["caret"]]
+        lines_before = before.split("\n")
+        line_no = len(lines_before) - 1
+        x = cx + f.measure(lines_before[-1])
+        lh = f.metrics("linespace")
+        total_lines = len(text.split("\n"))
+        # Text is anchored "sw", so the first line's baseline sits
+        # (total_lines - 1) line-heights above cy.
+        top = cy - (total_lines - line_no) * lh
+        self.canvas.create_line(x, top, x, top + lh,
+                                fill="#0a64d8", width=1, tags="caret")
+
+    def _bind_edit_key(self, event):
+        """Keystrokes while editing. Returns "break" so the canvas's own
+        scroll bindings don't also fire."""
+        st = self._edit_widget
+        if not st:
+            return None
+        note = st["note"]
+        text = note.get("text", "")
+        i = max(0, min(len(text), st["caret"]))
+        k = event.keysym
+
+        if k in ("Escape", "Return") and not (event.state & 0x1):
+            if k == "Return":
+                text, i = text[:i] + "\n" + text[i:], i + 1
+            else:
+                self._commit_edit()
+                return "break"
+        elif k == "BackSpace":
+            if i > 0:
+                text, i = text[:i - 1] + text[i:], i - 1
+        elif k == "Delete":
+            text = text[:i] + text[i + 1:]
+        elif k == "Left":
+            i = max(0, i - 1)
+        elif k == "Right":
+            i = min(len(text), i + 1)
+        elif k == "Home":
+            i = text.rfind("\n", 0, i) + 1
+        elif k == "End":
+            nxt = text.find("\n", i)
+            i = len(text) if nxt < 0 else nxt
+        elif event.char and event.char.isprintable():
+            text, i = text[:i] + event.char + text[i:], i + len(event.char)
+        else:
+            return None
+
+        note["text"] = text
+        st["caret"] = i
+        self._blink_on = True
+        self._redraw_notes()
+        return "break"
 
     def _commit_edit(self, _event=None):
-        if not self._edit_widget:
+        """Finish editing. An empty note is dropped rather than left as an
+        invisible click-target."""
+        st = self._edit_widget
+        if not st:
             return
-        txt, win, note, is_new = self._edit_widget
-        try:
-            value = txt.get("1.0", "end-1c")
-        except tk.TclError:
-            value = ""
         self._edit_widget = None
-        try:
-            self.canvas.delete(win)
-            txt.destroy()
-        except tk.TclError:
-            pass
-        note["text"] = value
-        if not value.strip():
-            # Empty note → drop it.
+        if self._blink_id is not None:
+            try:
+                self.canvas.after_cancel(self._blink_id)
+            except tk.TclError:
+                pass
+            self._blink_id = None
+        self.canvas.delete("caret")
+        note = st["note"]
+        if not note.get("text", "").strip():
             if note in self.app.text_notes:
                 self.app.text_notes.remove(note)
             if note is self._selected_note:
                 self._selected_note = None
         self._redraw_notes()
         self._invalidate_output_only()
+        self._update_text_buttons()
 
     def _cancel_edit(self):
         if self._edit_widget:
-            txt, win, _n, _new = self._edit_widget
-            self._edit_widget = None
-            try:
-                self.canvas.delete(win)
-                txt.destroy()
-            except tk.TclError:
-                pass
+            self._commit_edit()
+
+    # ---- Undo / redo over the whole note list ----------------------------
+    def _snapshot_notes(self):
+        return [dict(n) for n in self.app.text_notes]
+
+    def _push_undo(self):
+        self._undo_stack.append(self._snapshot_notes())
+        del self._undo_stack[:-40]          # keep the last 40 steps
+        self._redo_stack.clear()
+        self._update_text_buttons()
+
+    def _restore_notes(self, snap):
+        self.app.text_notes[:] = [dict(n) for n in snap]
+        self._selected_note = None
+        self._edit_widget = None
+        self.canvas.delete("caret")
+        self._redraw_notes()
+        self._invalidate_output_only()
+        self._update_text_buttons()
+
+    def _undo_text(self):
+        if not self._undo_stack:
+            return
+        self._redo_stack.append(self._snapshot_notes())
+        self._restore_notes(self._undo_stack.pop())
+
+    def _redo_text(self):
+        if not self._redo_stack:
+            return
+        self._undo_stack.append(self._snapshot_notes())
+        self._restore_notes(self._redo_stack.pop())
+
+    def _update_text_buttons(self):
+        """Enable/disable the text toolbar to match what's actually possible."""
+        if not hasattr(self, "undo_btn"):
+            return
+        self.undo_btn.state(["!disabled"] if self._undo_stack else ["disabled"])
+        self.redo_btn.state(["!disabled"] if self._redo_stack else ["disabled"])
+        has_sel = self._selected_note is not None
+        self.note_del_btn.state(["!disabled"] if has_sel else ["disabled"])
+        self.done_btn.state(["!disabled"] if self._editing() else ["disabled"])
 
     def _select_note(self, note):
+        if note is self._selected_note:
+            self._redraw_notes()
+            return
         self._selected_note = note
         if note is not None:
             # Reflect its style in the toolbar.
@@ -7371,12 +7673,15 @@ class PreviewTab:
         note = self._selected_note
         if note is None:
             return
+        self._push_undo()
         if note in self.app.text_notes:
             self.app.text_notes.remove(note)
         self._selected_note = None
-        self._cancel_edit()
+        self._edit_widget = None
+        self.canvas.delete("caret")
         self._redraw_notes()
         self._invalidate_output_only()
+        self._update_text_buttons()
 
     def _invalidate_output_only(self):
         """Notes are drawn live on the canvas, so we don't need to re-render
@@ -7447,8 +7752,8 @@ class PreviewTab:
                 text=f"{n} page{'' if n == 1 else 's'} marked.")
         else:
             self.mark_hint.config(
-                text="Tick “Mark to delete” on any page above, then hit "
-                     "Delete.")
+                text="Tick the box beside any page, then choose what to do "
+                     "with it.")
 
     def _clear_marks(self):
         """Untick everything without deleting anything."""

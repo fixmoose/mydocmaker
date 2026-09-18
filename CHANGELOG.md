@@ -1,5 +1,32 @@
 # Changelog
 
+## v1.65.2
+- **Fixed: "Delete note" did nothing.** `_redraw_notes()` created fresh canvas
+  items on every redraw but never removed the old ones, so deleted text stayed
+  painted, dragged text left ghosts, and `_note_at()` matched invisible
+  leftovers. One missing `canvas.delete()`; it explains the delete failure,
+  the stacking and the flaky dragging all at once.
+- **Text is edited in place.** The old inline editor dropped an opaque
+  `tk.Text` box over the very content being annotated. Keystrokes now go
+  straight into the canvas item — typing happens on the page, over the
+  background, with a blinking caret, Left/Right/Home/End and multi-line
+  support (`_bind_edit_key`, `_draw_caret`).
+- **Selection is visible**: a thin dashed box around the selected note,
+  replacing the near-invisible red-tint cue.
+- **Undo/redo for text** (`Ctrl+Z` / `Ctrl+Y`) over add, delete, edit and
+  drag, plus a `✓ Done` button; `Delete text` is enabled only when something
+  is selected.
+- **Adding text over existing text** nudges the new note clear instead of
+  burying it. With the tool armed, a click always adds; when it isn't, a click
+  selects.
+- **Zoom**: `−` / slider / `+` (25–400%) beside the preset dropdown, with a
+  live readout that reports the percentage actually rendered, including the
+  one "Fit" resolves to. Slider drags are debounced. The 2-up arrangement
+  radios moved next to their own checkbox to make room, so the window is no
+  wider.
+- **Page tick-box** is now an unlabelled square in the margin beside the page
+  rather than a "Mark to delete" caption over the artwork.
+
 ## v1.65.1
 - **Fixed: the packaged Linux build segfaulted on startup.** v1.65 moved the
   Paper size and Orientation radios off the (visible) Files tab onto the
