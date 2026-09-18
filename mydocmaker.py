@@ -47,6 +47,7 @@ from urllib.parse import urlparse
 # --- GUI: Tkinter (ships with Python on all platforms) ----------------------
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+from tkinter import font as tkfont
 
 # --- Cross-platform drag-and-drop -------------------------------------------
 # tkinterdnd2 adds OS-level file drop to Tkinter on Win/Mac/Linux.
@@ -142,6 +143,20 @@ TAB_EDITOR = "Editor"
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
     "1.65.2": [
+        "Zoom moved to the bottom-right, below the page, and got a lot "
+        "smoother — dragging the slider no longer redraws every page as you "
+        "move it. The Editor has the same zoom now.",
+        "The mouse wheel does the sensible thing: over the page it zooms, "
+        "out in the grey around it, it scrolls.",
+        "The Editor has tools you switch on — Select text and Form fills — "
+        "and Esc gets you back to a plain pointer (first press drops the "
+        "selection, second drops the tool).",
+        "Fixed: text you deleted in the Editor came back when you switched to "
+        "Preview. Both views now show the same document.",
+        "Tabs are in workflow order: Files, Editor, Order, Preview Pages, Add "
+        "Style. 'Create MyDoc' is bold and hard to miss.",
+        "The watermark opacity slider now has a live sample beside it, so you "
+        "can see how heavy it is before building anything.",
         "Closing the app no longer throws away unfinished work. If you "
         "haven't created a document from your files yet, it asks first — "
         "create it now, close anyway, or go back.",
@@ -6699,20 +6714,7 @@ class PreviewTab:
                                 values=self.ZOOM_PRESETS, state="readonly")
         zoom_box.pack(side="left")
         zoom_box.bind("<<ComboboxSelected>>", lambda e: self._on_zoom_changed())
-        tip(ttk.Button(bar, text="−", width=2,
-                       command=lambda: self._step_zoom(-self.ZOOM_STEP)),
-            "Zoom out").pack(side="left", padx=(6, 0))
-        self.zoom_scale = ttk.Scale(
-            bar, from_=self.ZOOM_MIN, to=self.ZOOM_MAX, orient="horizontal",
-            length=120, command=self._on_zoom_slider,
-        )
-        self.zoom_scale.set(100)
-        self.zoom_scale.pack(side="left", padx=2)
-        tip(ttk.Button(bar, text="+", width=2,
-                       command=lambda: self._step_zoom(self.ZOOM_STEP)),
-            "Zoom in").pack(side="left")
-        self.zoom_pct_lbl = ttk.Label(bar, text="Fit", width=7, anchor="w")
-        self.zoom_pct_lbl.pack(side="left", padx=(4, 0))
+
 
         # Content orientation: how the original document sits on the sheet
         # (separate from the paper Orientation set on the row above). Auto
@@ -6848,6 +6850,16 @@ class PreviewTab:
         # many times during a drag-to-resize.
         self.canvas.bind("<Configure>", self._on_canvas_configure)
 
+        # Zoom lives under the bottom-right corner of the page area, out of
+        # the way of the document itself.
+        zoomrow = ttk.Frame(self.frame)
+        zoomrow.pack(fill="x", padx=8, pady=(0, 6))
+        self.zoombar = ZoomBar(zoomrow, self._on_zoombar)
+        self.zoombar.pack(side="right")
+        ttk.Label(zoomrow, foreground="#777",
+                  text="Wheel over a page zooms · wheel outside scrolls"
+                  ).pack(side="right", padx=(0, 10))
+
         # Mouse-wheel scrolling. Cross-platform:
         #  • Windows + macOS use <MouseWheel> with event.delta (positive =
         #    up; ±120 per notch on Win, smaller on Mac)
@@ -6957,6 +6969,12 @@ class PreviewTab:
                             hidden += 1
                             continue
                         key = (it.uid, local_idx)
+                        # Show Editor-tab removals here too, otherwise text
+                        # you deleted reappears the moment you switch tabs.
+                        # Preview only paints them out — the rasterising that
+                        # makes a deletion permanent happens at build time,
+                        # where it isn't in the way of a live redraw.
+                        pg = apply_page_edits(pg, self.app.page_edits.get(key))
                         page_map[key] = pg
                         natural.append(key)
                 except Exception:
@@ -7138,38 +7156,16 @@ class PreviewTab:
         except ValueError:
             return 100
 
-    def _set_zoom_pct(self, pct, from_slider=False):
-        """Apply a numeric zoom, keeping the slider, dropdown and label in
-        step. Slider drags are debounced — re-rendering every page on each
-        pixel of travel would crawl."""
+    def _set_zoom_pct(self, pct):
+        """Apply a numeric zoom and keep the dropdown and strip in step."""
         pct = int(max(self.ZOOM_MIN, min(self.ZOOM_MAX, round(pct))))
         self._current_zoom = f"{pct}%"
         self.zoom_var.set(f"{pct}%")
-        self.zoom_pct_lbl.config(text=f"{pct}%")
-        if not from_slider:
-            try:
-                self.zoom_scale.set(pct)
-            except tk.TclError:
-                pass
-        if self._zoom_after_id is not None:
-            try:
-                self.canvas.after_cancel(self._zoom_after_id)
-            except tk.TclError:
-                pass
-        self._zoom_after_id = self.canvas.after(120, self._zoom_render_now)
-
-    def _zoom_render_now(self):
-        self._zoom_after_id = None
+        self.zoombar.set(pct)
         self._render_all_pages()
 
-    def _on_zoom_slider(self, value):
-        try:
-            pct = float(value)
-        except (TypeError, ValueError):
-            return
-        if abs(pct - self._current_zoom_pct()) < 1:
-            return
-        self._set_zoom_pct(pct, from_slider=True)
+    def _on_zoombar(self, pct):
+        self._set_zoom_pct(pct)
 
     def _step_zoom(self, delta):
         self._set_zoom_pct(self._current_zoom_pct() + delta)
@@ -7178,10 +7174,7 @@ class PreviewTab:
         """The preset dropdown changed. Keep the slider and label with it."""
         self._current_zoom = self.zoom_var.get()
         if self._current_zoom != "Fit":
-            try:
-                self.zoom_scale.set(self._current_zoom_pct())
-            except tk.TclError:
-                pass
+            self.zoombar.set(self._current_zoom_pct())
         self._render_all_pages()
 
     def _on_canvas_configure(self, _event=None):
@@ -7209,20 +7202,37 @@ class PreviewTab:
         self.canvas.unbind_all("<Button-4>")
         self.canvas.unbind_all("<Button-5>")
 
+    def _pointer_over_page(self, event):
+        """True when the pointer is on the document rather than the grey
+        workspace around it. Decides whether the wheel zooms or scrolls."""
+        try:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+        except tk.TclError:
+            return False
+        for (x, y, w, h) in self._page_boxes:
+            if w > 0 and h > 0 and x <= cx <= x + w and y <= cy <= y + h:
+                return True
+        return False
+
+    def _wheel(self, event, direction):
+        """direction: -1 = up/away, +1 = down/toward."""
+        if self._pointer_over_page(event):
+            self._step_zoom(-direction * self.ZOOM_STEP)
+            return "break"
+        self.canvas.yview_scroll(direction * 3, "units")
+        self._update_page_indicator()
+        return "break"
+
     def _on_mousewheel(self, event):
         # Windows event.delta is ±120/notch; macOS uses smaller integers.
-        # Either way, divide by 120 then negate (positive = up = scroll up).
-        units = -int(event.delta / 120) or (-1 if event.delta > 0 else 1)
-        self.canvas.yview_scroll(units, "units")
-        self._update_page_indicator()
+        return self._wheel(event, 1 if event.delta < 0 else -1)
 
-    def _on_wheel_linux_up(self, _event=None):
-        self.canvas.yview_scroll(-3, "units")
-        self._update_page_indicator()
+    def _on_wheel_linux_up(self, event=None):
+        return self._wheel(event, -1)
 
-    def _on_wheel_linux_down(self, _event=None):
-        self.canvas.yview_scroll(3, "units")
-        self._update_page_indicator()
+    def _on_wheel_linux_down(self, event=None):
+        return self._wheel(event, 1)
 
     # ---- Rendering ------------------------------------------------------
     def _render_all_pages(self):
@@ -7348,17 +7358,12 @@ class PreviewTab:
         )
         # Sync the zoom readout with what was actually rendered, so "Fit"
         # shows the percentage it worked out to.
-        if hasattr(self, "zoom_pct_lbl"):
+        if hasattr(self, "zoombar"):
             shown = int(round(scale * 100))
-            self.zoom_pct_lbl.config(
-                text=f"Fit {shown}%" if self._current_zoom == "Fit"
-                else f"{shown}%")
             if self._current_zoom == "Fit":
-                try:
-                    self.zoom_scale.set(
-                        max(self.ZOOM_MIN, min(self.ZOOM_MAX, shown)))
-                except tk.TclError:
-                    pass
+                self.zoombar.show_fit(shown)
+            else:
+                self.zoombar.set(shown)
         self._redraw_mark_outlines()
         self._update_delete_button(nup_on=nup_on)
         self._redraw_notes()
@@ -8596,8 +8601,16 @@ class StyleTab:
         ttk.Label(op_row, text="Opacity:").pack(side="left")
         self.wm_op = tk.DoubleVar(value=st.wm_opacity)
         ttk.Scale(op_row, from_=0.03, to=0.6, variable=self.wm_op,
-                  command=lambda _v: self._schedule()).pack(
+                  command=lambda _v: self._on_opacity()).pack(
             side="left", fill="x", expand=True, padx=6)
+        # A live sample, so the number means something before you build the
+        # whole document to find out what it looks like.
+        self.wm_sample = tk.Canvas(op_row, width=150, height=34,
+                                   highlightthickness=1,
+                                   highlightbackground="#bbb",
+                                   background="#ffffff")
+        self.wm_sample.pack(side="left", padx=(6, 0))
+        self._draw_wm_sample()
 
         # ===== Page numbers ===============================================
         pn = ttk.LabelFrame(body, text="Page numbers")
@@ -8714,8 +8727,37 @@ class StyleTab:
     def _wheel(self, event):
         self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
+    def _on_opacity(self):
+        self._draw_wm_sample()
+        self._schedule()
+
+    def _draw_wm_sample(self):
+        """Show the watermark at the chosen opacity over a scrap of page.
+
+        Tk canvases have no alpha, so the grey is computed the way the real
+        blend lands on white: 255 - opacity*255, which is what the finished
+        page actually looks like."""
+        cv = getattr(self, "wm_sample", None)
+        if cv is None:
+            return
+        cv.delete("all")
+        try:
+            op = float(self.wm_op.get())
+        except (tk.TclError, ValueError):
+            op = 0.12
+        for i in range(3):     # a hint of page content to sit behind
+            cv.create_line(8, 9 + i * 8, 142, 9 + i * 8, fill="#dcdcdc")
+        shade = max(0, min(255, int(round(255 - op * 255))))
+        col = f"#{shade:02x}{shade:02x}{shade:02x}"
+        txt = (self.wm_text.get() or "SAMPLE")[:12].upper()
+        cv.create_text(75, 17, text=txt, fill=col,
+                       font=("", 13, "bold"), angle=20)
+        cv.create_text(146, 30, text=f"{int(round(op * 100))}%", anchor="se",
+                       fill="#888", font=("", 7))
+
     def _set_wm_text(self, text):
         self.wm_text.set(text)
+        self._draw_wm_sample()
         self._sync_now()
 
     def _choose_wm_image(self):
@@ -8836,6 +8878,82 @@ class StyleTab:
 # the page picker so the workflow has a home and can be tried out; the editor
 # itself lands in a later version.
 # ---------------------------------------------------------------------------
+class ZoomBar:
+    """Compact zoom strip that sits under the bottom-right corner of a canvas.
+
+    Shared by Preview Pages and the Editor so zooming behaves the same in
+    both. Dragging the slider only updates the readout — the expensive
+    re-render happens when the drag ends, which is what makes it feel smooth
+    instead of lurching a frame at a time.
+    """
+
+    MIN, MAX, STEP = 25, 400, 10
+
+    def __init__(self, parent, on_change, label_fit=True):
+        self._on_change = on_change
+        self._pct = 100
+        self._fit = label_fit
+        self.frame = ttk.Frame(parent)
+        # The label is built first: ttk.Scale fires its command from set(),
+        # so it must have somewhere to write before that can happen.
+        self.lbl = ttk.Label(self.frame, text="100%", width=8, anchor="e")
+        ttk.Button(self.frame, text="−", width=2,
+                   command=lambda: self.step(-self.STEP)).pack(side="left")
+        self.scale = ttk.Scale(self.frame, from_=self.MIN, to=self.MAX,
+                               orient="horizontal", length=130,
+                               command=self._on_slide)
+        self.scale.pack(side="left", padx=3)
+        ttk.Button(self.frame, text="+", width=2,
+                   command=lambda: self.step(self.STEP)).pack(side="left")
+        self.lbl.pack(side="left", padx=(4, 0))
+        self.scale.set(100)
+        # Commit on release, not on every pixel of travel.
+        self.scale.bind("<ButtonRelease-1>", self._commit)
+
+    def pack(self, **kw):
+        self.frame.pack(**kw)
+        return self.frame
+
+    def _on_slide(self, value):
+        if getattr(self, "lbl", None) is None:
+            return
+        try:
+            self._pct = int(max(self.MIN, min(self.MAX, round(float(value)))))
+        except (TypeError, ValueError):
+            return
+        self.lbl.config(text=f"{self._pct}%")
+
+    def _commit(self, _event=None):
+        self._on_change(self._pct)
+
+    def step(self, delta):
+        self.set(self._pct + delta)
+        self._on_change(self._pct)
+
+    def set(self, pct, quiet=False):
+        self._pct = int(max(self.MIN, min(self.MAX, round(pct))))
+        try:
+            self.scale.set(self._pct)
+        except tk.TclError:
+            pass
+        self.lbl.config(text=f"{self._pct}%")
+        if not quiet:
+            self.lbl.config(text=f"{self._pct}%")
+
+    def show_fit(self, pct):
+        """Report what Fit actually resolved to without changing the slider
+        into a manual zoom."""
+        self._pct = int(max(self.MIN, min(self.MAX, round(pct))))
+        try:
+            self.scale.set(self._pct)
+        except tk.TclError:
+            pass
+        self.lbl.config(text=f"Fit {self._pct}%")
+
+    def get(self):
+        return self._pct
+
+
 class EditorTab:
     """Per-page editing (v1.65.2): find the text and form fills that are
     already on a page, and take them out.
@@ -8854,7 +8972,7 @@ class EditorTab:
     it properly, no rasterising needed.
     """
 
-    SCALE = 1.4                       # on-screen render scale
+    DEFAULT_SCALE = 1.4               # on-screen render scale
 
     def __init__(self, parent, app):
         self.app = app
@@ -8867,6 +8985,9 @@ class EditorTab:
         self._sel = set()             # selected char indices
         self._drag_from = None
         self._photo = None
+        self._scale = self.DEFAULT_SCALE
+        self._cur_page = None         # (item, local_idx) for re-render
+        self._mode = "none"           # none | text | fill
 
         ttk.Label(parent, text="Page editor", font=("", 13, "bold")
                   ).pack(anchor="w", padx=12, pady=(10, 0))
@@ -8896,6 +9017,22 @@ class EditorTab:
 
         bar = ttk.Frame(right)
         bar.pack(fill="x")
+        # Pick a tool first, like any editor. Esc puts the pointer back to
+        # normal, which is also how you get out of a half-made selection.
+        self.text_mode_btn = ttk.Button(
+            bar, text="Select text", width=14,
+            command=lambda: self._set_mode("text"))
+        self.text_mode_btn.pack(side="left")
+        tip(self.text_mode_btn,
+            "Drag across the page to select the text that's already there, "
+            "or click a single letter. Esc turns the tool off.")
+        self.fill_mode_btn = ttk.Button(
+            bar, text="Form fills", width=13,
+            command=lambda: self._set_mode("fill"))
+        self.fill_mode_btn.pack(side="left", padx=(4, 10))
+        tip(self.fill_mode_btn,
+            "Highlight the form fields on this page so you can clear them. "
+            "Esc turns the tool off.")
         self.del_btn = ttk.Button(bar, text="🗑 Delete selected text",
                                   command=self._delete_selection)
         self.del_btn.pack(side="left")
@@ -8911,6 +9048,8 @@ class EditorTab:
         tip(self.clear_btn, "Put back everything you removed from this page.")
         self.info = ttk.Label(bar, text="", foreground="#666")
         self.info.pack(side="left", padx=(12, 0))
+        self.mode_hint = ttk.Label(bar, text="", foreground="#7a4500")
+        self.mode_hint.pack(side="right")
 
         canvas_wrap = ttk.Frame(right, borderwidth=1, relief="sunken")
         canvas_wrap.pack(fill="both", expand=True, pady=(6, 0))
@@ -8927,6 +9066,19 @@ class EditorTab:
         self.canvas.bind("<Button-1>", self._on_press)
         self.canvas.bind("<B1-Motion>", self._on_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Enter>", self._bind_wheel)
+        self.canvas.bind("<Leave>", self._unbind_wheel)
+        self.canvas.configure(takefocus=1)
+        self.canvas.bind("<Escape>", self._on_escape)
+
+        zoomrow = ttk.Frame(right)
+        zoomrow.pack(fill="x", pady=(4, 0))
+        self.zoombar = ZoomBar(zoomrow, self._on_zoom)
+        self.zoombar.set(int(self.DEFAULT_SCALE * 100))
+        self.zoombar.pack(side="right")
+        ttk.Label(zoomrow, foreground="#777",
+                  text="Wheel over the page zooms · wheel outside scrolls"
+                  ).pack(side="right", padx=(0, 10))
 
         fills = ttk.LabelFrame(parent, text="Form fills on this page")
         fills.pack(fill="x", padx=12, pady=(0, 10))
@@ -8946,6 +9098,79 @@ class EditorTab:
 
         self._set_placeholder(f"Add files on the {TAB_FILES} tab, then pick a "
                               f"page here.")
+
+    # ---- tools -----------------------------------------------------------
+    def _set_mode(self, mode):
+        """Switch tool. Clicking the active tool again turns it off, and so
+        does Esc — there should always be an obvious way back to a plain
+        pointer."""
+        self._mode = "none" if mode == self._mode else mode
+        self._sel = set()
+        try:
+            self.canvas.config(
+                cursor={"text": "xterm", "fill": "hand2"}.get(self._mode, ""))
+        except tk.TclError:
+            pass
+        for btn, name, base in ((self.text_mode_btn, "text", "Select text"),
+                                (self.fill_mode_btn, "fill", "Form fills")):
+            on = self._mode == name
+            btn.state(["pressed"] if on else ["!pressed"])
+            btn.config(text=("● " if on else "") + base)
+        self.mode_hint.config(
+            text="Esc to stop" if self._mode != "none" else "")
+        if self._mode == "fill":
+            self._sel = set()
+        self.canvas.focus_set()
+        self._draw()
+        self._update_info()
+
+    def _on_escape(self, _event=None):
+        """Esc: drop the selection first, then the tool."""
+        if self._sel:
+            self._sel = set()
+            self._draw()
+            self._update_info()
+            return "break"
+        if self._mode != "none":
+            self._set_mode("none")
+            return "break"
+        return None
+
+    # ---- zoom ------------------------------------------------------------
+    def _on_zoom(self, pct):
+        self._scale = max(0.25, min(4.0, pct / 100.0))
+        if self._cur_page is not None:
+            self._load_page(*self._cur_page, keep_sel=True)
+
+    def _bind_wheel(self, _e=None):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", lambda e: self._wheel(e, -1))
+        self.canvas.bind_all("<Button-5>", lambda e: self._wheel(e, 1))
+
+    def _unbind_wheel(self, _e=None):
+        for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            self.canvas.unbind_all(seq)
+
+    def _on_mousewheel(self, event):
+        return self._wheel(event, 1 if event.delta < 0 else -1)
+
+    def _pointer_over_page(self, event):
+        if self._photo is None:
+            return False
+        try:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+        except tk.TclError:
+            return False
+        return (8 <= cx <= 8 + self._photo.width()
+                and 8 <= cy <= 8 + self._photo.height())
+
+    def _wheel(self, event, direction):
+        if self._pointer_over_page(event):
+            self.zoombar.step(-direction * ZoomBar.STEP)
+            return "break"
+        self.canvas.yview_scroll(direction * 3, "units")
+        return "break"
 
     # ---- page list -------------------------------------------------------
     def on_show(self):
@@ -8977,9 +9202,11 @@ class EditorTab:
         self._load_page(item, idx)
 
     # ---- load + render ---------------------------------------------------
-    def _load_page(self, item, idx):
+    def _load_page(self, item, idx, keep_sel=False):
         self._cur = (item.uid, idx)
-        self._sel = set()
+        self._cur_page = (item, idx)
+        if not keep_sel:
+            self._sel = set()
         self._chars = []
         self._fields = []
         try:
@@ -9007,7 +9234,7 @@ class EditorTab:
                 except Exception:
                     continue
                 self._chars.append((ch,) + tuple(box))
-            bitmap = pg.render(scale=self.SCALE)
+            bitmap = pg.render(scale=self._scale)
             pil = bitmap.to_pil()
             doc.close()
         except Exception as e:
@@ -9066,6 +9293,16 @@ class EditorTab:
             c, d = self._pdf_to_canvas(x1, y0)
             self.canvas.create_rectangle(a, b, c, d, fill="#ffffff",
                                          outline="#d40000", width=1)
+        # Form fields, outlined while the fill tool is active.
+        if self._mode == "fill":
+            for (_name, _val, rect) in self._fields:
+                try:
+                    a, b = self._pdf_to_canvas(rect[0], rect[3])
+                    c, d = self._pdf_to_canvas(rect[2], rect[1])
+                    self.canvas.create_rectangle(a, b, c, d, outline="#0a64d8",
+                                                 width=2, dash=(4, 2))
+                except Exception:
+                    pass
         # Current selection.
         for i in self._sel:
             _ch, x0, y0, x1, y1 = self._chars[i]
@@ -9076,11 +9313,11 @@ class EditorTab:
 
     def _pdf_to_canvas(self, x_pt, y_pt):
         _w, h = self._cur_size
-        return 8 + x_pt * self.SCALE, 8 + (h - y_pt) * self.SCALE
+        return 8 + x_pt * self._scale, 8 + (h - y_pt) * self._scale
 
     def _canvas_to_pdf(self, cx, cy):
         _w, h = self._cur_size
-        return (cx - 8) / self.SCALE, h - (cy - 8) / self.SCALE
+        return (cx - 8) / self._scale, h - (cy - 8) / self._scale
 
     def _set_placeholder(self, text):
         self.canvas.delete("all")
@@ -9090,7 +9327,8 @@ class EditorTab:
 
     # ---- selection -------------------------------------------------------
     def _on_press(self, event):
-        if not self._chars:
+        self.canvas.focus_set()
+        if self._mode != "text" or not self._chars:
             return
         self._drag_from = (self.canvas.canvasx(event.x),
                            self.canvas.canvasy(event.y))
@@ -9131,6 +9369,8 @@ class EditorTab:
         return out
 
     def _select_all(self):
+        if self._mode != "text":
+            self._set_mode("text")
         self._sel = set(range(len(self._chars)))
         self._draw()
         self._update_info()
@@ -9324,11 +9564,13 @@ class App:
         order_tab = ttk.Frame(self.notebook)
         style_tab = ttk.Frame(self.notebook)
         editor_tab = ttk.Frame(self.notebook)
+        # Order follows the workflow: gather files, fix up a page, arrange
+        # them, check the result, then dress it.
         self.notebook.add(pages_tab, text=TAB_FILES)
-        self.notebook.add(preview_tab, text=TAB_PREVIEW)
-        self.notebook.add(order_tab, text=TAB_ORDER)
-        self.notebook.add(style_tab, text=TAB_STYLE)
         self.notebook.add(editor_tab, text=TAB_EDITOR)
+        self.notebook.add(order_tab, text=TAB_ORDER)
+        self.notebook.add(preview_tab, text=TAB_PREVIEW)
+        self.notebook.add(style_tab, text=TAB_STYLE)
 
         # "My Signatures" lives at the top, right-aligned just above the tab
         # strip — an action, not a page, so it stays a button.
@@ -9558,9 +9800,20 @@ class App:
         # dialogs: what to make, then what to do with it.
         create_row = ttk.Frame(root)
         create_row.pack(fill="x", **pad)
+        # This is the point of the whole app, so it shouldn't look like
+        # every other button on the window.
+        try:
+            _style = ttk.Style()
+            _base = tkfont.nametofont("TkDefaultFont").actual()
+            _style.configure("Create.TButton",
+                             font=(_base["family"], _base["size"] + 1, "bold"),
+                             padding=8)
+        except Exception:
+            pass
         self.create_btn = ttk.Button(create_row, text="Create MyDoc",
+                                     style="Create.TButton",
                                      command=self.create_doc)
-        self.create_btn.pack(fill="x")
+        self.create_btn.pack(fill="x", ipady=2)
         tip(self.create_btn,
             "Turn everything in your list into one finished document. You "
             "pick the format next — PDF, images, Word, web page or plain "

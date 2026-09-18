@@ -1,6 +1,27 @@
 # Changelog
 
 ## v1.65.2
+- **Fixed: Editor deletions didn't show in Preview.** `PreviewTab._rebuild_now`
+  built straight from `cached_pdf_bytes` and never consulted `page_edits`, so
+  deleted text reappeared on tab switch while still being gone in the Editor.
+  Preview now paints the removals too (rasterising stays a build-time step,
+  where it isn't in the way of a live redraw).
+- **Zoom reworked.** New shared `ZoomBar` under the bottom-right of the page
+  area, used by Preview *and* the Editor (which had none). Dragging the slider
+  updates only the readout; the re-render fires on release, which is what makes
+  it smooth rather than lurching. − / + step, 25–400%, and "Fit" reports the
+  percentage it resolved to.
+- **Wheel behaviour follows the pointer**: over the page it zooms, over the
+  grey workspace it scrolls (`_pointer_over_page`).
+- **Editor tools.** `Select text` and `Form fills` are modes you turn on, shown
+  with a ● and an "Esc to stop" hint. Esc drops the selection, then the tool.
+  Clicking a page does nothing until a tool is chosen. Form fields are outlined
+  while the fill tool is active. Wheel scroll/zoom now works here too.
+- **Tabs in workflow order**: Files, Editor, Order, Preview Pages, Add Style.
+- **"Create MyDoc"** is bold and padded via a `Create.TButton` style — it's the
+  point of the app and shouldn't look like every other button.
+- **Watermark opacity has a live sample.** Tk canvases have no alpha, so the
+  swatch computes the grey the real blend lands on (255 − opacity·255).
 - **Closing no longer discards unfinished work.** `_on_close()` now prompts
   when the document has changed without being written out (Yes creates it and
   keeps the window open, No closes, Cancel goes back). `_doc_dirty` is set in
