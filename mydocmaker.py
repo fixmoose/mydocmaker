@@ -146,6 +146,13 @@ WHATS_NEW = {
         "marked pages and «name»-B.pdf with the rest. Perfect for cutting a "
         "two-page document into two single pages. Nothing is removed from the "
         "document you're building — export saves copies.",
+        "Windows: installing an Office suite is no longer a web-page hunt. "
+        "The 'Install missing components' dialog now offers ONLYOFFICE and "
+        "LibreOffice as separate buttons, finds the current official "
+        "installer, tells you how big the download is, fetches it with a "
+        "live progress readout (cancellable), and starts it for you. Neither "
+        "suite ships inside MyDocMaker — the download comes straight from "
+        "the project that makes it.",
         "Signing knows about your split. If you've marked pages and click "
         "🔏 Sign and Create PDF, it asks what to sign: the whole document, "
         "just part A, just part B, or both parts one after the other. A "
@@ -2360,6 +2367,174 @@ def detect_missing_components():
 
 ONLYOFFICE_DOWNLOAD_URL = "https://www.onlyoffice.com/download-desktop.aspx"
 
+# ---------------------------------------------------------------------------
+# Windows office-suite acquisition (v1.65).
+#
+# On Linux we install through the package manager and on macOS through brew,
+# but Windows had no path better than "here's a web page, good luck". These
+# resolvers find the current official installer so the app can download it
+# with a progress readout and hand it to the system installer — the same
+# download-then-hand-off flow the app already uses to update itself.
+#
+# NOTE: neither suite is bundled or redistributed. We fetch from the upstream
+# project exactly as a browser would, and the user installs it themselves.
+# (Bundling ONLYOFFICE would be an AGPL-3.0 problem; see
+# THIRD-PARTY-LICENSES.md.)
+# ---------------------------------------------------------------------------
+LIBREOFFICE_STABLE_INDEX = \
+    "https://download.documentfoundation.org/libreoffice/stable/"
+ONLYOFFICE_RELEASES_API = \
+    "https://api.github.com/repos/ONLYOFFICE/DesktopEditors/releases/latest"
+
+
+def _win_arch_tags():
+    """Architecture spellings for the running machine. The two projects name
+    the same architecture differently, hence the mapping."""
+    m = (_platform_mod.machine() or "").lower()
+    if m in ("arm64", "aarch64"):
+        return {"lo_dir": "aarch64", "oo": "arm64"}
+    if m in ("x86", "i386", "i686"):
+        return {"lo_dir": "x86", "oo": "x86"}
+    return {"lo_dir": "x86_64", "oo": "x64"}
+
+
+def _http_text(url, timeout=25, accept=None):
+    headers = {"User-Agent": f"{APP_NAME}/{APP_VERSION}"}
+    if accept:
+        headers["Accept"] = accept
+    req = urllib.request.Request(url, headers=headers)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
+def _remote_size(url, timeout=15):
+    """Content-Length for `url`, or 0 if the server won't say. Used to show
+    the download size before committing the user to a few hundred MB."""
+    try:
+        req = urllib.request.Request(
+            url, method="HEAD",
+            headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"},
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return int(resp.headers.get("Content-Length") or 0)
+    except Exception:
+        return 0
+
+
+def resolve_libreoffice_windows_installer(timeout=25):
+    """Current LibreOffice Windows .msi from The Document Foundation's stable
+    index. Returns {url, name, label, size} or None.
+
+    We read the index instead of hardcoding a version so the link can't go
+    stale, and skip the helppack/langpack/SDK .msi files — we want the base
+    installer."""
+    try:
+        arch = _win_arch_tags()["lo_dir"]
+        html = _http_text(LIBREOFFICE_STABLE_INDEX, timeout)
+        versions = sorted(set(re.findall(r'href="(\d+\.\d+\.\d+)/"', html)),
+                          key=_parse_version)
+        if not versions:
+            return None
+        version = versions[-1]
+        base = f"{LIBREOFFICE_STABLE_INDEX}{version}/win/{arch}/"
+        names = re.findall(r'href="([^"]+\.msi)"', _http_text(base, timeout))
+        for n in names:
+            low = n.lower()
+            if any(x in low for x in ("helppack", "langpack", "sdk")):
+                continue
+            url = base + n
+            return {"url": url, "name": n, "size": _remote_size(url),
+                    "label": f"LibreOffice {version}"}
+    except Exception:
+        return None
+    return None
+
+
+def resolve_onlyoffice_windows_installer(timeout=25):
+    """Latest ONLYOFFICE Desktop Editors Windows installer, from its GitHub
+    releases. Returns {url, name, label, size} or None."""
+    try:
+        arch = _win_arch_tags()["oo"]
+        data = json.loads(_http_text(
+            ONLYOFFICE_RELEASES_API, timeout,
+            accept="application/vnd.github+json"))
+        version = (data.get("tag_name") or "").lstrip("vV")
+        want = f"desktopeditors_{arch}.exe"
+        for a in data.get("assets", []):
+            if (a.get("name") or "").lower() == want:
+                return {"url": a.get("browser_download_url"),
+                        "name": a.get("name"),
+                        "size": int(a.get("size") or 0),
+                        "label": f"ONLYOFFICE {version}".strip()}
+    except Exception:
+        return None
+    return None
+
+
+SUITE_RESOLVERS = {
+    "libreoffice": resolve_libreoffice_windows_installer,
+    "onlyoffice": resolve_onlyoffice_windows_installer,
+}
+SUITE_FALLBACK_PAGES = {
+    "libreoffice": LIBREOFFICE_DOWNLOAD_URL,
+    "onlyoffice": ONLYOFFICE_DOWNLOAD_URL,
+}
+
+
+def download_and_run_installer(info, status_cb=None, cancel_event=None):
+    """Download `info` (from one of the resolvers) to a temp folder and hand
+    it to the system installer. Returns (ok, message).
+
+    The file is left on disk — Windows needs it to stay put while the
+    installer runs, and it gives the user something to re-run if they cancel
+    the wizard."""
+    def _log(msg):
+        if status_cb is not None:
+            try:
+                status_cb(msg)
+            except Exception:
+                pass
+
+    label = info.get("label") or "the installer"
+    tmpdir = tempfile.mkdtemp(prefix="mydocmaker-suite-")
+    dest = os.path.join(tmpdir, info["name"])
+
+    def prog(done, total):
+        if total:
+            pct = int(done * 100 / total)
+            _log(f"Downloading {label}… {pct}%  "
+                 f"({format_size(done)} of {format_size(total)})")
+        else:
+            _log(f"Downloading {label}… {format_size(done)}")
+
+    _log(f"Starting download of {label}…")
+    try:
+        download_with_progress(info["url"], dest, progress_cb=prog,
+                               cancel_event=cancel_event)
+    except Exception as e:
+        if cancel_event is not None and cancel_event.is_set():
+            return False, "Download cancelled."
+        return False, (f"Couldn't download {label}: {e}\n\n"
+                       f"You can download it manually instead.")
+
+    _log(f"Launching the {label} installer…")
+    try:
+        os.startfile(dest)  # type: ignore[attr-defined]
+    except Exception:
+        # Couldn't launch it — open the folder so the user can double-click.
+        try:
+            os.startfile(tmpdir)  # type: ignore[attr-defined]
+        except Exception:
+            return False, (f"Downloaded to:\n{dest}\n\n"
+                           f"Couldn't start it automatically — open that "
+                           f"file to install.")
+        return True, (f"Downloaded {label}.\n\nOpened the folder — "
+                      f"double-click {info['name']} to install, then come "
+                      f"back and click Retry.")
+    return True, (f"The {label} installer is running.\n\n"
+                  f"Finish it, then come back here and click Retry so "
+                  f"MyDocMaker picks it up.")
+
 
 def install_component(component_id, status_cb=None):
     """Best-effort one-click install. Returns (success: bool, message: str).
@@ -2381,6 +2556,9 @@ def install_component(component_id, status_cb=None):
     if component_id == "office_suite":
         if sys.platform.startswith("linux"):
             return install_component("libreoffice", status_cb=status_cb)
+        # On Windows the Install dialog offers each suite as its own button
+        # and downloads it directly (see _on_suite_resolved); this generic
+        # path is the no-UI fallback.
         webbrowser.open(ONLYOFFICE_DOWNLOAD_URL)
         alt = LIBREOFFICE_DOWNLOAD_URL
         return True, (
@@ -8166,6 +8344,9 @@ class App:
         # Pending signing passes (v1.65). Signing A and B is two passes —
         # a digital signature covers one whole file, so it can't be copied.
         self._sign_queue = []
+        # Set while an office-suite installer is downloading (Windows), so
+        # the Cancel button has something to trip.
+        self._suite_cancel = None
         # v1.53: custom page order. A list of (item.uid, local_page_index)
         # keys giving the desired OUTPUT sequence, independent of item order —
         # set by dragging thumbnails on the Order tab. Empty = natural order
@@ -9410,6 +9591,70 @@ class App:
         dlg.focus_force()
 
     # --- Install missing system components -----------------------------------
+    def _on_suite_resolved(self, cid, info):
+        """An office-suite installer lookup finished (Windows). Confirm the
+        download with the user — these are ~350 MB — then fetch and launch
+        it. Runs on the UI thread."""
+        st = getattr(self, "_install_dialog", None)
+        rec = None
+        if st is not None:
+            rec = next((r for r in st["rows"] if r["id"] == cid), None)
+
+        def set_status(text):
+            if st is not None:
+                st["status_var"].set(text)
+
+        if not info:
+            # Couldn't reach the project — fall back to the download page so
+            # the user isn't stuck.
+            set_status("Couldn't look up the installer.")
+            if rec is not None and st is not None:
+                st["reset"](rec)
+            page = SUITE_FALLBACK_PAGES.get(cid, LIBREOFFICE_DOWNLOAD_URL)
+            if messagebox.askyesno(
+                APP_NAME,
+                "Couldn't reach the download server to find the latest "
+                "installer.\n\nOpen the download page in your browser "
+                "instead?",
+            ):
+                webbrowser.open(page)
+            return
+
+        size_note = (f"  ({format_size(info['size'])} download)"
+                     if info.get("size") else "")
+        if not messagebox.askyesno(
+            APP_NAME,
+            f"Download and install {info['label']}?{size_note}\n\n"
+            f"MyDocMaker will download the official installer from the "
+            f"{'ONLYOFFICE' if cid == 'onlyoffice' else 'LibreOffice'} "
+            f"project and start it for you. The suite is not part of "
+            f"MyDocMaker — you're installing it yourself, from them.\n\n"
+            f"This can take a while on a slow connection.",
+        ):
+            set_status("")
+            if rec is not None and st is not None:
+                st["reset"](rec)
+            return
+
+        # Let the user abort a long download — the Install button becomes
+        # Cancel for the duration.
+        cancel = threading.Event()
+        self._suite_cancel = cancel
+        if rec is not None:
+            rec["btn"].config(state="normal", text="Cancel",
+                              command=cancel.set)
+        set_status(f"Starting download of {info['label']}…")
+
+        def worker():
+            ok, msg = download_and_run_installer(
+                info,
+                status_cb=lambda t: self.work_queue.put(("install_status", t)),
+                cancel_event=cancel,
+            )
+            self.work_queue.put(("install_done", cid, ok, msg))
+
+        threading.Thread(target=worker, daemon=True).start()
+
     def show_missing_components_dialog(self):
         """Modal listing each missing optional system component with a
         per-row Install button. Install runs on a background thread; status
@@ -9441,37 +9686,68 @@ class App:
 
         status_var = tk.StringVar(value="")
         row_widgets = []
+        on_windows = sys.platform.startswith("win")
         for it in items:
             row = ttk.LabelFrame(dlg, text=it["label"])
             row.pack(fill="x", padx=24, pady=6)
             ttk.Label(row, text=it["why"], wraplength=420,
                       justify="left", foreground="#333"
                       ).pack(side="left", padx=10, pady=10, anchor="w")
-            btn = ttk.Button(row, text="Install")
-            btn.pack(side="right", padx=10, pady=10)
-            row_widgets.append((it, row, btn))
+            # v1.65: on Windows the app can fetch and launch either suite's
+            # official installer itself, so offer them as two explicit
+            # choices rather than one button that just opens a web page.
+            # ONLYOFFICE leads — best Microsoft-format fidelity of the two.
+            if it["id"] == "office_suite" and on_windows:
+                specs = [("onlyoffice", "Install ONLYOFFICE"),
+                         ("libreoffice", "Install LibreOffice")]
+            else:
+                specs = [(it["id"], "Install")]
+            for cid, text in specs:
+                btn = ttk.Button(row, text=text)
+                btn.pack(side="right", padx=(4, 10), pady=10)
+                row_widgets.append({"id": cid, "btn": btn, "text": text})
 
-        def make_handler(component_id, button):
+        def reset_button(rec, text=None):
+            rec["btn"].config(state="normal", text=text or rec["text"],
+                              command=rec["click"])
+
+        def make_handler(rec):
+            """Windows suites: resolve the current installer, confirm the
+            download size, then fetch + launch. Everything else keeps the
+            original one-shot install_component() path."""
+            cid = rec["id"]
+            button = rec["btn"]
+
             def click():
+                if cid in SUITE_RESOLVERS and sys.platform.startswith("win"):
+                    button.config(state="disabled", text="Finding…")
+                    status_var.set(f"Looking up the latest {cid}…")
+
+                    def resolve_worker():
+                        info = SUITE_RESOLVERS[cid]()
+                        self.work_queue.put(("suite_resolved", cid, info))
+
+                    threading.Thread(target=resolve_worker,
+                                     daemon=True).start()
+                    return
                 button.config(state="disabled", text="Installing…")
-                status_var.set(f"Installing {component_id}…")
+                status_var.set(f"Installing {cid}…")
 
                 def worker():
                     ok, msg = install_component(
-                        component_id,
+                        cid,
                         status_cb=lambda s: self.work_queue.put(
                             ("install_status", s)
                         ),
                     )
-                    self.work_queue.put(
-                        ("install_done", component_id, ok, msg)
-                    )
+                    self.work_queue.put(("install_done", cid, ok, msg))
 
                 threading.Thread(target=worker, daemon=True).start()
             return click
 
-        for it, row, btn in row_widgets:
-            btn.config(command=make_handler(it["id"], btn))
+        for rec in row_widgets:
+            rec["click"] = make_handler(rec)
+            rec["btn"].config(command=rec["click"])
 
         status_lbl = ttk.Label(dlg, textvariable=status_var, foreground="#555")
         status_lbl.pack(padx=24, pady=(8, 4), anchor="w")
@@ -9484,6 +9760,7 @@ class App:
             "dlg": dlg,
             "status_var": status_var,
             "rows": row_widgets,
+            "reset": reset_button,
         }
         dlg.protocol("WM_DELETE_WINDOW", dlg.destroy)
         dlg.lift()
@@ -10584,17 +10861,21 @@ class App:
                     st = getattr(self, "_install_dialog", None)
                     if st is not None:
                         st["status_var"].set(msg[1])
+                elif msg[0] == "suite_resolved":
+                    self._on_suite_resolved(msg[1], msg[2])
                 elif msg[0] == "install_done":
                     _, comp_id, ok, message = msg
+                    self._suite_cancel = None
                     st = getattr(self, "_install_dialog", None)
                     if st is not None:
-                        st["status_var"].set(message)
-                        for it, _row, btn in st["rows"]:
-                            if it["id"] == comp_id:
+                        st["status_var"].set(message.split("\n")[0])
+                        for rec in st["rows"]:
+                            if rec["id"] == comp_id:
                                 if ok:
-                                    btn.config(state="disabled", text="Installed ✓")
+                                    rec["btn"].config(state="disabled",
+                                                      text="Installed ✓")
                                 else:
-                                    btn.config(state="normal", text="Retry install")
+                                    st["reset"](rec, "Retry install")
                                 break
                     if ok:
                         messagebox.showinfo(APP_NAME, message)
@@ -10687,7 +10968,16 @@ class App:
                         self.order_tab.refresh()
         except queue.Empty:
             pass
-        self.root.after(120, self._poll_queue)
+        except Exception:
+            # A handler blew up. Never let that kill the poller: the
+            # reschedule below used to sit outside the try, so one bad
+            # message stopped the after() chain for good and every
+            # background update — renders, downloads, signing hand-offs —
+            # silently died for the rest of the session. Log it and carry
+            # on; anything still queued is picked up on the next tick.
+            traceback.print_exc()
+        finally:
+            self.root.after(120, self._poll_queue)
 
 
 def _find_app_icon():

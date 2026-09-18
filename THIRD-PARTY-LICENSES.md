@@ -39,11 +39,25 @@ sources rather than reproducing them inline.
 ## License compatibility note
 
 All upstream licenses listed above are permissive (MIT / BSD / Apache /
-HPND). The project itself is released under the MIT License (see
-[LICENSE](LICENSE)). Bundling and redistribution under MIT is permitted by
-each upstream license, subject to the usual requirement to preserve copyright
-notices and license text in source-form distributions and in the bundled
-installer.
+HPND). MyDocMaker itself is released under the **PolyForm Noncommercial
+License 1.0.0** (see [LICENSE](LICENSE)) — free for personal use, with
+commercial use requiring a separate license. Permissive upstream licenses
+allow the combined work to be redistributed under those terms, subject to the
+usual requirement to preserve copyright notices and license text in
+source-form distributions and in the bundled installer.
+
+## Not bundled: office suites
+
+LibreOffice and OnlyOffice are **not** shipped with MyDocMaker. They are
+optional, user-installed programs that MyDocMaker detects and invokes as
+separate processes for Office-document conversion. MyDocMaker can help you
+download one (see "Install…" in the app), but the download comes from the
+upstream project and the install is your own — nothing from either suite is
+redistributed by us, so neither project's license attaches to this one.
+
+For the record, if that ever changed: LibreOffice is MPL-2.0 and could be
+redistributed; OnlyOffice Desktop Editors is AGPL-3.0 and could not be, not
+without a commercial license from Ascensio System SIA.
 
 ## Where the license texts live in the bundle
 

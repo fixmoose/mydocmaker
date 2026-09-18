@@ -47,6 +47,30 @@
   `_build_for_signing_worker` into `App.assemble_from_cache(keep=...)`, now
   shared by signing and export — Order, per-page flips, 2-up, Style and text
   notes all apply.
+- **Windows Office-suite acquisition: download + launch, not a web link.**
+  Linux had `pkexec` + the package manager and macOS had brew; Windows just
+  opened a download page. Now `resolve_libreoffice_windows_installer()` reads
+  The Document Foundation's stable index (no hardcoded version to go stale,
+  skips the helppack/langpack/SDK `.msi` files) and
+  `resolve_onlyoffice_windows_installer()` reads ONLYOFFICE's GitHub releases;
+  both pick the right build for the machine's architecture (x86_64 / aarch64 /
+  x86). The Install dialog shows each suite as its own button (ONLYOFFICE
+  first — best Microsoft-format fidelity), confirms the download size up
+  front, streams it with a live percentage via `download_and_run_installer()`,
+  supports Cancel, and hands the file to the system installer. Any failure
+  falls back to the upstream download page. Neither suite is bundled or
+  redistributed — see THIRD-PARTY-LICENSES.md.
+- **Fixed: one bad queue message could kill every background update.**
+  `_poll_queue` rescheduled itself *outside* its `try` and caught only
+  `queue.Empty`, so an exception in any handler stopped the `after()` chain
+  permanently — renders, download progress and signing hand-offs all went
+  silently dead for the rest of the session. The reschedule is now in a
+  `finally` and unexpected exceptions are logged instead of fatal.
+- **Docs: corrected the project license.** THIRD-PARTY-LICENSES.md claimed
+  MyDocMaker was MIT-licensed; it is PolyForm Noncommercial 1.0.0, as LICENSE
+  and README have always said. Added a section recording that office suites
+  are user-installed, not bundled (and why OnlyOffice's AGPL-3.0 means it
+  could not be bundled without a commercial license from Ascensio).
 - **Signing is split-aware.** With pages marked, `sign_and_create_pdf` asks
   what to sign via `_ask_sign_scope()` — whole document / part A / part B /
   both in turn — and only asks when some pages are marked and some aren't
