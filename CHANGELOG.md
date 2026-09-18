@@ -1,28 +1,30 @@
 # Changelog
 
 ## v1.65.1
-- **Fixed: the packaged Linux build segfaulted on startup.** A
-  `ttk::radiobutton` whose `-value` already matches its `-variable` selects
-  itself *during construction*. Doing that to the **first** `ttk::radiobutton`
-  in the process, inside a notebook pane that has not been mapped yet,
-  NULL-dereferences inside Tk in the frozen build. v1.65 moved the Paper size
-  and Orientation radios off the (visible) Files tab onto Preview Pages and hit
-  exactly that: the `Letter` radio matched `default_page_size()` and killed the
-  window before it drew. On an A4 locale it would have died on the `A4` radio
-  instead.
-  - Fix: the layout variables start empty so every radio is created
-    unselected, and `_apply_layout_defaults()` sets the defaults once the
-    widgets exist. `_current_layout()` falls back sensibly if read during
-    construction.
-  - It never reproduced from source because system Python 3.10 does not take
-    the same path as the bundled 3.12. Found by adding `faulthandler` (which
-    named the exact file and line) plus per-iteration breadcrumbs (which named
-    the exact radio).
-  - Ruled out first: the changed dependencies (swapping v1.64's
+- **Fixed: the packaged Linux build segfaulted on startup.** v1.65 moved the
+  Paper size and Orientation radios off the (visible) Files tab onto the
+  Preview Pages tab, and the packaged Linux binary began dying inside Tk while
+  constructing one of them — before the window ever appeared. Deterministic:
+  4/4 crashes on the real artifact, always at the same widget.
+  - Fix: those two rows now use the classic `tk.Radiobutton` rather than the
+    themed `ttk.Radiobutton`, and the layout variables start empty so no radio
+    selects itself during construction (`_apply_layout_defaults()` sets them
+    once the widgets exist). Verified on the packaged build: 3/3 clean starts,
+    reaching `mainloop`. The controls stay on Preview Pages, where they
+    belong.
+  - This is avoiding a fragile path in the packaged Tk, not fixing misuse on
+    our side: an experiment build that removed those widgets entirely simply
+    moved the crash to the next `ttk` widget in the same pane. The classic
+    widget is immune and looks near-identical.
+  - It never reproduced from source — system Python 3.10 does not take the
+    same path as the bundled 3.12 — so it was found by measurement rather than
+    reasoning: the core dump located it in `libtk`, `faulthandler` named the
+    exact line, and per-widget breadcrumbs named the exact widget.
+  - Ruled out along the way: the changed dependencies (swapping v1.64's
     pillow-heif/pyhanko/playwright/cryptography into the v1.65 bundle still
     crashed), tkinterdnd2 0.6.3, the bundled font libraries, Pillow's ImageTk,
-    every emoji glyph, the saved session state, and a place()d button inside
-    the notebook (fixed anyway — it was genuinely unsound).
+    every emoji glyph, and the saved session state. Also removed a `place()`d
+    button inside the notebook — not the cause, but genuinely unsound.
 - **`faulthandler` is now always on.** It costs nothing until the process dies
   and turns a bare "Segmentation fault" into a Python traceback naming the
   call that caused it. `MYDOCMAKER_DEBUG_STARTUP=1` additionally traces window

@@ -144,9 +144,9 @@ WHATS_NEW = {
     "1.65.1": [
         "Fixed: the Linux app wouldn't start at all. Moving the Paper size "
         "and Orientation controls onto the Preview Pages tab tripped a bug in "
-        "the windowing toolkit that closed the app before the window "
+        "the windowing toolkit that closed the app before its window ever "
         "appeared. The controls are still on Preview Pages — they're just "
-        "set up in a way that avoids it.",
+        "built in a way that steps around it.",
         "One button instead of four. 'Create PDF', 'Sign and Create PDF', "
         "'Create and open' and 'Create and print' are now a single "
         "'Create MyDoc'. It asks what to make — PDF, PNG or JPG images, "
