@@ -104,7 +104,7 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65"
+APP_VERSION = "1.65.1"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -118,6 +118,22 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.1": [
+        "Fixed: the Linux build crashed on startup. The ✎ My Signatures "
+        "button was being drawn inside the tab strip itself, which isn't a "
+        "supported arrangement — it took down the whole window on the "
+        "packaged Linux build. It now sits in its own row just above the "
+        "tabs.",
+        "One button instead of four. 'Create PDF', 'Sign and Create PDF', "
+        "'Create and open' and 'Create and print' are now a single "
+        "'Create MyDoc'. It asks what to make — PDF, PNG or JPG images, "
+        "plain text, Word or a web page — and once it's saved, asks whether "
+        "to open it, show it in your file manager, print it, or just close.",
+        "Signing moved into that same window as a tick-box, so it's one "
+        "less button without losing anything.",
+        "The flatten question is now part of the same window rather than a "
+        "separate pop-up, so creating a PDF is two steps instead of three.",
+    ],
     "1.65": [
         "The 'Pages' tab is now 'Files', 'Preview' is 'Preview Pages' and "
         "'Style' is 'Add Style' — the names now say what each tab does.",
@@ -1584,6 +1600,138 @@ def apply_text_notes(pdf_bytes, notes):
     out = io.BytesIO()
     writer.write(out)
     return out.getvalue()
+
+
+# ---------------------------------------------------------------------------
+# Output formats (v1.65.1). PDF is the real product; everything else is a
+# conversion FROM the finished PDF, so Style, notes and page order all apply
+# no matter what you pick.
+#
+#   id      label                        how
+#   pdf     PDF document                 native
+#   png/jpg Images, one file per page    pypdfium2 render (same engine as the
+#                                        preview and the flatten pass)
+#   txt     Plain text                   pypdf text extraction — reliable, but
+#                                        it is text only: no layout, no images
+#   docx    Word document       ┐ LibreOffice --convert-to. Genuinely lossy:
+#   html    Web page            ┘ a PDF has no paragraphs to recover, so
+#                                 complex layouts shift. Flagged in the UI.
+# ---------------------------------------------------------------------------
+OUTPUT_FORMATS = [
+    ("pdf",  "PDF document",              ".pdf",  "Everything works: styling, "
+     "signatures, form text. The one to pick unless you need something else."),
+    ("png",  "Images — one PNG per page", "",      "Saves a folder of PNG "
+     "images, one per page. Lossless and sharp; good for slides or posting."),
+    ("jpg",  "Images — one JPG per page", "",      "Saves a folder of JPG "
+     "images, one per page. Much smaller than PNG, slightly softer."),
+    ("txt",  "Plain text",                ".txt",  "Just the words, no layout "
+     "and no images. Good for searching or pasting elsewhere."),
+    ("docx", "Word document (.docx)",     ".docx", "Converted with "
+     "LibreOffice. A PDF has no paragraphs to recover, so expect the layout "
+     "to shift — fine for grabbing content, not for a faithful copy."),
+    ("html", "Web page (.html)",          ".html", "Converted with "
+     "LibreOffice. Same caveat as Word: the layout will shift."),
+]
+# Formats that need LibreOffice installed.
+OFFICE_OUTPUT_FORMATS = {"docx", "html"}
+# Formats that write a folder of files rather than a single file.
+FOLDER_OUTPUT_FORMATS = {"png", "jpg"}
+
+
+def pdf_to_images(pdf_bytes, out_dir, fmt="png", dpi=150, progress=None):
+    """Render each page to out_dir/page-001.<fmt>. Returns the file list."""
+    if not FLATTEN_OK:
+        raise RuntimeError("Image export needs pypdfium2")
+    os.makedirs(out_dir, exist_ok=True)
+    doc = pdfium.PdfDocument(pdf_bytes)
+    written = []
+    try:
+        total = len(doc)
+        scale = dpi / 72.0
+        for i in range(total):
+            pil = doc[i].render(scale=scale).to_pil()
+            ext = "png" if fmt == "png" else "jpg"
+            path = os.path.join(out_dir, f"page-{i + 1:03d}.{ext}")
+            if ext == "jpg":
+                pil.convert("RGB").save(path, "JPEG", quality=88, optimize=True)
+            else:
+                pil.save(path, "PNG")
+            written.append(path)
+            if progress is not None:
+                progress(i + 1, total)
+    finally:
+        try:
+            doc.close()
+        except Exception:
+            pass
+    return written
+
+
+def pdf_to_text(pdf_bytes):
+    """Extract the document's text. Layout is not preserved — PDFs store
+    positioned glyphs, not paragraphs."""
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    parts = []
+    for i, page in enumerate(reader.pages):
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:
+            parts.append("")
+    return ("\n\n".join(parts)).strip() + "\n"
+
+
+def pdf_to_office(pdf_bytes, out_path, fmt):
+    """Convert the finished PDF via LibreOffice. Lossy by nature; the caller
+    warns the user first. Raises on failure."""
+    soffice = find_libreoffice()
+    if not soffice:
+        raise RuntimeError("LibreOffice isn't installed")
+    tmpdir = tempfile.mkdtemp(prefix="mydocmaker-conv-")
+    src = os.path.join(tmpdir, "input.pdf")
+    with open(src, "wb") as fh:
+        fh.write(pdf_bytes)
+    cmd = [soffice, "--headless", "--norestore", "--convert-to", fmt,
+           "--outdir", tmpdir, src]
+    res = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+    produced = os.path.join(tmpdir, f"input.{fmt}")
+    if not os.path.exists(produced):
+        tail = (res.stderr or res.stdout or "").strip().splitlines()
+        raise RuntimeError(
+            f"LibreOffice couldn't convert to {fmt}"
+            + (f": {tail[-1]}" if tail else ""))
+    with open(produced, "rb") as fh:
+        data = fh.read()
+    with open(out_path, "wb") as fh:
+        fh.write(data)
+    return out_path
+
+
+def _reveal_in_file_manager(path):
+    """Open the containing folder, selecting the file where the platform
+    supports it."""
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    try:
+        if sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", "/select,", os.path.abspath(path)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", "-R", path])
+        else:
+            # Most Linux file managers understand the D-Bus call; fall back to
+            # just opening the folder.
+            try:
+                subprocess.Popen([
+                    "dbus-send", "--session", "--print-reply",
+                    "--dest=org.freedesktop.FileManager1",
+                    "--type=method_call", "/org/freedesktop/FileManager1",
+                    "org.freedesktop.FileManager1.ShowItems",
+                    f"array:string:file://{os.path.abspath(path)}",
+                    "string:",
+                ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                subprocess.Popen(["xdg-open", folder])
+        return True
+    except Exception:
+        return False
 
 
 def _open_with_default_viewer(path):
@@ -8433,8 +8581,12 @@ class App:
         # (everything they had pre-v1.23) and a live preview of the
         # combined PDF. Create/Save buttons stay below the notebook so
         # they're always accessible regardless of which tab is open.
+        # Row above the notebook for document-level actions (My Signatures).
+        topbar = ttk.Frame(root)
+        topbar.pack(fill="x", padx=10, pady=(4, 0))
+
         self.notebook = ttk.Notebook(root)
-        self.notebook.pack(fill="both", expand=True, padx=10, pady=(4, 4))
+        self.notebook.pack(fill="both", expand=True, padx=10, pady=(2, 4))
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
         pages_tab = ttk.Frame(self.notebook)
@@ -8448,16 +8600,20 @@ class App:
         self.notebook.add(style_tab, text=TAB_STYLE)
         self.notebook.add(editor_tab, text=TAB_EDITOR)
 
-        # v1.65: "My Signatures" is a button at the right-hand end of the tab
-        # strip rather than a footer button — it sits next to "Add Style", but
-        # it's an action, not a page, so it stays a button. place()d over the
-        # notebook's top-right corner so it lines up with the tabs.
+        # "My Signatures" lives at the top, right-aligned just above the tab
+        # strip — an action, not a page, so it stays a button.
+        #
+        # v1.65.1: it used to be place()d INSIDE self.notebook to sit level
+        # with the tabs. That is not a supported arrangement — a ttk::notebook
+        # manages its own children, and a place()d non-pane child corrupts its
+        # bookkeeping. It survived on Tk from source but segfaulted the frozen
+        # Linux build during the first layout pass. Now packed in its own row
+        # above the notebook, which is boring and correct.
         self.my_sigs_btn = ttk.Button(
-            root, text="✎ My Signatures…",
+            topbar, text="✎ My Signatures…",
             command=self.show_my_signatures,
         )
-        self.my_sigs_btn.place(in_=self.notebook, relx=1.0, x=-6, y=0,
-                               anchor="ne")
+        self.my_sigs_btn.pack(side="right")
         tip(self.my_sigs_btn,
             "Create, edit and manage your saved signatures (typed, drawn, or a "
             "full business stamp with logo). Set one up here before signing.")
@@ -8650,47 +8806,19 @@ class App:
         # page picker are live; the editor itself lands in a later release.
         self.editor_tab = EditorTab(editor_tab, self)
 
-        # Primary action row: Create PDF + (grayed-for-now) Sign and Create PDF.
-        # Sign lights up in v1.26 when e-signature lands; today it just sits
-        # there visibly disabled so users know the feature is on the way.
+        # v1.65.1: ONE primary action. The four buttons (Create / Sign and
+        # Create / Create and open / Create and print) were the same build
+        # with a different tail, so the choice now lives in two small
+        # dialogs: what to make, then what to do with it.
         create_row = ttk.Frame(root)
         create_row.pack(fill="x", **pad)
-        self.create_btn = ttk.Button(create_row, text="Create PDF",
-                                     command=lambda: self.create_pdf("none"))
-        self.create_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
+        self.create_btn = ttk.Button(create_row, text="Create MyDoc",
+                                     command=self.create_doc)
+        self.create_btn.pack(fill="x")
         tip(self.create_btn,
-            "Combine everything in the list into one PDF and save it, using "
-            "your Paper size / orientation / Order / Style settings.")
-        self.sign_create_btn = ttk.Button(
-            create_row, text="🔏 Sign and Create PDF",
-            command=self.sign_and_create_pdf,
-        )
-        self.sign_create_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
-        tip(self.sign_create_btn,
-            "Build the PDF, then place your saved signature on it and sign it "
-            "with a tamper-evident digital signature.")
-        if not SIGNING_OK:
-            # pyhanko / cryptography not installed — keep button grayed.
-            self.sign_create_btn.state(["disabled"])
-
-        # Convenience variants of "Create PDF" — same flow, then open or print.
-        action_row = ttk.Frame(root)
-        action_row.pack(fill="x", **pad)
-        self.create_open_btn = ttk.Button(
-            action_row, text="Create and open PDF",
-            command=lambda: self.create_pdf("open"),
-        )
-        self.create_open_btn.pack(side="left", expand=True, fill="x", padx=(0, 4))
-        tip(self.create_open_btn,
-            "Same as Create PDF, then opens the finished file in your default "
-            "PDF viewer.")
-        self.create_print_btn = ttk.Button(
-            action_row, text="Create and print PDF",
-            command=lambda: self.create_pdf("print"),
-        )
-        self.create_print_btn.pack(side="left", expand=True, fill="x", padx=(4, 0))
-        tip(self.create_print_btn,
-            "Same as Create PDF, then sends the finished file to your printer.")
+            "Turn everything in your list into one finished document. You "
+            "pick the format next — PDF, images, Word, web page or plain "
+            "text — and what to do with it once it's saved.")
 
         self.status = ttk.Label(root, text="Ready. Drop files or paste a URL to begin.",
                                 foreground="#444")
@@ -10657,9 +10785,11 @@ class App:
             self._schedule_save()
         return choice["value"]
 
-    # --- Build PDF (in a worker thread so the UI doesn't freeze) -------------
-    def create_pdf(self, action="none"):
-        """action: 'none' (just save), 'open' (open after save), 'print' (print)."""
+    # --- Create MyDoc (v1.65.1) ---------------------------------------------
+    def create_doc(self):
+        """One entry point for building the finished document. Asks what to
+        make (and, for PDF, whether to flatten), asks where to put it, then
+        builds on a worker thread. What to DO with it is asked afterwards."""
         if not self.items:
             messagebox.showwarning(APP_NAME, "Add some files or a webpage first.")
             return
@@ -10668,48 +10798,223 @@ class App:
             for it in self.items
         )
         if has_office and not find_libreoffice():
-            proceed = messagebox.askyesno(
+            if not messagebox.askyesno(
                 APP_NAME,
                 "LibreOffice is required to convert Office documents "
                 "(.docx, .xlsx, etc.) but isn't installed on this system.\n\n"
                 "Those files will be skipped. Continue with the rest?",
-            )
-            if not proceed:
+            ):
                 return
-        # Ask how to save it (flatten vs keep text) before picking a filename
-        # — decide what the file IS, then where it goes.
-        flatten_choice = self._ask_output_style()
-        if flatten_choice is None:
+
+        choice = self._ask_create_options()
+        if choice is None:
             return
-        out_path = filedialog.asksaveasfilename(
-            title="Save PDF as", defaultextension=".pdf",
-            initialdir=default_save_dir(),
-            initialfile=f"output-{random.randint(1000, 9999)}.pdf",
-            filetypes=[("PDF files", "*.pdf")],
-        )
-        if not out_path:
+        fmt, flatten, sign = choice
+        if sign:
+            # Signing has its own build + placement flow, and it asks for the
+            # filename at the end rather than up front.
+            self.sign_and_create_pdf()
             return
+        spec = next(f for f in OUTPUT_FORMATS if f[0] == fmt)
+        stamp = random.randint(1000, 9999)
+
+        if fmt in FOLDER_OUTPUT_FORMATS:
+            # A folder of page images — ask for the parent folder, then make
+            # a subfolder so we never scatter 40 files into Documents.
+            parent = filedialog.askdirectory(
+                title=f"Choose where to put the {fmt.upper()} images",
+                initialdir=default_save_dir(),
+            )
+            if not parent:
+                return
+            out_path = os.path.join(parent, f"mydoc-{stamp}")
+        else:
+            out_path = filedialog.asksaveasfilename(
+                title=f"Save {spec[1]} as", defaultextension=spec[2],
+                initialdir=default_save_dir(),
+                initialfile=f"mydoc-{stamp}{spec[2]}",
+                filetypes=[(spec[1], f"*{spec[2]}")],
+            )
+            if not out_path:
+                return
+
         self._set_busy(True)
         self.status.config(text="Working… (capturing webpages can take a few seconds)")
         self.progress.config(maximum=100, value=0)
-        layout = self._current_layout()
-        flatten = bool(flatten_choice and FLATTEN_OK)
-        items_snapshot = list(self.items)
-        excluded_snapshot = set(self.excluded_pages)
         threading.Thread(
             target=self._build_worker,
-            args=(items_snapshot, layout, out_path, flatten, action,
-                  excluded_snapshot),
+            args=(list(self.items), self._current_layout(), out_path,
+                  bool(flatten), "none", set(self.excluded_pages), fmt),
             daemon=True,
         ).start()
 
+    def _ask_create_options(self):
+        """What should we make? Returns (fmt, flatten) or None if cancelled.
+        The flatten question is folded in here rather than being a second
+        dialog — it only applies to PDF, so it shows and hides with it."""
+        win = tk.Toplevel(self.root)
+        win.title("Create MyDoc")
+        win.transient(self.root)
+        win.resizable(False, False)
+        result = {"value": None}
+        fmt = tk.StringVar(value="pdf")
+        flat = tk.StringVar(value="flat")
+        have_office = bool(find_libreoffice())
+
+        ttk.Label(win, text="What should we make?",
+                  font=("", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 8))
+
+        for fid, label, _ext, blurb in OUTPUT_FORMATS:
+            row = ttk.Frame(win)
+            row.pack(fill="x", padx=16)
+            rb = ttk.Radiobutton(row, text=label, value=fid, variable=fmt,
+                                 command=lambda: _sync())
+            rb.pack(anchor="w")
+            note = blurb
+            if fid in OFFICE_OUTPUT_FORMATS and not have_office:
+                rb.state(["disabled"])
+                note = "Needs LibreOffice, which isn't installed. " + blurb
+            if fid in FOLDER_OUTPUT_FORMATS and not FLATTEN_OK:
+                rb.state(["disabled"])
+                note = "Needs pypdfium2, which isn't available. " + blurb
+            ttk.Label(row, wraplength=440, justify="left", foreground="#555",
+                      text=note).pack(anchor="w", padx=(22, 0), pady=(0, 7))
+
+        # PDF-only sub-question.
+        flat_box = ttk.LabelFrame(win, text="PDF: what goes inside it?")
+        ttk.Radiobutton(
+            flat_box, text="Flatten it  (recommended)", value="flat",
+            variable=flat).pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(
+            flat_box, wraplength=430, justify="left", foreground="#555",
+            text="Pages become flat pictures: smaller file, identical "
+                 "everywhere, nobody can edit or copy the text out.",
+        ).pack(anchor="w", padx=(32, 10), pady=(0, 6))
+        ttk.Radiobutton(
+            flat_box, text="Keep text and links", value="text",
+            variable=flat).pack(anchor="w", padx=10)
+        ttk.Label(
+            flat_box, wraplength=430, justify="left", foreground="#555",
+            text="Text stays selectable and searchable and links keep "
+                 "working, but the file is bigger and can be edited.",
+        ).pack(anchor="w", padx=(32, 10), pady=(0, 8))
+
+        est_lbl = ttk.Label(win, text="", foreground="#0a5a16",
+                            wraplength=460, justify="left")
+
+        # Signing replaced its own top-level button in v1.65.1 — it is a
+        # PDF-only finish, so it belongs with the PDF options.
+        sign_var = tk.BooleanVar(value=False)
+        sign_box = ttk.Frame(win)
+        sign_chk = ttk.Checkbutton(
+            sign_box, text="🔏 Sign it when it's built", variable=sign_var)
+        sign_chk.pack(anchor="w")
+        ttk.Label(
+            sign_box, wraplength=430, justify="left", foreground="#555",
+            text="Builds the PDF, then lets you place your saved signature "
+                 "on it and signs it so tampering is detectable.",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 4))
+        if not SIGNING_OK:
+            sign_chk.state(["disabled"])
+
+        def _sync():
+            if fmt.get() == "pdf":
+                flat_box.pack(fill="x", padx=16, pady=(4, 2))
+                est = self._flatten_estimate_text()
+                if est:
+                    est_lbl.config(text=est)
+                    est_lbl.pack(anchor="w", padx=(38, 16), pady=(0, 4))
+                else:
+                    est_lbl.pack_forget()
+                sign_box.pack(fill="x", padx=16, pady=(4, 0))
+            else:
+                flat_box.pack_forget()
+                est_lbl.pack_forget()
+                sign_box.pack_forget()
+        _sync()
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(10, 14))
+
+        def go():
+            result["value"] = (fmt.get(), flat.get() == "flat",
+                               bool(sign_var.get()) and fmt.get() == "pdf")
+            win.destroy()
+
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        ok = ttk.Button(row, text="Choose where to save…", command=go)
+        ok.pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: go())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{max(0, self.root.winfo_rooty() + 40)}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        ok.focus_set()
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _show_saved_dialog(self, path, summary):
+        """"Saved — now what?" Replaces the old Create-and-open /
+        Create-and-print buttons."""
+        win = tk.Toplevel(self.root)
+        win.title("Saved")
+        win.transient(self.root)
+        win.resizable(False, False)
+        is_dir = os.path.isdir(path)
+
+        ttk.Label(win, text="Saved", font=("", 12, "bold")
+                  ).pack(anchor="w", padx=16, pady=(14, 4))
+        ttk.Label(win, text=summary, wraplength=520, justify="left",
+                  foreground="#444").pack(anchor="w", padx=16, pady=(0, 12))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+
+        def close_then(fn):
+            def go():
+                win.destroy()
+                if fn:
+                    fn()
+            return go
+
+        ttk.Button(row, text="Close", command=win.destroy).pack(side="right")
+        ttk.Button(
+            row, text="Show in folder",
+            command=close_then(lambda: _reveal_in_file_manager(path)),
+        ).pack(side="right", padx=(0, 8))
+        if not is_dir:
+            ttk.Button(
+                row, text="Print",
+                command=close_then(
+                    lambda: _print_with_default_printer(path, self.work_queue)),
+            ).pack(side="right", padx=(0, 8))
+        ttk.Button(
+            row, text="Open",
+            command=close_then(lambda: _open_with_default_viewer(path)),
+        ).pack(side="right", padx=(0, 8))
+
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{self.root.winfo_rooty() + 120}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        win.focus_force()
+
+    # --- Build PDF (in a worker thread so the UI doesn't freeze) -------------
     def _set_busy(self, busy):
         state = "disabled" if busy else "normal"
-        for btn in (self.create_btn, self.create_open_btn, self.create_print_btn):
-            btn.config(state=state)
+        self.create_btn.config(state=state)
 
     def _build_worker(self, items, layout, out_path, flatten=False,
-                      action="none", excluded=None):
+                      action="none", excluded=None, fmt="pdf"):
         excluded = excluded or set()
         # Under 2-up, render each item at native size; the 2-up pass below
         # pairs them onto the big sheet.
@@ -10806,17 +11111,42 @@ class App:
             except Exception as e:
                 skipped.append(f"(flatten failed, kept original: {e})")
 
+        # Everything above produced the finished PDF. Anything other than
+        # "pdf" is a conversion from it, so Style, notes and page order are
+        # already baked in whichever format the user picked.
+        n_pages = len(writer.pages)
         try:
-            with open(out_path, "wb") as f:
-                f.write(out_data)
+            if fmt in FOLDER_OUTPUT_FORMATS:
+                self.work_queue.put(("flatten_start", n_pages))
+                files = pdf_to_images(
+                    out_data, out_path, fmt=fmt,
+                    progress=lambda d, t: self.work_queue.put(
+                        ("flatten_progress", d, t)),
+                )
+                msg = (f"Saved {len(files)} {fmt.upper()} image(s) to:\n"
+                       f"{out_path}")
+            elif fmt == "txt":
+                text = pdf_to_text(out_data)
+                with open(out_path, "w", encoding="utf-8") as f:
+                    f.write(text)
+                msg = (f"Saved: {out_path}\nPages: {n_pages}\n\n"
+                       f"Text only — layout and images aren't included.")
+            elif fmt in OFFICE_OUTPUT_FORMATS:
+                pdf_to_office(out_data, out_path, fmt)
+                msg = (f"Saved: {out_path}\nPages: {n_pages}\n\n"
+                       f"Converted from PDF by LibreOffice — check the "
+                       f"layout, it may have shifted.")
+            else:
+                with open(out_path, "wb") as f:
+                    f.write(out_data)
+                msg = f"Saved: {out_path}\nPages: {n_pages}{flatten_note}"
         except Exception as e:
             self.work_queue.put(("error", f"Could not save: {e}"))
             return
 
-        msg = f"Saved: {out_path}\nPages: {len(writer.pages)}{flatten_note}"
         if skipped:
             msg += "\n\nSkipped:\n - " + "\n - ".join(skipped)
-        self.work_queue.put(("done", msg, out_path, len(writer.pages), action))
+        self.work_queue.put(("done", msg, out_path, n_pages, action))
 
     def _poll_queue(self):
         try:
@@ -10831,14 +11161,11 @@ class App:
                     _, text, path, pages, action = msg
                     self._set_busy(False)
                     self.progress.config(value=self.progress["maximum"])
-                    self.status.config(text=f"Done. Saved {pages}-page PDF.")
-                    # Auto-trigger after-build actions before showing the
-                    # success dialog so users see them happen simultaneously.
-                    if action == "open":
-                        _open_with_default_viewer(path)
-                    elif action == "print":
-                        _print_with_default_printer(path, self.work_queue)
-                    messagebox.showinfo(APP_NAME, text)
+                    self.status.config(
+                        text=f"Done. Saved {pages} page(s).")
+                    # v1.65.1: what to do with the file is asked here rather
+                    # than chosen up front by a dedicated button.
+                    self._show_saved_dialog(path, text)
                 elif msg[0] == "export_done":
                     _, written = msg
                     self._set_busy(False)

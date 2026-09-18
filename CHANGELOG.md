@@ -1,5 +1,30 @@
 # Changelog
 
+## v1.65.1
+- **Fixed: the packaged Linux build segfaulted on startup.** v1.65 `place()`d
+  the My Signatures button *inside* the `ttk::Notebook` so it would sit level
+  with the tabs. A notebook manages its own children, and a place()d non-pane
+  child corrupts that bookkeeping — it survived running from source but killed
+  the frozen build during the first layout pass (`root.update_idletasks()`).
+  Now packed in its own row above the notebook.
+  - Ruled out by bisection first: not the changed dependencies (swapping
+    v1.64's pillow-heif/pyhanko/playwright/cryptography into the v1.65 bundle
+    still crashed), not tkinterdnd2 0.6.3, not the bundled font libraries, not
+    Pillow's ImageTk, and not any individual emoji glyph (all render fine in
+    system Tk). v1.64's bundle runs fine on the same machine.
+- **One "Create MyDoc" button replaces four.** `Create PDF`, `Sign and Create
+  PDF`, `Create and open PDF` and `Create and print PDF` were one build with
+  four tails. Now `create_doc()` asks what to make, then `_show_saved_dialog()`
+  asks what to do with it (Open / Show in folder / Print / Close).
+- **Output formats.** PDF is still native; everything else converts from the
+  finished PDF, so Style, text notes and page order apply either way:
+  `pdf_to_images()` (PNG/JPG, one file per page, via pypdfium2),
+  `pdf_to_text()` (pypdf extraction), and `pdf_to_office()` (DOCX/HTML via
+  LibreOffice, flagged as lossy in the UI and disabled when it isn't
+  installed).
+- **Signing folded into the create dialog** as a tick-box, and the flatten
+  choice moved in there too — so making a PDF is two dialogs, not three.
+
 ## v1.65
 - **Tabs renamed for what they actually do.** `Pages` → **Files**,
   `Preview` → **Preview Pages**, `Style` → **Add Style**. The tab labels now
