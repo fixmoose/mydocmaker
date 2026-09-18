@@ -146,6 +146,12 @@ WHATS_NEW = {
         "marked pages and «name»-B.pdf with the rest. Perfect for cutting a "
         "two-page document into two single pages. Nothing is removed from the "
         "document you're building — export saves copies.",
+        "Signing knows about your split. If you've marked pages and click "
+        "🔏 Sign and Create PDF, it asks what to sign: the whole document, "
+        "just part A, just part B, or both parts one after the other. A "
+        "digital signature covers one whole file, so it can never be copied "
+        "between files — 'both' walks you through placing a signature on each "
+        "and saving them separately.",
         "'✎ Add text' is now a button instead of a tick-box. Click it, then "
         "click where the text goes — it places one text box and switches "
         "itself off. Changing text you've already added never needed the "
@@ -7095,14 +7101,22 @@ class PreviewTab:
         self._redraw_mark_outlines()
         self._update_delete_button()
 
+    def marked_and_rest(self):
+        """(marked keys, unmarked keys) for the pages currently on screen.
+        Shared by Export and by the Sign flow's "what should I sign?" prompt
+        so both mean exactly the same thing by A and B."""
+        marked = set(self._marked)
+        rest = [k for k in self._page_sources if k not in marked]
+        return marked, rest
+
     def _export_marked_pages(self):
         """Save the ticked pages as their own PDF, optionally splitting the
         document into A (ticked) and B (the rest) in one go. The pages stay
         in this document — export copies, it doesn't remove."""
         if not self._marked:
             return
-        rest = [k for k in self._page_sources if k not in self._marked]
-        self.app.export_pages(set(self._marked), rest)
+        marked, rest = self.marked_and_rest()
+        self.app.export_pages(marked, rest)
 
     def _delete_marked_pages(self):
         """Hide every ticked page. Marks are already source keys
@@ -8149,6 +8163,9 @@ class App:
         # so reordering/removing other items doesn't disturb it. Honoured by
         # the Preview tab, the final Create-PDF build, and the sign build.
         self.excluded_pages = set()
+        # Pending signing passes (v1.65). Signing A and B is two passes —
+        # a digital signature covers one whole file, so it can't be copied.
+        self._sign_queue = []
         # v1.53: custom page order. A list of (item.uid, local_page_index)
         # keys giving the desired OUTPUT sequence, independent of item order —
         # set by dragging thumbnails on the Order tab. Empty = natural order
@@ -9882,27 +9899,130 @@ class App:
             SignatureCreatorDialog(self.root, on_save=_after_create)
             return
 
-        # Build the combined PDF in memory using cached item bytes.
-        self.status.config(text="Building PDF for signing…")
+        # What are we signing? Only worth asking when the user has pages
+        # marked on Preview Pages AND some aren't marked — otherwise "marked"
+        # and "the whole document" are the same thing.
+        marked, rest = (set(), [])
+        if hasattr(self, "preview"):
+            marked, rest = self.preview.marked_and_rest()
+        if marked and rest:
+            scope = self._ask_sign_scope(len(marked), len(rest))
+            if scope is None:
+                return
+        else:
+            scope = "whole"
+
+        # A digital signature covers one whole file, so each part is its own
+        # signing pass — build a queue and walk it.
+        keep_marked = lambda k, ks=set(marked): k in ks
+        keep_rest = lambda k, ks=set(rest): k in ks
+        if scope == "marked":
+            self._sign_queue = [(keep_marked, "the marked pages (A)")]
+        elif scope == "unmarked":
+            self._sign_queue = [(keep_rest, "the unmarked pages (B)")]
+        elif scope == "both":
+            self._sign_queue = [(keep_marked, "part A — the marked pages"),
+                                (keep_rest, "part B — the unmarked pages")]
+        else:
+            self._sign_queue = [(None, "")]
+        self._start_next_sign_job()
+
+    def _start_next_sign_job(self):
+        """Build the next document in the signing queue, off the UI thread."""
+        if not self._sign_queue:
+            return
+        keep, label = self._sign_queue.pop(0)
+        self.status.config(
+            text=f"Building {label or 'PDF'} for signing…")
         self._set_busy(True)
         threading.Thread(
             target=self._build_for_signing_worker,
+            args=(keep, label),
             daemon=True,
         ).start()
 
-    def _build_for_signing_worker(self):
+    def _ask_sign_scope(self, n_marked, n_rest):
+        """Ask what to sign when pages are marked. Returns "whole", "marked",
+        "unmarked", "both" or None (cancelled)."""
+        win = tk.Toplevel(self.root)
+        win.title("What should be signed?")
+        win.transient(self.root)
+        win.resizable(False, False)
+        result = {"value": None}
+        # Default to the existing behaviour — someone may have pages marked
+        # for an unrelated reason and just want the whole thing signed.
+        mode = tk.StringVar(value="whole")
+        total = n_marked + n_rest
+
+        ttk.Label(win, text="What should be signed?",
+                  font=("", 12, "bold")).pack(anchor="w", padx=16,
+                                              pady=(14, 2))
+        ttk.Label(
+            win, wraplength=480, justify="left", foreground="#444",
+            text=f"You've marked {n_marked} of {total} pages. A digital "
+                 f"signature covers one whole file, so each part has to be "
+                 f"signed on its own — a signature can't be copied from one "
+                 f"file to another.",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        for val, title, blurb in (
+            ("whole", f"The whole document ({total} pages)",
+             "One file, one signature. What Sign has always done."),
+            ("both", "Both parts, one after the other",
+             f"Sign part A ({n_marked} marked page"
+             f"{'' if n_marked == 1 else 's'}), save it, then place a second "
+             f"signature on part B ({n_rest} page"
+             f"{'' if n_rest == 1 else 's'}) and save that. Two files, two "
+             f"signatures."),
+            ("marked", f"Just the marked pages ({n_marked})",
+             "Signs part A only. The rest isn't written anywhere."),
+            ("unmarked", f"Just the unmarked pages ({n_rest})",
+             "Signs part B only. The marked pages aren't written anywhere."),
+        ):
+            f = ttk.Frame(win)
+            f.pack(fill="x", padx=16)
+            ttk.Radiobutton(f, text=title, value=val,
+                            variable=mode).pack(anchor="w")
+            ttk.Label(f, wraplength=450, justify="left", foreground="#555",
+                      text=blurb).pack(anchor="w", padx=(22, 0), pady=(0, 8))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(6, 14))
+
+        def go():
+            result["value"] = mode.get()
+            win.destroy()
+
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        ok_btn = ttk.Button(row, text="Continue", command=go)
+        ok_btn.pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: go())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{self.root.winfo_rooty() + 60}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        ok_btn.focus_set()
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _build_for_signing_worker(self, keep=None, label=""):
         """Worker: stitch the combined PDF, then post back to the UI thread
         to open SignDialog. Mirrors _build_worker's assembly logic but
         prefers cached bytes when available so signing doesn't pay the
         render cost twice."""
         try:
-            final = self.assemble_from_cache()
+            final = self.assemble_from_cache(keep=keep)
             if final is None:
                 self.work_queue.put((
                     "error", "No pages were created — nothing to sign."
                 ))
                 return
-            self.work_queue.put(("ready_for_signing", final))
+            self.work_queue.put(("ready_for_signing", final, label))
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
 
@@ -9992,15 +10112,31 @@ class App:
                 out.append(dict(n, page=new_page))
         return out
 
-    def _open_sign_dialog(self, pdf_bytes):
+    def _open_sign_dialog(self, pdf_bytes, label=""):
         self._set_busy(False)
-        self.status.config(text="Ready to sign — click on a page to place.")
+        what = f" {label}" if label else ""
+        self.status.config(
+            text=f"Ready to sign{what} — click on a page to place.")
         SignDialog(
-            self.root, self, pdf_bytes,
-            on_signed=lambda path: self.status.config(
-                text=f"Signed: {os.path.basename(path)}"
-            ),
+            self.root, self, pdf_bytes, on_signed=self._on_one_signed,
         )
+
+    def _on_one_signed(self, path):
+        """One part signed and saved. If the user chose to sign both halves,
+        walk straight on to the next one — cancelling that dialog just ends
+        the run."""
+        self.status.config(text=f"Signed: {os.path.basename(path)}")
+        if not self._sign_queue:
+            return
+        next_label = self._sign_queue[0][1]
+        messagebox.showinfo(
+            APP_NAME,
+            f"Saved {os.path.basename(path)}.\n\n"
+            f"Now place a signature on {next_label} and save it as its own "
+            f"file. Each file is signed separately — a digital signature "
+            f"covers one whole file, so it can't be copied across.",
+        )
+        self.root.after(100, self._start_next_sign_job)
 
     # --- Export / split marked pages (v1.65) --------------------------------
     def export_pages(self, marked, rest):
@@ -10535,7 +10671,8 @@ class App:
                     self.root.lift()
                     self.root.focus_force()
                 elif msg[0] == "ready_for_signing":
-                    self._open_sign_dialog(msg[1])
+                    self._open_sign_dialog(
+                        msg[1], msg[2] if len(msg) > 2 else "")
                 elif msg[0] in ("item_status", "item_rendered",
                                 "item_render_failed"):
                     # Per-item render-state change from RenderWorker:

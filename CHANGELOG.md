@@ -47,6 +47,16 @@
   `_build_for_signing_worker` into `App.assemble_from_cache(keep=...)`, now
   shared by signing and export — Order, per-page flips, 2-up, Style and text
   notes all apply.
+- **Signing is split-aware.** With pages marked, `sign_and_create_pdf` asks
+  what to sign via `_ask_sign_scope()` — whole document / part A / part B /
+  both in turn — and only asks when some pages are marked and some aren't
+  (otherwise "marked" and "whole" are the same document). "Both" queues two
+  passes in `_sign_queue`; `_on_one_signed` chains to the next after a save,
+  explaining that a digital signature covers one whole file and can't be
+  copied across. Cancelling a pass ends the run. `_build_for_signing_worker`
+  now takes a `keep` filter and a label, both threaded through
+  `ready_for_signing`. `PreviewTab.marked_and_rest()` is the single source of
+  truth for what A and B mean, shared with Export.
 - **Fixed: text notes drifted onto the wrong page when exporting a subset.**
   Notes are keyed by their index in the *full* assembled document, so a
   filtered export landed them on the wrong page and silently dropped the rest.
