@@ -6535,19 +6535,16 @@ class PreviewTab:
         for _txt, _val in (("Original (images)", "original"), ("A4", "a4"),
                            ("A3", "a3"), ("Letter", "letter"),
                            ("11×17", "tabloid")):
-            _dbg(f"  size radio {_val!r} text={_txt!r}")
             ttk.Radiobutton(lbar, text=_txt, value=_val,
                             variable=self.app.size_var,
                             command=self.app._on_page_mode_changed
                             ).pack(side="left", padx=4)
-        _dbg("  size radios done")
 
         lbar2 = ttk.Frame(self.frame)
         lbar2.pack(fill="x", padx=8, pady=(2, 0))
         ttk.Label(lbar2, text="Orientation:").pack(side="left")
         for _txt, _val in (("Portrait", "portrait"),
                            ("Landscape", "landscape")):
-            _dbg(f"  orient radio {_val!r}")
             ttk.Radiobutton(lbar2, text=_txt, value=_val,
                             variable=self.app.orient_var,
                             command=self.app._on_page_mode_changed
@@ -8803,10 +8800,20 @@ class App:
         #   content_var = how the original content sits on that sheet
         #   arrange_var = 2-up side-by-side vs stacked
         #   nup_var     = the 2-up coupler itself
-        self.size_var = tk.StringVar(value=default_page_size())
-        self.orient_var = tk.StringVar(value="portrait")
-        self.content_var = tk.StringVar(value="auto")
-        self.arrange_var = tk.StringVar(value="side")
+        # These deliberately start EMPTY and are given their real defaults
+        # once the radio buttons exist — see _apply_layout_defaults().
+        #
+        # v1.65.1: a ttk::radiobutton whose -value already matches its
+        # -variable selects itself as it is created. Doing that to the FIRST
+        # ttk::radiobutton in the process, inside a notebook pane that has not
+        # been mapped yet, segfaults Tk in the packaged build. v1.65 moved
+        # these radios from the (visible) Files tab to the Preview Pages tab
+        # and so hit exactly that. Creating them all unselected and setting
+        # the value afterwards avoids the path entirely.
+        self.size_var = tk.StringVar(value="")
+        self.orient_var = tk.StringVar(value="")
+        self.content_var = tk.StringVar(value="")
+        self.arrange_var = tk.StringVar(value="")
         self.nup_var = tk.BooleanVar(value=False)
 
         # Flatten is no longer a checkbox (v1.65) — Create PDF asks, with
@@ -8821,6 +8828,8 @@ class App:
         # forwarded by _poll_queue.
         _dbg("PreviewTab")
         self.preview = PreviewTab(preview_tab, self)
+        # Radios now exist and are all unselected — safe to pick the defaults.
+        self._apply_layout_defaults()
 
         # OrderTab (v1.53): drag-to-reorder thumbnail grid. Built after the
         # preview so its reorders can invalidate/refresh the preview.
@@ -9006,15 +9015,30 @@ class App:
         elif current == TAB_EDITOR and hasattr(self, "editor_tab"):
             self.editor_tab.on_show()
 
+    def _apply_layout_defaults(self):
+        """Select the default paper size / orientation / content / 2-up
+        arrangement. Called straight after the radio buttons are built,
+        never before — see the note where these variables are created."""
+        self.size_var.set(default_page_size())
+        self.orient_var.set("portrait")
+        self.content_var.set("auto")
+        self.arrange_var.set("side")
+
     def _current_layout(self):
         """Snapshot the page-layout controls into a PageLayout. Defensive so
         it works even if called before every widget exists."""
+        # The "or" fallbacks matter during construction: the variables are
+        # empty until _apply_layout_defaults() runs.
         return PageLayout(
-            self.size_var.get() if hasattr(self, "size_var") else "original",
-            self.orient_var.get() if hasattr(self, "orient_var") else "portrait",
-            self.content_var.get() if hasattr(self, "content_var") else "auto",
+            (getattr(self, "size_var", None) and self.size_var.get())
+            or default_page_size(),
+            (getattr(self, "orient_var", None) and self.orient_var.get())
+            or "portrait",
+            (getattr(self, "content_var", None) and self.content_var.get())
+            or "auto",
             2 if (hasattr(self, "nup_var") and self.nup_var.get()) else 1,
-            self.arrange_var.get() if hasattr(self, "arrange_var") else "side",
+            (getattr(self, "arrange_var", None) and self.arrange_var.get())
+            or "side",
         )
 
     def reorder_keys(self, natural_keys):
