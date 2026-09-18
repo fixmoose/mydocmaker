@@ -6535,16 +6535,19 @@ class PreviewTab:
         for _txt, _val in (("Original (images)", "original"), ("A4", "a4"),
                            ("A3", "a3"), ("Letter", "letter"),
                            ("11×17", "tabloid")):
+            _dbg(f"  size radio {_val!r} text={_txt!r}")
             ttk.Radiobutton(lbar, text=_txt, value=_val,
                             variable=self.app.size_var,
                             command=self.app._on_page_mode_changed
                             ).pack(side="left", padx=4)
+        _dbg("  size radios done")
 
         lbar2 = ttk.Frame(self.frame)
         lbar2.pack(fill="x", padx=8, pady=(2, 0))
         ttk.Label(lbar2, text="Orientation:").pack(side="left")
         for _txt, _val in (("Portrait", "portrait"),
                            ("Landscape", "landscape")):
+            _dbg(f"  orient radio {_val!r}")
             ttk.Radiobutton(lbar2, text=_txt, value=_val,
                             variable=self.app.orient_var,
                             command=self.app._on_page_mode_changed
