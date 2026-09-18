@@ -5,11 +5,11 @@ name: Build & Release
 # every artifact to a GitHub Release. workflow_dispatch lets you run the
 # build manually (without publishing a release).
 #
-# Windows code signing via SignPath Foundation is opportunistic: if the
-# SIGNPATH_API_TOKEN secret is set (and the three SIGNPATH_* repo variables
-# are configured) the build signs the bundled .exe and the installer .exe;
-# otherwise it produces unsigned artifacts and the build still succeeds.
-# See the SignPath section further down for the exact setup.
+# Windows code signing via Azure Artifact Signing (formerly Trusted Signing)
+# is opportunistic: if the AZURE_CLIENT_SECRET secret is set (and the
+# AZURE_* repo variables are configured) the build signs the bundled .exe and
+# the installer .exe; otherwise it produces unsigned artifacts and the build
+# still succeeds. See the signing section further down for the exact setup.
 on:
   push:
     tags:
@@ -146,78 +146,83 @@ jobs:
 
       # ---- Package per-OS -------------------------------------------------
       # ===================================================================
-      # SignPath Foundation code signing (Windows only).
+      # Windows code signing via Azure Artifact Signing (formerly Azure
+      # Trusted Signing).
       #
-      # When the SIGNPATH_API_TOKEN repository secret is set, the bundled
-      # app .exe AND the Inno Setup installer .exe are submitted to
-      # SignPath Foundation for signing with their EV certificate. The
-      # signed binaries replace the unsigned ones before packaging /
-      # release.
+      # When the AZURE_CLIENT_SECRET repository secret is set, the bundled
+      # app .exe AND the Inno Setup installer .exe are signed in place on the
+      # runner. Azure issues short-lived (~3 day) certificates, so there is
+      # nothing to store or rotate beyond the service-principal credentials.
       #
-      # When SIGNPATH_API_TOKEN is NOT set (forks, pre-approval, local
-      # tests) all signing steps are skipped and the build behaves as
-      # today, producing unsigned artifacts.
+      # When AZURE_CLIENT_SECRET is NOT set (forks, pre-signup, local tests)
+      # all signing steps are skipped and the build produces unsigned
+      # artifacts, exactly as before.
       #
-      # Required secrets / variables (add in repo Settings → Secrets and
-      # variables → Actions, after SignPath Foundation approves):
-      #   • Secret:    SIGNPATH_API_TOKEN       (the API token from SignPath)
-      #   • Variable:  SIGNPATH_ORG_ID          (your SignPath organisation id)
-      #   • Variable:  SIGNPATH_PROJECT_SLUG    (the project slug in SignPath)
-      #   • Variable:  SIGNPATH_POLICY_SLUG     (signing policy slug; usually
-      #                                          'release-signing')
+      # We previously scaffolded SignPath Foundation here. That programme
+      # requires "an OSI-approved Open Source license without commercial
+      # dual-licensing" — MyDocMaker is PolyForm Noncommercial 1.0.0 and
+      # sells commercial licenses, so it can never qualify. Removed rather
+      # than left as dead config that looks like it might work one day.
+      #
+      # Required secret / variables (Settings → Secrets and variables →
+      # Actions), from the Azure Artifact Signing account:
+      #   • Secret:    AZURE_CLIENT_SECRET   (service-principal secret)
+      #   • Variable:  AZURE_TENANT_ID
+      #   • Variable:  AZURE_CLIENT_ID
+      #   • Variable:  AZURE_SIGNING_ENDPOINT        e.g.
+      #                https://wus2.codesigning.azure.net
+      #   • Variable:  AZURE_SIGNING_ACCOUNT_NAME
+      #   • Variable:  AZURE_CERT_PROFILE_NAME
+      #
+      # The service principal needs the "Trusted Signing Certificate Profile
+      # Signer" role on the signing account.
       # ===================================================================
 
-      - name: Check SignPath signing config
-        id: signpath_check
+      - name: Check code-signing config
+        id: signing_check
         if: matrix.os == 'windows-latest'
         shell: bash
         env:
-          HAS_TOKEN: ${{ secrets.SIGNPATH_API_TOKEN != '' }}
+          HAS_SECRET: ${{ secrets.AZURE_CLIENT_SECRET != '' }}
         run: |
-          if [ "$HAS_TOKEN" = "true" ]; then
+          if [ "$HAS_SECRET" = "true" ]; then
             echo "enabled=true" >> "$GITHUB_OUTPUT"
-            echo "::notice::SignPath signing enabled — bundled .exe and installer will be signed."
+            echo "::notice::Code signing enabled — bundled .exe and installer will be signed."
           else
             echo "enabled=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::SignPath signing skipped (SIGNPATH_API_TOKEN secret not set). Build will produce UNSIGNED Windows artifacts and end users will see SmartScreen warnings."
+            echo "::notice::Code signing skipped (AZURE_CLIENT_SECRET secret not set). Build will produce UNSIGNED Windows artifacts and end users will see SmartScreen warnings."
           fi
 
-      # ---- Sign the bundled app .exe BEFORE zipping/installer build,
-      # so both the portable zip and the installer contain a signed .exe.
-      - name: Upload unsigned bundled .exe for signing
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
-        id: upload_unsigned_app
-        uses: actions/upload-artifact@v4
+      # ---- Sign the bundled app .exe BEFORE zipping / building the
+      # installer, so both the portable zip and the installer carry a signed
+      # executable.
+      - name: Sign bundled .exe
+        if: matrix.os == 'windows-latest' && steps.signing_check.outputs.enabled == 'true'
+        uses: azure/trusted-signing-action@v0
         with:
-          name: unsigned-bundled-exe
-          path: "dist/${{ env.APP_NAME }}/${{ env.APP_NAME }}.exe"
-          retention-days: 1
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE_NAME }}
+          files-folder: dist/${{ env.APP_NAME }}
+          files-folder-filter: exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
-      - name: Sign bundled .exe via SignPath
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
-          github-artifact-id: ${{ steps.upload_unsigned_app.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: signed-app
-
-      - name: Replace bundled .exe with signed version
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
+      - name: Verify bundled .exe is signed
+        if: matrix.os == 'windows-latest' && steps.signing_check.outputs.enabled == 'true'
         shell: pwsh
         run: |
-          $signed = "signed-app/${{ env.APP_NAME }}.exe"
           $target = "dist/${{ env.APP_NAME }}/${{ env.APP_NAME }}.exe"
-          if (-not (Test-Path $signed)) {
-            Write-Error "SignPath did not return a signed bundle .exe at $signed"
-            Get-ChildItem -Recurse signed-app
+          $sig = Get-AuthenticodeSignature $target
+          Write-Host "Status: $($sig.Status);  Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "Bundled .exe is not validly signed (status: $($sig.Status))"
             exit 1
           }
-          Move-Item -Force $signed $target
-          Write-Host "Replaced bundled .exe with signed copy."
 
       - name: Package (Windows portable zip)
         if: matrix.os == 'windows-latest'
@@ -255,41 +260,33 @@ jobs:
           Write-Host "Installer built:"
           Get-Item $exe | Format-List Name,Length
 
-      # ---- Sign the Setup.exe so users see no SmartScreen when they
-      # download and run it.
-      - name: Upload unsigned installer for signing
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
-        id: upload_unsigned_setup
-        uses: actions/upload-artifact@v4
+      # ---- Sign the Setup.exe too: it is the file most users actually
+      # download and run, so it is the one SmartScreen judges first.
+      - name: Sign Windows installer
+        if: matrix.os == 'windows-latest' && steps.signing_check.outputs.enabled == 'true'
+        uses: azure/trusted-signing-action@v0
         with:
-          name: unsigned-installer-exe
-          path: MyDocMaker-Windows-Setup.exe
-          retention-days: 1
+          azure-tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          azure-client-id: ${{ vars.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          endpoint: ${{ vars.AZURE_SIGNING_ENDPOINT }}
+          trusted-signing-account-name: ${{ vars.AZURE_SIGNING_ACCOUNT_NAME }}
+          certificate-profile-name: ${{ vars.AZURE_CERT_PROFILE_NAME }}
+          files: MyDocMaker-Windows-Setup.exe
+          file-digest: SHA256
+          timestamp-rfc3161: http://timestamp.acs.microsoft.com
+          timestamp-digest: SHA256
 
-      - name: Sign installer via SignPath
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
-        uses: signpath/github-action-submit-signing-request@v1
-        with:
-          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
-          organization-id: ${{ vars.SIGNPATH_ORG_ID }}
-          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
-          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
-          github-artifact-id: ${{ steps.upload_unsigned_setup.outputs.artifact-id }}
-          wait-for-completion: true
-          output-artifact-directory: signed-setup
-
-      - name: Replace installer with signed version
-        if: matrix.os == 'windows-latest' && steps.signpath_check.outputs.enabled == 'true'
+      - name: Verify installer is signed
+        if: matrix.os == 'windows-latest' && steps.signing_check.outputs.enabled == 'true'
         shell: pwsh
         run: |
-          $signed = "signed-setup/MyDocMaker-Windows-Setup.exe"
-          if (-not (Test-Path $signed)) {
-            Write-Error "SignPath did not return a signed installer at $signed"
-            Get-ChildItem -Recurse signed-setup
+          $sig = Get-AuthenticodeSignature "MyDocMaker-Windows-Setup.exe"
+          Write-Host "Status: $($sig.Status);  Signer: $($sig.SignerCertificate.Subject)"
+          if ($sig.Status -ne 'Valid') {
+            Write-Error "Installer is not validly signed (status: $($sig.Status))"
             exit 1
           }
-          Move-Item -Force $signed MyDocMaker-Windows-Setup.exe
-          Write-Host "Replaced installer with signed copy."
 
       # macOS: inject CFBundleDocumentTypes into the bundled Info.plist so
       # Finder offers "Open With MyDocMaker" for our file types.
