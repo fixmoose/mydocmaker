@@ -9937,14 +9937,19 @@ class App:
                 key = (it.uid, local_idx)
                 if key in excluded:
                     continue
-                if keep is not None and not keep(key):
-                    continue
                 page_map[key] = pg
                 natural.append(key)
-        # Emit in the custom page order (Order tab), applying any per-page
-        # orientation flips.
+        # Full page order (Order tab) BEFORE any export filter — text notes
+        # are keyed by position in this full document, so we need it to remap
+        # them onto a filtered subset.
+        ordered_all = self.reorder_keys(natural)
+        if keep is None:
+            ordered_out = ordered_all
+        else:
+            ordered_out = [k for k in ordered_all if keep(k)]
+        # Emit in that order, applying any per-page orientation flips.
         asis_idx = set()
-        for out_i, key in enumerate(self.reorder_keys(natural)):
+        for out_i, key in enumerate(ordered_out):
             pg = page_map[key]
             turns = self.page_rotate.get(key, 0)
             if turns:
@@ -9957,7 +9962,35 @@ class App:
         writer.write(staged)
         final = _apply_nup(staged.getvalue(), layout, asis_idx)
         final = apply_style(final, self.style, self)
-        return apply_text_notes(final, self.text_notes)
+        return apply_text_notes(
+            final, self._notes_for(ordered_all, ordered_out, layout))
+
+    def _notes_for(self, ordered_all, ordered_out, layout):
+        """Re-key the text notes for a filtered document.
+
+        Notes carry the page index they were placed on in the FULL assembled
+        document, so exporting a subset (A / B split) would otherwise drop
+        them or drift them onto the wrong page. Map old display index -> new
+        one and discard notes whose page isn't in this output.
+
+        Under 2-up a display "page" is a sheet of two source pages, so we work
+        in sheet indices and let the first surviving page of a pair claim the
+        sheet — its notes were positioned on that sheet's layout."""
+        if not self.text_notes or ordered_out is ordered_all:
+            return self.text_notes
+        nup = 2 if layout.nup == 2 else 1
+        pos_out = {k: i for i, k in enumerate(ordered_out)}
+        remap = {}
+        for old_i, key in enumerate(ordered_all):
+            new_i = pos_out.get(key)
+            if new_i is not None:
+                remap.setdefault(old_i // nup, new_i // nup)
+        out = []
+        for n in self.text_notes:
+            new_page = remap.get(int(n["page"]))
+            if new_page is not None:
+                out.append(dict(n, page=new_page))
+        return out
 
     def _open_sign_dialog(self, pdf_bytes):
         self._set_busy(False)

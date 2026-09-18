@@ -47,6 +47,12 @@
   `_build_for_signing_worker` into `App.assemble_from_cache(keep=...)`, now
   shared by signing and export — Order, per-page flips, 2-up, Style and text
   notes all apply.
+- **Fixed: text notes drifted onto the wrong page when exporting a subset.**
+  Notes are keyed by their index in the *full* assembled document, so a
+  filtered export landed them on the wrong page and silently dropped the rest.
+  `assemble_from_cache` now computes the full page order before applying the
+  export filter and re-keys the notes through `_notes_for()` (sheet-wise under
+  2-up, where a display page holds two source pages).
 - **`✎ Add text` is a button, not a checkbox.** It arms a single placement
   (`_toggle_text_mode` / `_sync_text_mode` / `_disarm_text_mode`): the label
   flips to "✎ Click a page…", the cursor becomes a crosshair, and it disarms
