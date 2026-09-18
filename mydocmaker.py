@@ -136,6 +136,20 @@ WHATS_NEW = {
         "New 'Editor' tab — pick a page, edit it, and have that page replaced "
         "in your document. The tab and its page picker are in place now; the "
         "editor itself lands in a coming release.",
+        "Deleting pages is much easier to find. The small red '✕ Remove page' "
+        "button is gone; every page now carries a clear 'Mark to delete' "
+        "tick-box. Tick as many as you like — they get a red frame — then hit "
+        "'🗑 Delete marked pages'. 'Clear marks' unticks everything, and "
+        "'Restore hidden pages' still brings them all back.",
+        "New '⇱ Export marked…' button — split a document in one go. Tick the "
+        "pages you want, pick one filename, and you get «name»-A.pdf with the "
+        "marked pages and «name»-B.pdf with the rest. Perfect for cutting a "
+        "two-page document into two single pages. Nothing is removed from the "
+        "document you're building — export saves copies.",
+        "'✎ Add text' is now a button instead of a tick-box. Click it, then "
+        "click where the text goes — it places one text box and switches "
+        "itself off. Changing text you've already added never needed the "
+        "button at all: just click it, or double-click to edit.",
     ],
     "1.64": [
         "Add text right on the Preview — perfect for filling in forms or "
@@ -6132,7 +6146,13 @@ class PreviewTab:
         # are excluded so the Restore button can label itself.
         self._page_sources = []
         self._hidden_count = 0
-        self._page_btn_widgets = []    # per-page Remove buttons (kept from GC)
+        self._page_btn_widgets = []    # per-page tick-boxes (kept from GC)
+        # v1.65: pages are marked with a tick-box and deleted in one go by the
+        # toolbar button, instead of a small per-page "Remove" button that was
+        # easy to miss. Marks are held as (uid, local_idx) source keys, not
+        # display indices, so they survive a re-render/reorder.
+        self._marked = set()
+        self._page_mark_vars = []      # [(src_key, BooleanVar)] for this render
 
         # v1.64: text-notes tool state. _page_boxes[i] = (x, y, w_px, h_px) of
         # display page i on the canvas; _page_render_scale = px per PDF point.
@@ -6216,23 +6236,65 @@ class PreviewTab:
 
         ttk.Button(bar, text="↻ Refresh", command=self.refresh_preview
                    ).pack(side="right")
-        # Restore hidden pages — only meaningful once the user has hidden at
+
+        # ----- Page-actions bar (v1.65): tick pages, then delete them.
+        # The old per-page "✕ Remove page" button was small, red-on-white and
+        # easy to miss — and it only ever removed one page at a time. Now each
+        # page carries a plain tick-box and this row does the deleting.
+        pbar = ttk.Frame(self.frame)
+        pbar.pack(fill="x", padx=8, pady=(2, 2))
+        self.del_btn = ttk.Button(pbar, text="🗑 Delete marked pages",
+                                  command=self._delete_marked_pages)
+        self.del_btn.pack(side="left")
+        self.del_btn.state(["disabled"])
+        tip(self.del_btn,
+            "Removes every page you've ticked from the document. They're only "
+            "hidden — 'Restore hidden pages' brings them all back.")
+        self.export_btn = ttk.Button(pbar, text="⇱ Export marked…",
+                                     command=self._export_marked_pages)
+        self.export_btn.pack(side="left", padx=(6, 0))
+        self.export_btn.state(["disabled"])
+        tip(self.export_btn,
+            "Save the ticked pages as their own PDF — and optionally the "
+            "pages you didn't tick as a second file, so a document splits "
+            "into A and B in one go. Nothing is removed from this document.")
+        self.clear_marks_btn = ttk.Button(pbar, text="Clear marks",
+                                          command=self._clear_marks)
+        self.clear_marks_btn.pack(side="left", padx=(6, 0))
+        self.clear_marks_btn.state(["disabled"])
+        tip(self.clear_marks_btn,
+            "Untick every page without deleting anything.")
+        self.mark_hint = ttk.Label(
+            pbar, foreground="#666",
+            text="Tick “Mark to delete” on any page above, then hit Delete.",
+        )
+        self.mark_hint.pack(side="left", padx=(10, 0))
+
+        # Restore hidden pages — only meaningful once the user has deleted at
         # least one page; label updates with the count.
         self.restore_btn = ttk.Button(
-            bar, text="Restore hidden pages",
+            pbar, text="Restore hidden pages",
             command=self._restore_hidden_pages,
         )
-        self.restore_btn.pack(side="right", padx=(0, 6))
+        self.restore_btn.pack(side="right")
         self.restore_btn.pack_forget()
+        self._restore_btn_parent = pbar
 
         # ----- Text-notes toolbar (v1.64): its own row so nothing clips.
         tbar = ttk.Frame(self.frame)
         tbar.pack(fill="x", padx=8, pady=(0, 2))
+        # v1.65: a BUTTON, not a checkbox. Clicking it arms ONE placement —
+        # the next click on a page drops a text box there and opens the
+        # editor, then it disarms itself. Existing notes were always
+        # clickable/editable without any mode; only *creating* one is armed.
         self.text_mode = tk.BooleanVar(value=False)
-        tip(ttk.Checkbutton(tbar, text="✎ Add text", variable=self.text_mode,
-                            command=self._on_text_mode),
-            "Turn on, then click a page to type a note or fill a form. Click "
-            "an existing note to select and edit it; drag to move it.").pack(side="left")
+        self.add_text_btn = ttk.Button(tbar, text="✎ Add text", width=17,
+                                       command=self._toggle_text_mode)
+        self.add_text_btn.pack(side="left")
+        tip(self.add_text_btn,
+            "Click this, then click where you want the text — handy for "
+            "filling in a form. To change text you've already added, just "
+            "click it (or double-click to edit); no need to press this first.")
         ttk.Label(tbar, text="Font:").pack(side="left", padx=(10, 2))
         self.note_font = tk.StringVar(value="Helvetica")
         fcb = ttk.Combobox(tbar, textvariable=self.note_font, width=9,
@@ -6294,6 +6356,9 @@ class PreviewTab:
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
         self.canvas.bind_all("<Delete>", self._on_delete_key, add="+")
+        # Esc cancels an armed placement (the inline editor binds its own Esc
+        # while it's open, so this only fires when nothing is being typed).
+        self.canvas.bind_all("<Escape>", self._disarm_text_mode, add="+")
 
         self._set_placeholder(
             f"Add some files in the {TAB_FILES} tab to see a preview here.")
@@ -6399,6 +6464,9 @@ class PreviewTab:
             self._page_sources.append(key)
         self._asis_idx = asis_idx
         self._hidden_count = hidden
+        # Drop marks for pages that are no longer on screen (their item was
+        # removed, or they've just been deleted) so the counter can't drift.
+        self._marked &= set(self._page_sources)
 
         if len(writer.pages) == 0:
             self._teardown_pdf()
@@ -6455,11 +6523,13 @@ class PreviewTab:
             except tk.TclError:
                 pass
         self._page_btn_widgets = []
+        self._page_mark_vars = []
         self.canvas.delete("all")
         self.canvas.create_text(
             10, 10, anchor="nw",
             text=text, fill="#666", font=("", 11),
         )
+        self._update_delete_button()
         self.page_lbl.config(text="—")
         self.prev_btn.state(["disabled"])
         self.next_btn.state(["disabled"])
@@ -6630,10 +6700,13 @@ class PreviewTab:
         self._cached_image_refs = []
         self._page_y_positions = []
         self._page_boxes = []
+        self._page_mark_vars = []
         self._note_item_ids = {}
         self._page_render_scale = scale
         y = 8
         max_w = 0
+        nup_on = bool(getattr(self.app, "nup_var", None)
+                      and self.app.nup_var.get())
 
         for idx in range(self._page_count):
             try:
@@ -6655,24 +6728,31 @@ class PreviewTab:
             x = max((cw - pil.width) // 2, 8)
             self._page_boxes.append((x, y, pil.width, pil.height))
             self.canvas.create_image(x, y, anchor="nw", image=photo)
-            # v1.45: a "✕ Remove page" button floating at the page's top-right.
-            # Clicking it hides just this page from the output (and preview).
-            # Skipped under 2-up: a displayed sheet holds two source pages, so
-            # there's no 1:1 page→source mapping to remove. (Turn 2-up off to
-            # remove individual pages, then re-enable.)
-            if not (hasattr(self.app, "nup_var") and self.app.nup_var.get()):
-                rm_btn = tk.Button(
-                    self.canvas, text="✕ Remove page",
-                    font=("", 8), fg="#a30000", cursor="hand2",
-                    relief="raised", bd=1, padx=4, pady=0,
-                    command=lambda i=idx: self._remove_page(i),
+            # v1.65: a "Mark to delete" tick-box floating at the page's
+            # top-right. Tick as many pages as you like, then use the Delete
+            # button on the page-actions row. Skipped under 2-up: a displayed
+            # sheet holds two source pages, so there's no 1:1 page→source
+            # mapping to delete. (Turn 2-up off to delete individual pages.)
+            if not nup_on:
+                src = (self._page_sources[idx]
+                       if idx < len(self._page_sources) else None)
+                var = tk.BooleanVar(value=src in self._marked)
+                chk = tk.Checkbutton(
+                    self.canvas, text=" Mark to delete",
+                    variable=var, font=("", 9, "bold"),
+                    fg="#a30000", bg="#ffffff",
+                    activeforeground="#a30000", activebackground="#ffecec",
+                    selectcolor="#ffffff", cursor="hand2",
+                    relief="raised", bd=1, padx=6, pady=2,
+                    command=lambda sk=src, v=var: self._on_mark_toggle(sk, v),
                 )
                 self.canvas.create_window(
-                    x + pil.width - 4, y + 4, anchor="ne", window=rm_btn,
+                    x + pil.width - 6, y + 6, anchor="ne", window=chk,
                 )
                 # Track for cleanup — only when actually created (under 2-up
-                # there's no Remove button, so nothing to append).
-                self._page_btn_widgets.append(rm_btn)
+                # there's no tick-box, so nothing to append).
+                self._page_btn_widgets.append(chk)
+                self._page_mark_vars.append((src, var))
             # Page number label below each page so users can see where they are.
             label_y = y + pil.height + 4
             self.canvas.create_text(
@@ -6692,6 +6772,8 @@ class PreviewTab:
         self.canvas.config(
             scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100))
         )
+        self._redraw_mark_outlines()
+        self._update_delete_button(nup_on=nup_on)
         self._redraw_notes()
         self._update_page_indicator()
 
@@ -6754,12 +6836,27 @@ class PreviewTab:
                 return self._note_item_ids[item]
         return None
 
-    def _on_text_mode(self):
-        cur = "crosshair" if self.text_mode.get() else ""
+    def _toggle_text_mode(self):
+        """Arm (or cancel) a single text placement. Kept as a toggle so a
+        mis-click on the button is undone by clicking it again, and Esc."""
+        self.text_mode.set(not self.text_mode.get())
+        self._sync_text_mode()
+
+    def _sync_text_mode(self):
+        """Reflect the armed/idle state in the cursor and the button label."""
+        armed = self.text_mode.get()
         try:
-            self.canvas.config(cursor=cur)
+            self.canvas.config(cursor="crosshair" if armed else "")
         except tk.TclError:
             pass
+        if hasattr(self, "add_text_btn"):
+            self.add_text_btn.config(
+                text="✎ Click a page…" if armed else "✎ Add text")
+
+    def _disarm_text_mode(self, _event=None):
+        if self.text_mode.get():
+            self.text_mode.set(False)
+            self._sync_text_mode()
 
     def _on_canvas_press(self, event):
         cx = self.canvas.canvasx(event.x)
@@ -6824,6 +6921,8 @@ class PreviewTab:
             "italic": bool(self.note_italic.get()),
         }
         self.app.text_notes.append(note)
+        # One click, one text box — the button re-arms for the next one.
+        self._disarm_text_mode()
         self._select_note(note)
         self._begin_edit(note, is_new=True)
 
@@ -6917,17 +7016,104 @@ class PreviewTab:
         if hasattr(self.app, "_schedule_save"):
             self.app._schedule_save()
 
-    # ---- Per-page removal (v1.45) ---------------------------------------
-    def _remove_page(self, display_idx):
-        """Hide the page currently shown at display_idx. Maps it back to its
-        source (item.uid, local_idx) and records that in the app-level
-        exclusion set, then rebuilds the preview. The exclusion is honoured
-        by both the final Create-PDF build and the sign build."""
-        if display_idx < 0 or display_idx >= len(self._page_sources):
+    # ---- Mark-and-delete pages (v1.45, reworked v1.65) -------------------
+    def _on_mark_toggle(self, src, var):
+        """A page's "Mark to delete" tick-box changed. Marks are held as
+        source keys so they survive the re-renders that a zoom, resize or
+        layout change triggers."""
+        if src is None:
             return
-        src = self._page_sources[display_idx]
-        self.app.excluded_pages.add(src)
-        # Rebuild immediately so the page disappears and numbering updates.
+        if var.get():
+            self._marked.add(src)
+        else:
+            self._marked.discard(src)
+        # Outline the marked pages so a long document still reads at a glance.
+        self._redraw_mark_outlines()
+        self._update_delete_button()
+
+    def _redraw_mark_outlines(self):
+        """Draw a red frame around every marked page. Cheap — it only touches
+        canvas rectangles, never the page bitmaps."""
+        self.canvas.delete("markbox")
+        # Under 2-up a displayed sheet holds two source pages, so
+        # _page_sources and _page_boxes don't line up 1:1 — there are no
+        # tick-boxes in that mode either, so there's nothing to outline.
+        if getattr(self.app, "nup_var", None) and self.app.nup_var.get():
+            return
+        for idx, src in enumerate(self._page_sources):
+            if src not in self._marked or idx >= len(self._page_boxes):
+                continue
+            x, y, w, h = self._page_boxes[idx]
+            if w <= 0 or h <= 0:
+                continue
+            self.canvas.create_rectangle(
+                x - 3, y - 3, x + w + 3, y + h + 3,
+                outline="#d40000", width=3, tags="markbox",
+            )
+
+    def _update_delete_button(self, nup_on=None):
+        """Keep the Delete / Clear-marks buttons and the hint in step with how
+        many pages are ticked."""
+        if not hasattr(self, "del_btn"):
+            return
+        if nup_on is None:
+            nup_on = bool(getattr(self.app, "nup_var", None)
+                          and self.app.nup_var.get())
+        n = len(self._marked)
+        if n:
+            self.del_btn.config(
+                text=f"🗑 Delete {n} marked page{'' if n == 1 else 's'}")
+            self.del_btn.state(["!disabled"])
+            self.clear_marks_btn.state(["!disabled"])
+            self.export_btn.state(["!disabled"])
+        else:
+            self.del_btn.config(text="🗑 Delete marked pages")
+            self.del_btn.state(["disabled"])
+            self.clear_marks_btn.state(["disabled"])
+            self.export_btn.state(["disabled"])
+        if nup_on:
+            self.mark_hint.config(
+                text="Turn 2-up off to mark and delete individual pages.")
+        elif n:
+            self.mark_hint.config(
+                text=f"{n} page{'' if n == 1 else 's'} marked.")
+        else:
+            self.mark_hint.config(
+                text="Tick “Mark to delete” on any page above, then hit "
+                     "Delete.")
+
+    def _clear_marks(self):
+        """Untick everything without deleting anything."""
+        if not self._marked:
+            return
+        self._marked.clear()
+        for _src, var in self._page_mark_vars:
+            try:
+                var.set(False)
+            except tk.TclError:
+                pass
+        self._redraw_mark_outlines()
+        self._update_delete_button()
+
+    def _export_marked_pages(self):
+        """Save the ticked pages as their own PDF, optionally splitting the
+        document into A (ticked) and B (the rest) in one go. The pages stay
+        in this document — export copies, it doesn't remove."""
+        if not self._marked:
+            return
+        rest = [k for k in self._page_sources if k not in self._marked]
+        self.app.export_pages(set(self._marked), rest)
+
+    def _delete_marked_pages(self):
+        """Hide every ticked page. Marks are already source keys
+        (item.uid, local_idx), so they go straight into the app-level
+        exclusion set — which both the final Create-PDF build and the sign
+        build honour. Reversible via "Restore hidden pages"."""
+        if not self._marked:
+            return
+        self.app.excluded_pages.update(self._marked)
+        self._marked.clear()
+        # Rebuild immediately so the pages disappear and numbering updates.
         self._dirty = True
         self._rebuild_now()
         # Keep the Order tab in sync — a hidden page must drop from its grid.
@@ -6935,7 +7121,7 @@ class PreviewTab:
             self.app.order_tab.invalidate()
 
     def _restore_hidden_pages(self):
-        """Un-hide every page the user removed in this session."""
+        """Un-hide every page the user deleted in this session."""
         if not self.app.excluded_pages:
             return
         self.app.excluded_pages.clear()
@@ -6953,7 +7139,7 @@ class PreviewTab:
                 text=f"Restore {n} hidden page{'' if n == 1 else 's'}"
             )
             try:
-                self.restore_btn.pack(side="right", padx=(0, 6))
+                self.restore_btn.pack(side="right")
             except tk.TclError:
                 pass
         else:
@@ -9710,51 +9896,68 @@ class App:
         prefers cached bytes when available so signing doesn't pay the
         render cost twice."""
         try:
-            writer = PdfWriter()
-            excluded = set(self.excluded_pages)
-            page_map = {}
-            natural = []
-            for it in self.items:
-                if it.cached_pdf_bytes:
-                    reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
-                else:
-                    # Fall back to live render if cache missed (e.g. user
-                    # hits Sign before RenderWorker finished an item).
-                    data = RenderWorker._render(it, self._current_layout())
-                    reader = PdfReader(io.BytesIO(data))
-                # Honour pages hidden in the Preview tab so the signed PDF
-                # matches what the user sees / what Create PDF would produce.
-                for local_idx, pg in enumerate(reader.pages):
-                    if (it.uid, local_idx) in excluded:
-                        continue
-                    key = (it.uid, local_idx)
-                    page_map[key] = pg
-                    natural.append(key)
-            # Emit in the custom page order (Order tab) so the signed PDF
-            # matches the arrangement shown in the preview, applying any
-            # per-page orientation flips.
-            asis_idx = set()
-            for out_i, key in enumerate(self.reorder_keys(natural)):
-                pg = page_map[key]
-                turns = self.page_rotate.get(key, 0)
-                if turns:
-                    pg = _rotate_page_baked(pg, turns)
-                    asis_idx.add(out_i)
-                writer.add_page(pg)
-            if len(writer.pages) == 0:
+            final = self.assemble_from_cache()
+            if final is None:
                 self.work_queue.put((
                     "error", "No pages were created — nothing to sign."
                 ))
                 return
-            staged = io.BytesIO()
-            writer.write(staged)
-            final = _apply_nup(staged.getvalue(), self._current_layout(),
-                               asis_idx)
-            final = apply_style(final, self.style, self)
-            final = apply_text_notes(final, self.text_notes)
             self.work_queue.put(("ready_for_signing", final))
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
+
+    def assemble_from_cache(self, keep=None):
+        """Stitch the finished PDF from the per-item cached bytes — the same
+        document the Preview shows, with Order, per-page flips, 2-up, Style
+        and text notes applied. Returns bytes, or None if nothing survived.
+
+        `keep`: optional callable((uid, local_idx)) -> bool, applied on top of
+        the Preview's hidden-page exclusions. Export uses it to pull out just
+        the marked pages (or just the unmarked ones).
+
+        Runs on a worker thread — it must not touch Tk widgets. Callers pass
+        the layout in via _current_layout() before spawning the thread where
+        that matters; here we read it once, up front."""
+        layout = self._current_layout()
+        writer = PdfWriter()
+        excluded = set(self.excluded_pages)
+        page_map = {}
+        natural = []
+        for it in self.items:
+            if it.cached_pdf_bytes:
+                reader = PdfReader(io.BytesIO(it.cached_pdf_bytes))
+            else:
+                # Fall back to a live render if the cache missed (e.g. the
+                # user hit Sign before RenderWorker finished an item).
+                data = RenderWorker._render(it, layout)
+                reader = PdfReader(io.BytesIO(data))
+            # Honour pages hidden in the Preview tab so the output matches
+            # what the user sees / what Create PDF would produce.
+            for local_idx, pg in enumerate(reader.pages):
+                key = (it.uid, local_idx)
+                if key in excluded:
+                    continue
+                if keep is not None and not keep(key):
+                    continue
+                page_map[key] = pg
+                natural.append(key)
+        # Emit in the custom page order (Order tab), applying any per-page
+        # orientation flips.
+        asis_idx = set()
+        for out_i, key in enumerate(self.reorder_keys(natural)):
+            pg = page_map[key]
+            turns = self.page_rotate.get(key, 0)
+            if turns:
+                pg = _rotate_page_baked(pg, turns)
+                asis_idx.add(out_i)
+            writer.add_page(pg)
+        if len(writer.pages) == 0:
+            return None
+        staged = io.BytesIO()
+        writer.write(staged)
+        final = _apply_nup(staged.getvalue(), layout, asis_idx)
+        final = apply_style(final, self.style, self)
+        return apply_text_notes(final, self.text_notes)
 
     def _open_sign_dialog(self, pdf_bytes):
         self._set_busy(False)
@@ -9765,6 +9968,146 @@ class App:
                 text=f"Signed: {os.path.basename(path)}"
             ),
         )
+
+    # --- Export / split marked pages (v1.65) --------------------------------
+    def export_pages(self, marked, rest):
+        """Save the pages marked on the Preview Pages tab as their own PDF,
+        and optionally the unmarked ones as a second file — so a document
+        splits into A and B in one pass. Called by PreviewTab.
+
+        `marked` / `rest` are sets/lists of (item.uid, local_idx) source keys.
+        Nothing is removed from the working document; export copies."""
+        marked = set(marked)
+        rest = [k for k in rest if k not in marked]
+        if not marked:
+            return
+        split = self._ask_export_split(len(marked), len(rest))
+        if split is None:
+            return
+        flatten = self._ask_output_style()
+        if flatten is None:
+            return
+        base = filedialog.asksaveasfilename(
+            title="Export marked pages as", defaultextension=".pdf",
+            initialdir=default_save_dir(),
+            initialfile=f"split-{random.randint(1000, 9999)}.pdf",
+            filetypes=[("PDF files", "*.pdf")],
+        )
+        if not base:
+            return
+        stem, ext = os.path.splitext(base)
+        ext = ext or ".pdf"
+        if split:
+            # Two files: A = the pages you ticked, B = everything else.
+            path_a, path_b = f"{stem}-A{ext}", f"{stem}-B{ext}"
+        else:
+            path_a, path_b = base, None
+        self._set_busy(True)
+        self.status.config(text="Exporting…")
+        self.progress.config(maximum=100, value=0)
+        threading.Thread(
+            target=self._export_worker,
+            args=(marked, set(rest), bool(flatten), path_a, path_b),
+            daemon=True,
+        ).start()
+
+    def _ask_export_split(self, n_marked, n_rest):
+        """Ask whether to also write the unmarked pages as a second file.
+        Returns True (A & B), False (marked only) or None (cancelled)."""
+        win = tk.Toplevel(self.root)
+        win.title("Export marked pages")
+        win.transient(self.root)
+        win.resizable(False, False)
+        result = {"value": None}
+        mode = tk.StringVar(value="split" if n_rest else "only")
+
+        ttk.Label(win, text="Export marked pages",
+                  font=("", 12, "bold")).pack(anchor="w", padx=16,
+                                              pady=(14, 2))
+        ttk.Label(
+            win, wraplength=460, justify="left", foreground="#444",
+            text=f"You've marked {n_marked} page"
+                 f"{'' if n_marked == 1 else 's'}; "
+                 f"{n_rest} page{'' if n_rest == 1 else 's'} "
+                 f"{'is' if n_rest == 1 else 'are'} not marked. Nothing is "
+                 f"removed from the document you're building — this saves "
+                 f"copies.",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        f1 = ttk.Frame(win)
+        f1.pack(fill="x", padx=16)
+        ttk.Radiobutton(f1, text="Split into two files (A and B)",
+                        value="split", variable=mode).pack(anchor="w")
+        ttk.Label(
+            f1, wraplength=440, justify="left", foreground="#555",
+            text=f"You pick one name; you get two files. The -A file gets "
+                 f"the {n_marked} marked page{'' if n_marked == 1 else 's'}, "
+                 f"the -B file gets the other {n_rest}. This is the one for "
+                 f"splitting a two-page document into two single pages.",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 10))
+        if not n_rest:
+            for w in f1.winfo_children():
+                try:
+                    w.state(["disabled"])
+                except (AttributeError, tk.TclError):
+                    pass
+
+        f2 = ttk.Frame(win)
+        f2.pack(fill="x", padx=16)
+        ttk.Radiobutton(f2, text="Just the marked pages, one file",
+                        value="only", variable=mode).pack(anchor="w")
+        ttk.Label(
+            f2, wraplength=440, justify="left", foreground="#555",
+            text="Saves only what you ticked. The unmarked pages aren't "
+                 "written anywhere.",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 6))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(10, 14))
+
+        def go():
+            result["value"] = (mode.get() == "split" and n_rest > 0)
+            win.destroy()
+
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        ok_btn = ttk.Button(row, text="Continue", command=go)
+        ok_btn.pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: go())
+        win.bind("<Escape>", lambda _e: win.destroy())
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{self.root.winfo_rooty() + 90}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        ok_btn.focus_set()
+        self.root.wait_window(win)
+        return result["value"]
+
+    def _export_worker(self, marked, rest, flatten, path_a, path_b):
+        """Worker: assemble one PDF per side of the split and write them."""
+        try:
+            written = []
+            jobs = [(marked, path_a)]
+            if path_b:
+                jobs.append((rest, path_b))
+            for keys, path in jobs:
+                data = self.assemble_from_cache(keep=lambda k, ks=keys: k in ks)
+                if data is None:
+                    continue
+                if flatten and FLATTEN_OK:
+                    data = flatten_pdf_bytes(data)
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                written.append((path, len(PdfReader(io.BytesIO(data)).pages)))
+            if not written:
+                self.work_queue.put(("error", "Nothing to export."))
+                return
+            self.work_queue.put(("export_done", written))
+        except Exception as e:
+            self.work_queue.put(("error", f"Couldn't export: {e}"))
 
     # --- Output style (flatten?) --------------------------------------------
     def _ask_output_style(self):
@@ -10044,6 +10387,20 @@ class App:
                     elif action == "print":
                         _print_with_default_printer(path, self.work_queue)
                     messagebox.showinfo(APP_NAME, text)
+                elif msg[0] == "export_done":
+                    _, written = msg
+                    self._set_busy(False)
+                    self.progress.config(value=0)
+                    lines = "\n".join(
+                        f"  • {os.path.basename(p)}  ({n} page"
+                        f"{'' if n == 1 else 's'})" for p, n in written)
+                    self.status.config(
+                        text=f"Exported {len(written)} file(s).")
+                    messagebox.showinfo(
+                        APP_NAME,
+                        f"Exported to {os.path.dirname(written[0][0])}:\n\n"
+                        f"{lines}",
+                    )
                 elif msg[0] == "flatten_start":
                     _, total = msg
                     self.progress.config(maximum=max(total, 1), value=0)

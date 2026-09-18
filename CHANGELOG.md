@@ -29,6 +29,30 @@
 - **✎ My Signatures moved to the top**, at the right-hand end of the tab strip
   next to *Add Style*. Still a button, not a tab — `place()`d over the
   notebook's top-right corner. Removed from the footer (Archive stays).
+- **Page deletion reworked: tick-boxes + one Delete button.** The per-page
+  `✕ Remove page` button (small, red-on-white, one page at a time) is replaced
+  by a `Mark to delete` tick-box on every page plus a page-actions row under
+  the preview toolbar: `🗑 Delete N marked pages`, `Clear marks`, and the
+  existing `Restore hidden pages`. Marks are held as `(uid, local_idx)` source
+  keys in `PreviewTab._marked`, so they survive zoom/resize/layout re-renders,
+  and `_rebuild_now` prunes them against `_page_sources`. Marked pages get a
+  red outline (`markbox` canvas tag, skipped under 2-up where display pages
+  and source pages aren't 1:1). `_remove_page` is gone.
+- **New `⇱ Export marked…` — split a document into A and B.** Tick pages, pick
+  one filename, and `App.export_pages()` writes `«name»-A.pdf` (marked) and
+  `«name»-B.pdf` (the rest); or just the marked pages as one file.
+  `_ask_export_split()` explains the choice, then the same output-style
+  (flatten) dialog Create PDF uses, then one save prompt. Nothing is removed
+  from the working document. The assembly logic came out of
+  `_build_for_signing_worker` into `App.assemble_from_cache(keep=...)`, now
+  shared by signing and export — Order, per-page flips, 2-up, Style and text
+  notes all apply.
+- **`✎ Add text` is a button, not a checkbox.** It arms a single placement
+  (`_toggle_text_mode` / `_sync_text_mode` / `_disarm_text_mode`): the label
+  flips to "✎ Click a page…", the cursor becomes a crosshair, and it disarms
+  itself once the note is placed or Esc is pressed. Selecting, editing,
+  dragging and deleting existing notes never required the mode and still
+  doesn't.
 - **New Editor tab** (`EditorTab`) — the scaffold for the multi-format page
   editor: pick a page, edit it, save, and that page is replaced in the
   document. The tab and its live page picker ship now; the editor itself is a
