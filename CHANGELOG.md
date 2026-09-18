@@ -1,5 +1,39 @@
 # Changelog
 
+## v1.65
+- **Tabs renamed for what they actually do.** `Pages` → **Files**,
+  `Preview` → **Preview Pages**, `Style` → **Add Style**. The tab labels now
+  live in the `TAB_FILES` / `TAB_PREVIEW` / `TAB_ORDER` / `TAB_STYLE` /
+  `TAB_EDITOR` constants so the "which tab is open?" checks can't drift from
+  the text on the tab. The file list's frame is now "Files (in order)".
+- **Paper size + Orientation moved to Preview Pages.** Both (plus the 2-up
+  coupler, which belongs with its side-by-side/stacked setting) now sit in two
+  rows above the preview canvas, so every click re-renders the page you're
+  looking at. The `size_var` / `orient_var` / `content_var` / `arrange_var` /
+  `nup_var` variables are still created in `App.__init__` (before `PreviewTab`
+  is built) so `_current_layout()` and the session restore keep working.
+- **Flatten is no longer a checkbox.** Create PDF now opens
+  `App._ask_output_style()` — a dialog that explains the two options in plain
+  English (flatten = smaller, identical everywhere, not editable; keep text =
+  selectable/searchable text, working links and form fields, bigger file) with
+  **Flatten preselected**. The per-document size estimate moved out of the old
+  under-checkbox label into `App._flatten_estimate_text()`, shown both in the
+  dialog and appended to the totals strip under the file list. The last choice
+  is remembered in `flatten_var` and persisted.
+- **The list starts empty every launch.** `_restore_session` no longer loads
+  the previous session's items — it parks them in `_prev_session_items` and
+  stashes a copy on disk under `previous_items` (`stash_previous_items()`,
+  preserved by `save_session_state`) so a new **↺ Restore last session** button
+  next to *Clear all* can put them back on demand. Files that were moved or
+  deleted in the meantime are reported rather than added as dead entries.
+- **✎ My Signatures moved to the top**, at the right-hand end of the tab strip
+  next to *Add Style*. Still a button, not a tab — `place()`d over the
+  notebook's top-right corner. Removed from the footer (Archive stays).
+- **New Editor tab** (`EditorTab`) — the scaffold for the multi-format page
+  editor: pick a page, edit it, save, and that page is replaced in the
+  document. The tab and its live page picker ship now; the editor itself is a
+  later release, and the button says so.
+
 ## v1.64
 - **Add text on the Preview** (fill forms / annotate). A new text tool on the
   Preview tab: tick "✎ Add text", click a page to place a note and type it

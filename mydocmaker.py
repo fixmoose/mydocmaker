@@ -104,12 +104,39 @@ except Exception:
     PIL_TK_OK = False
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.64"
+APP_VERSION = "1.65"
+
+# Notebook tab labels. Kept as constants so the "which tab is open?" checks
+# can never drift from the text shown on the tab itself.
+TAB_FILES = "Files"
+TAB_PREVIEW = "Preview Pages"
+TAB_ORDER = "Order"
+TAB_STYLE = "Add Style"
+TAB_EDITOR = "Editor"
 
 # Per-version "What's new" feed. The footer version label pops a dialog that
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65": [
+        "The 'Pages' tab is now 'Files', 'Preview' is 'Preview Pages' and "
+        "'Style' is 'Add Style' — the names now say what each tab does.",
+        "Paper size and Orientation moved onto the Preview Pages tab, right "
+        "above the page you're looking at, so every change shows up live as "
+        "you click it. (The 2-up switch moved with them, next to its "
+        "side-by-side / stacked setting.)",
+        "Flatten is no longer a checkbox you have to find. Click Create PDF "
+        "and MyDocMaker asks how to save it, explains the difference in plain "
+        "English, and has Flatten preselected.",
+        "The file list now starts empty every time you open the app — no "
+        "leftovers from last time. A new '↺ Restore last session' button next "
+        "to Clear all brings back what you had open.",
+        "✎ My Signatures moved to the top of the window, at the right-hand "
+        "end of the tab strip, instead of hiding in the footer.",
+        "New 'Editor' tab — pick a page, edit it, and have that page replaced "
+        "in your document. The tab and its page picker are in place now; the "
+        "editor itself lands in a coming release.",
+    ],
     "1.64": [
         "Add text right on the Preview — perfect for filling in forms or "
         "annotating a document. Tick '✎ Add text', click where you want it, "
@@ -2083,9 +2110,28 @@ def save_session_state(items, page_mode=None, flatten=None):
     # license-gate bookkeeping, future prefs) so a session save doesn't blow
     # them away.
     for k in ("archive_folder", "auto_update_check", "last_update_check",
-              "install_date", "last_license_check"):
+              "install_date", "last_license_check", "previous_items"):
         if k in existing:
             data[k] = existing[k]
+    try:
+        tmp = _state_file() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+        os.replace(tmp, _state_file())
+    except OSError:
+        pass
+
+
+def stash_previous_items(items_data):
+    """Park the previous session's item list under `previous_items` so the
+    Files tab's "Restore last session" button still works after this run has
+    saved its own (possibly empty) list over `items`. Best-effort."""
+    try:
+        with open(_state_file(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        data = {}
+    data["previous_items"] = list(items_data or [])
     try:
         tmp = _state_file() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
@@ -2104,7 +2150,11 @@ def load_session_state():
             data = json.load(f)
     except (OSError, ValueError):
         return [], None, None, 0
-    raw_items = data.get("items", []) or []
+    # v1.65: the app no longer auto-restores on launch, so `items` is what
+    # the PREVIOUS run had open and "Restore last session" is what puts it
+    # back. `previous_items` is the carry-over copy that survives this run's
+    # own saves, so the button keeps working once the user starts a new list.
+    raw_items = data.get("items") or data.get("previous_items") or []
     surviving = []
     dropped = 0
     for it in raw_items:
@@ -6094,9 +6144,38 @@ class PreviewTab:
         self._edit_widget = None       # inline Text editor while typing
         self._note_drag = None         # (note, start_cx, start_cy, moved)
 
+        # ----- Page-layout bar (v1.65)
+        # Paper size + Orientation moved here from the Files tab: changing
+        # them re-renders the preview immediately, so the user sees the effect
+        # on the actual page instead of having to switch tabs to check.
+        lbar = ttk.Frame(self.frame)
+        lbar.pack(fill="x", padx=8, pady=(8, 0))
+        ttk.Label(lbar, text="Paper size:").pack(side="left")
+        for _txt, _val in (("Original (images)", "original"), ("A4", "a4"),
+                           ("A3", "a3"), ("Letter", "letter"),
+                           ("11×17", "tabloid")):
+            ttk.Radiobutton(lbar, text=_txt, value=_val,
+                            variable=self.app.size_var,
+                            command=self.app._on_page_mode_changed
+                            ).pack(side="left", padx=4)
+
+        lbar2 = ttk.Frame(self.frame)
+        lbar2.pack(fill="x", padx=8, pady=(2, 0))
+        ttk.Label(lbar2, text="Orientation:").pack(side="left")
+        for _txt, _val in (("Portrait", "portrait"),
+                           ("Landscape", "landscape")):
+            ttk.Radiobutton(lbar2, text=_txt, value=_val,
+                            variable=self.app.orient_var,
+                            command=self.app._on_page_mode_changed
+                            ).pack(side="left", padx=4)
+        ttk.Checkbutton(
+            lbar2, text="2-up (2 pages per sheet)",
+            variable=self.app.nup_var, command=self.app._on_nup_changed,
+        ).pack(side="left", padx=(16, 0))
+
         # ----- Toolbar
         bar = ttk.Frame(self.frame)
-        bar.pack(fill="x", padx=8, pady=(8, 4))
+        bar.pack(fill="x", padx=8, pady=(4, 4))
 
         self.prev_btn = ttk.Button(bar, text="◀ Prev page",
                                    command=self._prev_page)
@@ -6115,7 +6194,7 @@ class PreviewTab:
         zoom_box.bind("<<ComboboxSelected>>", lambda e: self._on_zoom_changed())
 
         # Content orientation: how the original document sits on the sheet
-        # (separate from the paper orientation set on the Pages tab). Auto
+        # (separate from the paper Orientation set on the row above). Auto
         # rotates each page to best match the sheet.
         ttk.Label(bar, text="Content:").pack(side="left", padx=(20, 4))
         for _txt, _val in (("Auto", "auto"), ("Portrait", "portrait"),
@@ -6204,7 +6283,7 @@ class PreviewTab:
         #    up; ±120 per notch on Win, smaller on Mac)
         #  • Linux uses <Button-4> (up) / <Button-5> (down)
         # Bound only while pointer is over the canvas so it doesn't steal
-        # scroll from the Pages tab's listbox.
+        # scroll from the Files tab's listbox.
         self.canvas.bind("<Enter>", self._bind_wheel)
         self.canvas.bind("<Leave>", self._unbind_wheel)
 
@@ -6216,7 +6295,8 @@ class PreviewTab:
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
         self.canvas.bind_all("<Delete>", self._on_delete_key, add="+")
 
-        self._set_placeholder("Add some files in the Pages tab to see a preview here.")
+        self._set_placeholder(
+            f"Add some files in the {TAB_FILES} tab to see a preview here.")
 
     # ---- Public hooks called by App -------------------------------------
     def invalidate(self):
@@ -6241,7 +6321,8 @@ class PreviewTab:
     # ---- Internals ------------------------------------------------------
     def _is_active(self):
         try:
-            return self.app.notebook.tab(self.app.notebook.select(), "text") == "Preview"
+            return self.app.notebook.tab(
+                self.app.notebook.select(), "text") == TAB_PREVIEW
         except tk.TclError:
             return False
 
@@ -6264,7 +6345,7 @@ class PreviewTab:
         if not items:
             self._teardown_pdf()
             self._set_placeholder(
-                "Add some files in the Pages tab to see a preview here."
+                f"Add some files in the {TAB_FILES} tab to see a preview here."
             )
             return
 
@@ -6726,7 +6807,7 @@ class PreviewTab:
 
     def _on_delete_key(self, _event=None):
         # Only act when the Preview tab is active and a note is selected.
-        if (self.app._tab_is("Preview") and self._selected_note is not None
+        if (self.app._tab_is(TAB_PREVIEW) and self._selected_note is not None
                 and self._edit_widget is None):
             self._delete_selected()
 
@@ -6986,7 +7067,7 @@ class OrderTab:
     def on_show(self):
         """Called when the Order tab becomes visible. Always rebuilds so it
         can never show a stale layout — e.g. after the orientation/size was
-        changed on the Pages or Preview tab."""
+        changed on the Files or Preview Pages tab."""
         self.refresh()
 
     def _bind_wheel(self):
@@ -7052,8 +7133,8 @@ class OrderTab:
             if self.drag_mode.get() == "sheet":
                 self.drag_mode.set("page")
         flip_note = ("  Click ⟳ on a page to flip just that page — but "
-                     "Create the PDF now, as changing size/orientation in "
-                     "Pages or Preview clears per-page flips.")
+                     f"Create the PDF now, as changing size/orientation on "
+                     f"{TAB_PREVIEW} clears per-page flips.")
         if self._is_nup():
             self.hint_lbl.config(
                 text="2-up is on — each boxed row is one sheet (2 pages). "
@@ -7075,8 +7156,8 @@ class OrderTab:
             return
         if not ordered:
             self._set_placeholder(
-                "No pages yet — add files on the Pages tab, then drag the "
-                "thumbnails here to arrange them.")
+                f"No pages yet — add files on the {TAB_FILES} tab, then "
+                f"drag the thumbnails here to arrange them.")
             self._dirty = False
             return
 
@@ -7242,7 +7323,7 @@ class OrderTab:
             lbl.config(image=thumb)
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
-            if self.app._tab_is("Preview"):
+            if self.app._tab_is(TAB_PREVIEW):
                 self.app.preview.refresh_preview()
 
     def _slot_xy(self, idx):
@@ -7447,7 +7528,7 @@ class OrderTab:
         self._update_reset_btn()
         if changed and hasattr(self.app, "preview"):
             self.app.preview.invalidate()
-            if self.app._tab_is("Preview"):
+            if self.app._tab_is(TAB_PREVIEW):
                 self.app.preview.refresh_preview()
 
     # ---- reset / housekeeping --------------------------------------------
@@ -7457,7 +7538,7 @@ class OrderTab:
         self.refresh()
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
-            if self.app._tab_is("Preview"):
+            if self.app._tab_is(TAB_PREVIEW):
                 self.app.preview.refresh_preview()
 
     def _update_reset_btn(self):
@@ -7791,8 +7872,83 @@ class StyleTab:
         # Live update: the Preview is the WYSIWYG surface.
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
-            if self.app._tab_is("Preview"):
+            if self.app._tab_is(TAB_PREVIEW):
                 self.app.preview.refresh_preview()
+
+
+# ---------------------------------------------------------------------------
+# EditorTab (v1.65): scaffold for the multi-format page editor.
+#
+# The finished tool lets the user pick a single page, open it in an editor
+# that understands the page's original format (PDF, Word/Excel/PowerPoint,
+# image, plain text), change it, and save — at which point that page is
+# replaced inside the document being built. This release ships the tab and
+# the page picker so the workflow has a home and can be tried out; the editor
+# itself lands in a later version.
+# ---------------------------------------------------------------------------
+class EditorTab:
+    def __init__(self, parent, app):
+        self.app = app
+        self.frame = parent
+
+        ttk.Label(parent, text="Page editor",
+                  font=("", 13, "bold")).pack(anchor="w", padx=12,
+                                              pady=(12, 2))
+        ttk.Label(
+            parent, wraplength=640, justify="left", foreground="#444",
+            text="Pick a page, edit it, save — and that page is replaced in "
+                 "your document. Multi-format: PDFs, Word/Excel/PowerPoint, "
+                 "images and plain text.",
+        ).pack(anchor="w", padx=12, pady=(0, 8))
+
+        box = ttk.LabelFrame(parent, text="Pick a page to edit")
+        box.pack(fill="both", expand=True, padx=12, pady=(0, 8))
+        self.listbox = tk.Listbox(box, selectmode=tk.SINGLE,
+                                  activestyle="dotbox")
+        self.listbox.pack(side="left", fill="both", expand=True,
+                          padx=(8, 0), pady=8)
+        sb = ttk.Scrollbar(box, orient="vertical",
+                           command=self.listbox.yview)
+        sb.pack(side="left", fill="y", pady=8)
+        self.listbox.config(yscrollcommand=sb.set)
+        self.listbox.bind("<Double-Button-1>", lambda _e: self._not_yet())
+
+        row = ttk.Frame(parent)
+        row.pack(fill="x", padx=12, pady=(0, 6))
+        self.edit_btn = ttk.Button(row, text="✎ Edit this page…",
+                                   command=self._not_yet)
+        self.edit_btn.pack(side="left")
+        tip(self.edit_btn,
+            "Open the selected page in the editor, change it, and save — the "
+            "page in your document updates to match.")
+        ttk.Button(row, text="↻ Refresh list", command=self.on_show
+                   ).pack(side="left", padx=6)
+
+        ttk.Label(
+            parent, foreground="#7a4500", wraplength=640, justify="left",
+            text="Coming soon — the editor itself isn't wired up in this "
+                 "release. The list above already shows what you'll be able "
+                 "to edit.",
+        ).pack(anchor="w", padx=12, pady=(0, 12))
+
+    def on_show(self):
+        """Repopulate the picker from the current file list. Called on every
+        switch to this tab so it can never show a stale list."""
+        self.listbox.delete(0, tk.END)
+        for it in self.app.items:
+            self.listbox.insert(tk.END, it.label)
+        if not self.app.items:
+            self.listbox.insert(
+                tk.END,
+                f"(nothing added yet — add files on the {TAB_FILES} tab)")
+
+    def _not_yet(self):
+        messagebox.showinfo(
+            APP_NAME,
+            "The page editor is on its way.\n\n"
+            "When it lands you'll pick a page here, edit it in place, and "
+            "save — the page in your document updates to match.",
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -7843,7 +7999,7 @@ class App:
         pad = {"padx": 10, "pady": 6}
 
         # --- Header --------------------------------------------------------
-        # The brand logo lives in the bottom-right of the Pages tab (next to
+        # The brand logo lives in the bottom-right of the Files tab (next to
         # the add-source buttons), not the header — see the controls row
         # below. We keep its PhotoImage reference alive on self.
         self._brand_logo_ref = None
@@ -7882,7 +8038,7 @@ class App:
                 command=self.show_missing_components_dialog,
             ).pack(side="right")
 
-        # --- Tabbed UI: Pages | Preview -----------------------------------
+        # --- Tabbed UI: Files | Preview Pages | Order | Add Style | Editor --
         # The Notebook lets users flip between the page-list editor
         # (everything they had pre-v1.23) and a live preview of the
         # combined PDF. Create/Save buttons stay below the notebook so
@@ -7895,10 +8051,28 @@ class App:
         preview_tab = ttk.Frame(self.notebook)
         order_tab = ttk.Frame(self.notebook)
         style_tab = ttk.Frame(self.notebook)
-        self.notebook.add(pages_tab, text="Pages")
-        self.notebook.add(preview_tab, text="Preview")
-        self.notebook.add(order_tab, text="Order")
-        self.notebook.add(style_tab, text="Style")
+        editor_tab = ttk.Frame(self.notebook)
+        self.notebook.add(pages_tab, text=TAB_FILES)
+        self.notebook.add(preview_tab, text=TAB_PREVIEW)
+        self.notebook.add(order_tab, text=TAB_ORDER)
+        self.notebook.add(style_tab, text=TAB_STYLE)
+        self.notebook.add(editor_tab, text=TAB_EDITOR)
+
+        # v1.65: "My Signatures" is a button at the right-hand end of the tab
+        # strip rather than a footer button — it sits next to "Add Style", but
+        # it's an action, not a page, so it stays a button. place()d over the
+        # notebook's top-right corner so it lines up with the tabs.
+        self.my_sigs_btn = ttk.Button(
+            root, text="✎ My Signatures…",
+            command=self.show_my_signatures,
+        )
+        self.my_sigs_btn.place(in_=self.notebook, relx=1.0, x=-6, y=0,
+                               anchor="ne")
+        tip(self.my_sigs_btn,
+            "Create, edit and manage your saved signatures (typed, drawn, or a "
+            "full business stamp with logo). Set one up here before signing.")
+        if not SIGNING_OK:
+            self.my_sigs_btn.state(["disabled"])
 
         # --- URL capture row ----------------------------------------------
         urlframe = ttk.LabelFrame(pages_tab, text="Add a webpage (paste a link)")
@@ -7912,7 +8086,7 @@ class App:
             "your PDF (captured with its current layout).").pack(side="left", padx=8)
 
         # --- File list -----------------------------------------------------
-        listframe = ttk.LabelFrame(pages_tab, text="Pages (in order)")
+        listframe = ttk.LabelFrame(pages_tab, text="Files (in order)")
         listframe.pack(fill="both", expand=True, **pad)
 
         self.listbox = tk.Listbox(listframe, selectmode=tk.SINGLE,
@@ -8018,6 +8192,17 @@ class App:
             "on disk.").pack(side="left")
         tip(ttk.Button(btns, text="Clear all", command=self.clear_all),
             "Remove every file from the list and start over.").pack(side="left", padx=4)
+        # v1.65: the list starts empty every launch, so give the user an
+        # explicit way back to what they had open last time.
+        self.restore_session_btn = ttk.Button(
+            btns, text="↺ Restore last session",
+            command=self.restore_last_session,
+        )
+        self.restore_session_btn.pack(side="left")
+        self.restore_session_btn.state(["disabled"])
+        tip(self.restore_session_btn,
+            "MyDocMaker now starts with an empty list every time. Click here "
+            "to bring back the files you had open in your previous session.")
 
         # Add-from-source buttons. Their own line so the Scan button
         # doesn't get clipped on narrower windows.
@@ -8033,99 +8218,28 @@ class App:
         tip(ttk.Button(add_row, text="🖨 Scan", command=self.add_from_scanner),
             "Scan a page from a connected scanner directly into the list.").pack(side="left")
 
-        # --- Page size + Create -------------------------------------------
-        opt = ttk.Frame(left)
-        opt.pack(fill="x", **pad)
-        ttk.Label(opt, text="Paper size:").pack(side="left")
-        # Default page size: Letter for US/CA/MX/etc., A4 for the rest of
-        # the world. "Original (images)" stays user-selectable but is no
-        # longer the default — most users adding mixed content (PDFs,
-        # office docs, photos) get a more predictable result with a
-        # standard paper size.
+        # --- Page-layout state (the controls live on Preview Pages) -------
+        # v1.65: Paper size, Orientation and the 2-up coupler moved onto the
+        # Preview Pages tab so a change re-renders the page you're actually
+        # looking at, live. The variables are created here — before
+        # PreviewTab is built — so _current_layout() always has something to
+        # read, and so the session restore can set them.
+        #
+        #   size_var    = output sheet size (Original/A4/A3/Letter/11x17)
+        #   orient_var  = output SHEET orientation
+        #   content_var = how the original content sits on that sheet
+        #   arrange_var = 2-up side-by-side vs stacked
+        #   nup_var     = the 2-up coupler itself
         self.size_var = tk.StringVar(value=default_page_size())
-        ttk.Radiobutton(opt, text="Original (images)", value="original",
-                        variable=self.size_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-        ttk.Radiobutton(opt, text="A4", value="a4",
-                        variable=self.size_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-        ttk.Radiobutton(opt, text="A3", value="a3",
-                        variable=self.size_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-        ttk.Radiobutton(opt, text="Letter", value="letter",
-                        variable=self.size_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-        ttk.Radiobutton(opt, text="11×17", value="tabloid",
-                        variable=self.size_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-
-        # --- Paper orientation + 2-up coupler -----------------------------
-        # orient_var = the output SHEET orientation. content_var (set here so
-        # it always exists; its radios live in the Preview tab) = how the
-        # original content sits on the sheet. nup_var = the coupler.
-        self.content_var = tk.StringVar(value="auto")
-        # 2-up arrangement: "side" (left/right) or "stack" (top/bottom). Its
-        # radios live on the Preview tab's Content row; set here so it always
-        # exists before _current_layout / PreviewTab are first used.
-        self.arrange_var = tk.StringVar(value="side")
-        orient_row = ttk.Frame(left)
-        orient_row.pack(fill="x", **pad)
-        ttk.Label(orient_row, text="Orientation:").pack(side="left")
         self.orient_var = tk.StringVar(value="portrait")
-        ttk.Radiobutton(orient_row, text="Portrait", value="portrait",
-                        variable=self.orient_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
-        ttk.Radiobutton(orient_row, text="Landscape", value="landscape",
-                        variable=self.orient_var,
-                        command=self._on_page_mode_changed
-                        ).pack(side="left", padx=4)
+        self.content_var = tk.StringVar(value="auto")
+        self.arrange_var = tk.StringVar(value="side")
         self.nup_var = tk.BooleanVar(value=False)
-        ttk.Checkbutton(
-            orient_row, text="2-up (2 pages per sheet)",
-            variable=self.nup_var, command=self._on_nup_changed,
-        ).pack(side="left", padx=(16, 0))
 
-        # Flatten option — rasterizes pages into JPEG to shrink the output.
-        # v1.63: ON by default (when available) — most users want the compact,
-        # tamper-resistant flattened output; uncheck it to keep text selectable.
-        # Disabled if pypdfium2 isn't available (dev env missing the dep).
+        # Flatten is no longer a checkbox (v1.65) — Create PDF asks, with
+        # "Flatten" preselected and the trade-off spelled out. This variable
+        # just carries the answer from that dialog into the build worker.
         self.flatten_var = tk.BooleanVar(value=FLATTEN_OK)
-        flatten_text = "Flatten output (smaller file — page becomes image, text not selectable)"
-        if not FLATTEN_OK:
-            flatten_text = "Flatten output (unavailable — install pypdfium2)"
-        flatten_row = ttk.Frame(left)
-        flatten_row.pack(fill="x", **pad)
-        self.flatten_chk = ttk.Checkbutton(
-            flatten_row,
-            text=flatten_text,
-            variable=self.flatten_var,
-        )
-        if not FLATTEN_OK:
-            self.flatten_chk.state(["disabled"])
-        else:
-            tip(self.flatten_chk,
-                "On by default — pages become flat images, so the PDF is "
-                "smaller and can't be easily edited. Uncheck it to keep the "
-                "text, links and form fields selectable, but the file will be "
-                "much larger.")
-        self.flatten_chk.pack(anchor="w")
-
-        # Savings preview, sits right under the checkbox label so the
-        # user can see the trade-off they'd get from ticking it. Two
-        # lines if the message is long. Empty when the list is empty;
-        # populated by _update_totals (along with the under-listbox
-        # totals strip).
-        self.flatten_savings_lbl = ttk.Label(
-            flatten_row, text="", foreground="#0a5a16",
-            justify="left", wraplength=560,
-        )
-        self.flatten_savings_lbl.pack(anchor="w", padx=(24, 0))
 
         # --- Preview tab ---------------------------------------------------
         # PreviewTab assembles the combined PDF from per-item cached bytes
@@ -8141,6 +8255,10 @@ class App:
         # StyleTab (v1.55): watermark / page numbers / header-footer / Bates /
         # cover sheet. Writes into self.style and refreshes the preview live.
         self.style_tab = StyleTab(style_tab, self)
+
+        # EditorTab (v1.65): scaffold for the per-page editor. The tab and its
+        # page picker are live; the editor itself lands in a later release.
+        self.editor_tab = EditorTab(editor_tab, self)
 
         # Primary action row: Create PDF + (grayed-for-now) Sign and Create PDF.
         # Sign lights up in v1.26 when e-signature lands; today it just sits
@@ -8226,12 +8344,12 @@ class App:
             "About MyDocMaker, license terms (free for personal use), and "
             "commercial pricing.").pack(side="left", padx=(0, 6))
         tip(ttk.Button(center_btns, text="Close", command=self.root.destroy),
-            "Close MyDocMaker. Your current list is remembered for next "
-            "time.").pack(side="left")
+            "Close MyDocMaker. Your list is saved — next time, "
+            "“↺ Restore last session” on the Files tab brings "
+            "it back.").pack(side="left")
 
-        # v1.32+: My Signatures + (v1.45) Archive live in the footer's
-        # right column. Both are setup-once actions so they sit out of
-        # the way of the per-PDF workflow.
+        # v1.45: Archive lives in the footer's right column. It's a
+        # setup-once action so it sits out of the way of the per-PDF workflow.
         right_btns = ttk.Frame(foot)
         right_btns.grid(row=0, column=2, sticky="e")
         # The Archive button label changes based on whether a folder
@@ -8249,16 +8367,9 @@ class App:
             "you choose — a backup, separate from where you save them "
             "yourself.",
         )
-        self.my_sigs_btn = ttk.Button(
-            right_btns, text="✎ My Signatures…",
-            command=self.show_my_signatures,
-        )
-        self.my_sigs_btn.pack(side="left")
-        tip(self.my_sigs_btn,
-            "Create, edit and manage your saved signatures (typed, drawn, or a "
-            "full business stamp with logo). Set one up here before signing.")
-        if not SIGNING_OK:
-            self.my_sigs_btn.state(["disabled"])
+        # ✎ My Signatures used to live here; v1.65 moved it to the top of
+        # the window, at the right-hand end of the tab strip next to
+        # "Add Style", so it sits with the document-level actions.
         self._refresh_archive_button()
 
         # Poll the worker queue so background threads can update the UI safely.
@@ -8336,10 +8447,12 @@ class App:
             current = self.notebook.tab(self.notebook.select(), "text")
         except tk.TclError:
             return
-        if current == "Preview" and hasattr(self, "preview"):
+        if current == TAB_PREVIEW and hasattr(self, "preview"):
             self.preview.refresh_preview()
-        elif current == "Order" and hasattr(self, "order_tab"):
+        elif current == TAB_ORDER and hasattr(self, "order_tab"):
             self.order_tab.on_show()
+        elif current == TAB_EDITOR and hasattr(self, "editor_tab"):
+            self.editor_tab.on_show()
 
     def _current_layout(self):
         """Snapshot the page-layout controls into a PageLayout. Defensive so
@@ -8472,36 +8585,78 @@ class App:
             self._on_page_mode_changed()
 
     def _restore_session(self):
-        items_data, page_mode, flatten, dropped = load_session_state()
-        if items_data:
-            for it in items_data:
-                new_item = Item(
-                    it["kind"], it["value"], it["label"],
-                    size_bytes=it.get("size_bytes", 0),
-                    flat_pages_est=it.get("flat_pages_est", 1),
-                )
-                self.items.append(new_item)
-                # Cached PDF bytes are NOT persisted (in-memory only) — kick
-                # off background re-render so the Preview tab is populated
-                # without the user having to wait at Create-PDF time.
-                if hasattr(self, "_render_worker"):
-                    self._render_worker.enqueue(new_item)
-            self._refresh()
+        """v1.65: the list starts EMPTY on every launch — no leftovers from
+        last time. What the previous session had open is parked in memory
+        (and on disk under `previous_items`) so the Files tab's "Restore last
+        session" button can bring it back on demand. The paper-size pref is
+        still carried over — that's a setting, not content."""
+        items_data, page_mode, _flatten, dropped = load_session_state()
+        self._prev_session_items = items_data or []
+        self._restored_dropped = dropped
+        # Keep the carry-over copy on disk so the button still works after
+        # this run saves its own (empty, or brand-new) list over `items`.
+        stash_previous_items(self._prev_session_items)
         if page_mode in ("original", "a4", "letter"):
             self.size_var.set(page_mode)
-        if flatten is not None and FLATTEN_OK:
-            self.flatten_var.set(bool(flatten))
-        self._restored_dropped = dropped
-        n = len(self.items)
-        if n and dropped:
+        # `flatten` from the state file is the old v1.64 checkbox preference.
+        # v1.65 asks per build with Flatten preselected, so we deliberately
+        # don't restore it — a stale unchecked box shouldn't silently become
+        # the preselected answer forever.
+        n = len(self._prev_session_items)
+        if hasattr(self, "restore_session_btn"):
+            self.restore_session_btn.state(
+                ["!disabled"] if n else ["disabled"])
+        if n:
             self.status.config(
-                text=f"Restored {n} item(s) from last session "
-                     f"({dropped} missing file(s) were dropped)."
+                text=f"Starting with a clean list. "
+                     f"“↺ Restore last session” brings back "
+                     f"{n} item(s) from last time."
             )
-        elif n:
-            self.status.config(
-                text=f"Restored {n} item(s) from last session."
+
+    def restore_last_session(self):
+        """Put back the file list from the previous session. Items already in
+        the list are left alone, and files that have since been moved or
+        deleted are reported rather than added as dead entries."""
+        data = list(getattr(self, "_prev_session_items", []) or [])
+        if not data:
+            messagebox.showinfo(
+                APP_NAME, "There's no previous session to restore.")
+            return
+        present = {(it.kind, it.value) for it in self.items}
+        added = 0
+        missing = 0
+        for it in data:
+            key = (it.get("kind"), it.get("value"))
+            if key in present:
+                continue
+            if key[0] == "file" and not os.path.exists(key[1] or ""):
+                missing += 1
+                continue
+            new_item = Item(
+                it["kind"], it["value"], it["label"],
+                size_bytes=it.get("size_bytes", 0),
+                flat_pages_est=it.get("flat_pages_est", 1),
             )
+            self.items.append(new_item)
+            present.add(key)
+            added += 1
+            # Cached PDF bytes are NOT persisted (in-memory only) — kick off
+            # a background render so the Preview tab fills in without the
+            # user having to wait at Create-PDF time.
+            if hasattr(self, "_render_worker"):
+                self._render_worker.enqueue(new_item)
+        self._refresh()
+        if added:
+            msg = f"Restored {added} item(s) from your last session."
+            if missing:
+                msg += (f" {missing} file(s) no longer exist on disk and "
+                        f"were skipped.")
+        elif missing:
+            msg = (f"Nothing to restore — all {missing} file(s) from last "
+                   f"session have been moved or deleted.")
+        else:
+            msg = "Those items are already in the list."
+        self.status.config(text=msg)
 
     def _on_close(self):
         # Final flush before tearing down the window.
@@ -8808,62 +8963,52 @@ class App:
         self._schedule_save()
 
     def _update_totals(self):
-        """Recompute the two info strips:
-          • totals_lbl (under the page list): "N items · X MB on disk"
-          • flatten_savings_lbl (under the Flatten checkbox): the savings
-            estimate, so the trade-off lives right next to the toggle that
-            controls it.
-        Both are empty when the list is empty."""
+        """Recompute the totals strip under the file list: item count, size on
+        disk, and (v1.65) the flattened-size estimate that used to live under
+        the Flatten checkbox. Empty when the list is empty."""
         if not hasattr(self, "totals_lbl"):
             return
         n = len(self.items)
         if n == 0:
             self.totals_lbl.config(text="")
-            if hasattr(self, "flatten_savings_lbl"):
-                self.flatten_savings_lbl.config(text="")
             return
 
         total_bytes = sum(it.size_bytes for it in self.items)
-        flat_pages = sum(it.flat_pages_est for it in self.items)
-        flat_est = flat_pages * FLATTEN_BYTES_PER_PAGE_EST
-
         url_count = sum(1 for it in self.items if it.kind == "url")
         url_note = ""
         if url_count:
             # URLs have no pre-known size; total bytes excludes them.
             url_note = f"  (excludes {url_count} webpage)" if url_count == 1 \
                        else f"  (excludes {url_count} webpages)"
-
-        # Under-listbox strip — just count + on-disk total. The flatten
-        # estimate lives next to the Flatten checkbox now.
+        est = self._flatten_estimate_text()
         self.totals_lbl.config(
             text=f"{n} item{'' if n == 1 else 's'}  ·  "
                  f"{format_size(total_bytes)} on disk{url_note}"
+                 + (f"  ·  {est}" if est else "")
         )
 
-        # Next-to-checkbox savings estimate.
-        if hasattr(self, "flatten_savings_lbl"):
-            if total_bytes <= 0 and flat_est <= 0:
-                self.flatten_savings_lbl.config(text="")
-            elif flat_est < total_bytes:
-                pct = round(100 * (total_bytes - flat_est) / total_bytes)
-                self.flatten_savings_lbl.config(
-                    text=f"≈ {format_size(flat_est)} if flattened "
-                         f"(saves about {pct}%)",
-                    foreground="#0a5a16",
-                )
-            elif flat_est > total_bytes and total_bytes > 0:
-                # Text-heavy inputs flatten LARGER — explicitly warn.
-                self.flatten_savings_lbl.config(
-                    text=f"≈ {format_size(flat_est)} if flattened — would "
-                         f"grow the file, skip flatten for this set.",
-                    foreground="#7a4500",
-                )
-            else:
-                self.flatten_savings_lbl.config(
-                    text=f"≈ {format_size(flat_est)} if flattened",
-                    foreground="#0a5a16",
-                )
+    def _flatten_estimate_text(self):
+        """One-line "what flattening would do to the file size" estimate.
+        Shared by the totals strip and the Create-PDF output-style dialog, so
+        the trade-off reads the same in both places. "" when there's nothing
+        useful to say."""
+        if not self.items:
+            return ""
+        total_bytes = sum(it.size_bytes for it in self.items)
+        flat_est = (sum(it.flat_pages_est for it in self.items)
+                    * FLATTEN_BYTES_PER_PAGE_EST)
+        if total_bytes <= 0 and flat_est <= 0:
+            return ""
+        if flat_est < total_bytes:
+            pct = round(100 * (total_bytes - flat_est) / total_bytes)
+            return (f"≈ {format_size(flat_est)} if flattened "
+                    f"(saves about {pct}%)")
+        if flat_est > total_bytes and total_bytes > 0:
+            # Text-heavy inputs flatten LARGER — say so explicitly.
+            return (f"≈ {format_size(flat_est)} if flattened — that "
+                    f"would grow the file, so keeping the text is the better "
+                    f"pick for this set")
+        return f"≈ {format_size(flat_est)} if flattened"
 
     # --- Add from phone (QR upload) ------------------------------------------
     def add_from_phone(self):
@@ -9621,6 +9766,102 @@ class App:
             ),
         )
 
+    # --- Output style (flatten?) --------------------------------------------
+    def _ask_output_style(self):
+        """v1.65: Flatten stopped being a checkbox buried on the Files tab —
+        Create PDF asks here instead, so the choice gets made with the
+        finished document in mind and the trade-off spelled out.
+
+        Returns True (flatten), False (keep text) or None (user cancelled).
+        When pypdfium2 is unavailable there's no choice to make, so we
+        silently keep the text."""
+        if not FLATTEN_OK:
+            return False
+
+        win = tk.Toplevel(self.root)
+        win.title("How should this PDF be saved?")
+        win.transient(self.root)
+        win.resizable(False, False)
+        choice = {"value": None}
+        # Flatten is always the preselected answer — it's the right default for
+        # most documents, and the dialog is one click away from the other one.
+        # (Deliberately NOT sticky: a one-off "keep the text" for a contract
+        # shouldn't quietly turn flattening off for every later PDF.)
+        mode = tk.StringVar(value="flat")
+
+        ttk.Label(win, text="How should this PDF be saved?",
+                  font=("", 12, "bold")).pack(anchor="w", padx=16,
+                                              pady=(14, 2))
+        ttk.Label(
+            win, wraplength=520, justify="left", foreground="#444",
+            text="Both options give you the same-looking document — the "
+                 "difference is what's inside it.",
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        f1 = ttk.Frame(win)
+        f1.pack(fill="x", padx=16)
+        ttk.Radiobutton(f1, text="Flatten output  (recommended)",
+                        value="flat", variable=mode).pack(anchor="w")
+        ttk.Label(
+            f1, wraplength=500, justify="left", foreground="#555",
+            text="Every page becomes a flat picture. The file is usually much "
+                 "smaller, looks identical on every device, and nobody can "
+                 "edit the text, pull it out, or tamper with form fields.\n"
+                 "Trade-off: the text can no longer be selected, searched or "
+                 "read aloud by a screen reader, and links and fillable form "
+                 "fields stop working.",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 10))
+
+        f2 = ttk.Frame(win)
+        f2.pack(fill="x", padx=16)
+        ttk.Radiobutton(f2, text="Keep text and links",
+                        value="text", variable=mode).pack(anchor="w")
+        ttk.Label(
+            f2, wraplength=500, justify="left", foreground="#555",
+            text="The real text stays in the PDF, so it can be selected, "
+                 "searched, copied and read aloud, and links and form fields "
+                 "keep working.\n"
+                 "Trade-off: a noticeably bigger file, and anyone with a PDF "
+                 "editor can change or extract the content.",
+        ).pack(anchor="w", padx=(22, 0), pady=(0, 6))
+
+        est = self._flatten_estimate_text()
+        if est:
+            ttk.Label(win, text=f"For this document: {est}",
+                      foreground="#0a5a16", wraplength=500, justify="left"
+                      ).pack(anchor="w", padx=(38, 16), pady=(0, 4))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(10, 14))
+
+        def go():
+            choice["value"] = (mode.get() == "flat")
+            win.destroy()
+
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        ok_btn = ttk.Button(row, text="Continue", command=go)
+        ok_btn.pack(side="right", padx=(0, 8))
+        win.bind("<Return>", lambda _e: go())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            y = self.root.winfo_rooty() + 80
+            win.geometry(f"+{x}+{y}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        ok_btn.focus_set()
+        self.root.wait_window(win)
+
+        if choice["value"] is not None:
+            # Remember it for next time (and for the session file).
+            self.flatten_var.set(bool(choice["value"]))
+            self._schedule_save()
+        return choice["value"]
+
     # --- Build PDF (in a worker thread so the UI doesn't freeze) -------------
     def create_pdf(self, action="none"):
         """action: 'none' (just save), 'open' (open after save), 'print' (print)."""
@@ -9640,6 +9881,11 @@ class App:
             )
             if not proceed:
                 return
+        # Ask how to save it (flatten vs keep text) before picking a filename
+        # — decide what the file IS, then where it goes.
+        flatten_choice = self._ask_output_style()
+        if flatten_choice is None:
+            return
         out_path = filedialog.asksaveasfilename(
             title="Save PDF as", defaultextension=".pdf",
             initialdir=default_save_dir(),
@@ -9652,7 +9898,7 @@ class App:
         self.status.config(text="Working… (capturing webpages can take a few seconds)")
         self.progress.config(maximum=100, value=0)
         layout = self._current_layout()
-        flatten = bool(self.flatten_var.get() and FLATTEN_OK)
+        flatten = bool(flatten_choice and FLATTEN_OK)
         items_snapshot = list(self.items)
         excluded_snapshot = set(self.excluded_pages)
         threading.Thread(
@@ -9910,7 +10156,7 @@ class App:
                     # If the Order tab is the one on screen, rebuild it now so
                     # newly-rendered (or re-oriented) thumbnails appear live.
                     if (msg[0] == "item_rendered" and hasattr(self, "order_tab")
-                            and self._tab_is("Order")):
+                            and self._tab_is(TAB_ORDER)):
                         self.order_tab.refresh()
         except queue.Empty:
             pass
@@ -9936,7 +10182,7 @@ def _find_app_icon():
 
 def _find_app_logo():
     """Locate the brand logo (logoMDM.png) shown in the bottom-right of the
-    Pages tab. Bundled next to the executable via PyInstaller --add-data; in
+    Files tab. Bundled next to the executable via PyInstaller --add-data; in
     dev mode it sits beside this file. Returns None if not found (the UI
     simply omits the logo)."""
     candidates = []
