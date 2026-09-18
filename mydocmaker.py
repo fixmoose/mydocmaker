@@ -2340,7 +2340,13 @@ def detect_missing_components():
     """
     missing = []
     office_suites = detect_office_suites()
-    if not office_suites:
+    # Testing aid (v1.65): MYDOCMAKER_FORCE_COMPONENTS=1 shows the
+    # office-suite offer even when a suite is already installed, so the
+    # download-and-install path can be exercised on a machine that isn't
+    # bare. It only makes the offer appear — conversion still uses whatever
+    # is actually installed. Unlike MYDOCMAKER_SKIP_LICENSE this also works
+    # in a frozen build, because that's where the installer path matters.
+    if not office_suites or os.environ.get("MYDOCMAKER_FORCE_COMPONENTS"):
         # Nothing installed — suggest OnlyOffice DocumentBuilder as the
         # primary recommendation (best Microsoft-format fidelity of free
         # tools, scriptable for headless PDF export). LibreOffice is the

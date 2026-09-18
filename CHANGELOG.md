@@ -60,6 +60,11 @@
   supports Cancel, and hands the file to the system installer. Any failure
   falls back to the upstream download page. Neither suite is bundled or
   redistributed — see THIRD-PARTY-LICENSES.md.
+- **Testing aid: `MYDOCMAKER_FORCE_COMPONENTS=1`** shows the office-suite
+  install offer even when a suite is already present, so the new Windows
+  download-and-install path can be exercised on a machine that isn't bare.
+  It only makes the offer appear; conversion still uses what's installed.
+  Unlike `MYDOCMAKER_SKIP_LICENSE` it also works in a frozen build.
 - **Fixed: one bad queue message could kill every background update.**
   `_poll_queue` rescheduled itself *outside* its `try` and caught only
   `queue.Empty`, so an exception in any handler stopped the `after()` chain
