@@ -39,6 +39,7 @@ import queue
 import random
 import urllib.request
 import urllib.error
+import zipfile
 import uuid
 import webbrowser
 import traceback
@@ -128,7 +129,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.2"
+APP_VERSION = "1.65.3"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -142,6 +143,24 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.3": [
+        "Save your work as a project. 💾 Save MyDoc writes a .mydoc holding "
+        "everything — your files, the page order, hidden pages, the text you "
+        "typed, Editor removals, styling and the log — and 📂 Open MyDoc "
+        "picks it straight back up. Copies of your actual files go inside it, "
+        "so a project still works even if the originals are moved or deleted.",
+        "Closing now offers three real choices instead of two that did the "
+        "same thing: save your progress, close and lose it, or go back.",
+        "A progress bar while a project saves, so you can see the wait is the "
+        "save and not a freeze.",
+        "Startup says what it's doing — checking your licence, loading, "
+        "setting up — instead of leaving you with a spinning cursor.",
+        "New ⚙ Settings, with the Archive folder moved into it and controls "
+        "for the activity log. The log lives inside your .mydoc, so reopening "
+        "a project carries on the same record rather than starting over.",
+        "The window can no longer be shrunk far enough to push the Create "
+        "button or the progress bar off the bottom edge.",
+    ],
     "1.65.2": [
         "Zoom moved to the bottom-right, below the page, and got a lot "
         "smoother — dragging the slider no longer redraws every page as you "
@@ -2388,6 +2407,183 @@ def archive_signed_pdf(signed_pdf_path, audit_path=None):
             except OSError:
                 pass
         return archive_path
+    except Exception:
+        return None
+
+
+# ---------------------------------------------------------------------------
+# .mydoc project files (v1.65.3)
+#
+# A .mydoc is the whole working state — which files, in what order, which
+# pages are hidden or rotated, the text you typed, the Editor removals, the
+# styling, and the activity log — so you can stop mid-job and pick it up next
+# time. It does NOT embed the source files; it points at them, so a .mydoc
+# stays small and always reflects the current contents of those files.
+#
+# Per-page state is keyed in memory by Item.uid, which is regenerated every
+# run. On save those keys are rewritten as the item's INDEX in the list, and
+# on load they're mapped back onto the new uids — otherwise nothing would
+# line up after a restart.
+# ---------------------------------------------------------------------------
+MYDOC_EXT = ".mydoc"
+MYDOC_FORMAT = 2          # 2 = zip container with the source files inside
+MYDOC_MANIFEST = "project.json"
+MYDOC_FILEDIR = "files/"
+
+
+def _style_to_dict(style):
+    out = {}
+    for name in StyleSettings.__slots__:
+        val = getattr(style, name, None)
+        if name == "wm_image_bytes":
+            out[name] = base64.b64encode(val).decode("ascii") if val else None
+        else:
+            out[name] = val
+    return out
+
+
+def _style_from_dict(data, style):
+    for name in StyleSettings.__slots__:
+        if name not in data:
+            continue
+        val = data[name]
+        if name == "wm_image_bytes" and val:
+            try:
+                val = base64.b64decode(val)
+            except Exception:
+                val = None
+        setattr(style, name, val)
+    return style
+
+
+def build_project_data(app):
+    """Snapshot everything needed to resume this document later."""
+    idx_of = {it.uid: i for i, it in enumerate(app.items)}
+
+    def rekey(mapping):
+        out = {}
+        for (uid, page), val in mapping.items():
+            if uid in idx_of:
+                out[f"{idx_of[uid]}:{page}"] = val
+        return out
+
+    return {
+        "format": MYDOC_FORMAT,
+        "app_version": APP_VERSION,
+        "saved_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "items": [
+            {"kind": it.kind, "value": it.value, "label": it.label,
+             "size_bytes": getattr(it, "size_bytes", 0),
+             "flat_pages_est": getattr(it, "flat_pages_est", 1)}
+            for it in app.items
+        ],
+        "excluded_pages": [f"{idx_of[u]}:{p}" for (u, p) in app.excluded_pages
+                           if u in idx_of],
+        "page_order": [f"{idx_of[u]}:{p}" for (u, p) in app.page_order
+                       if u in idx_of],
+        "page_rotate": rekey(app.page_rotate),
+        "page_edits": rekey(app.page_edits),
+        "text_notes": [dict(n) for n in app.text_notes],
+        "style": _style_to_dict(app.style),
+        "layout": {
+            "size": app.size_var.get(), "orient": app.orient_var.get(),
+            "content": app.content_var.get(), "arrange": app.arrange_var.get(),
+            "nup": bool(app.nup_var.get()),
+        },
+        # The full log travels inside the project, so reopening a .mydoc
+        # continues the same record rather than starting a new one. That is
+        # also why a separate .log file is off by default — one file, not two.
+        "log": list(getattr(app, "activity_log", [])),
+    }
+
+
+def prepare_project_save(app):
+    """Gather everything the save needs, on the UI thread (it reads Tk
+    variables). Returns (manifest, [(source_path, arcname), ...])."""
+    data = build_project_data(app)
+    payload = []
+    for i, it in enumerate(app.items):
+        arc = None
+        if it.kind == "file" and os.path.exists(it.value):
+            arc = f"{MYDOC_FILEDIR}{i:04d}_{os.path.basename(it.value)}"
+            payload.append((it.value, arc))
+        data["items"][i]["embedded"] = arc
+    return data, payload
+
+
+def write_project(data, payload, path, progress=None):
+    """Write the .mydoc zip. Safe to call from a worker thread.
+
+    The file holds the manifest AND a copy of every source file, so a project
+    survives the originals being moved, renamed or deleted. Zip rather than
+    JSON-with-base64: no 33% encoding bloat, and anything compressible gets
+    compressed. Copying real files is why this can take a moment, hence the
+    progress callback."""
+    tmp = path + ".tmp"
+    total = len(payload) + 1
+    try:
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(MYDOC_MANIFEST, json.dumps(data, indent=2))
+            if progress:
+                progress(1, total, "project details")
+            for n, (src, arc) in enumerate(payload, start=2):
+                zf.write(src, arc)
+                if progress:
+                    progress(n, total, os.path.basename(src))
+        os.replace(tmp, path)
+        return True, path
+    except Exception as e:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False, str(e)
+
+
+def save_project(app, path, progress=None):
+    """Convenience wrapper — builds and writes in one go (used by autosave
+    and by tests)."""
+    data, payload = prepare_project_save(app)
+    return write_project(data, payload, path, progress=progress)
+
+
+def load_project(path):
+    """Read a .mydoc back. Returns (data, error_message). `data["_archive"]`
+    is the path to the container so the embedded copies can be recovered."""
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as zf:
+                data = json.loads(zf.read(MYDOC_MANIFEST).decode("utf-8"))
+            data["_archive"] = path
+        else:
+            # Format 1 was plain JSON with no embedded files.
+            with open(path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            data["_archive"] = None
+    except (OSError, ValueError, KeyError, zipfile.BadZipFile) as e:
+        return None, f"Couldn't read that file: {e}"
+    if not isinstance(data, dict) or "items" not in data:
+        return None, "That doesn't look like a MyDocMaker project file."
+    if int(data.get("format", 0)) > MYDOC_FORMAT:
+        return None, (f"That project was saved by a newer version "
+                      f"(v{data.get('app_version', '?')}). Update first.")
+    return data, None
+
+
+def recover_embedded_file(archive, arcname, project_path):
+    """Pull one embedded source out of a .mydoc into a recovery folder next
+    to the app's own state, and hand back the new path."""
+    if not archive or not arcname:
+        return None
+    try:
+        stem = os.path.splitext(os.path.basename(project_path or "project"))[0]
+        outdir = os.path.join(_state_dir(), "recovered", stem)
+        os.makedirs(outdir, exist_ok=True)
+        dest = os.path.join(outdir, os.path.basename(arcname))
+        with zipfile.ZipFile(archive) as zf, open(dest, "wb") as fh:
+            fh.write(zf.read(arcname))
+        return dest
     except Exception:
         return None
 
@@ -7880,6 +8076,7 @@ class PreviewTab:
         build honour. Reversible via "Restore hidden pages"."""
         if not self._marked:
             return
+        self.app.log(f"Removed {len(self._marked)} page(s) from the document.")
         self.app.excluded_pages.update(self._marked)
         self._marked.clear()
         # Rebuild immediately so the pages disappear and numbering updates.
@@ -9401,6 +9598,9 @@ class EditorTab:
             return
         # One rectangle per contiguous run keeps the output tidy.
         boxes = [self._chars[i][1:] for i in sorted(self._sel)]
+        picked = "".join(self._chars[i][0] for i in sorted(self._sel))[:60]
+        self.app.log(f"Editor: deleted {len(boxes)} character(s) "
+                     f"({picked!r}) from a page.")
         self._edits()["redactions"].extend(
             [tuple(round(v, 2) for v in b) for b in boxes])
         self._sel = set()
@@ -9415,6 +9615,7 @@ class EditorTab:
         cleared = self._edits()["cleared_fields"]
         if name not in cleared:
             cleared.append(name)
+        self.app.log(f"Editor: cleared form field {name!r}.")
         self.app._doc_dirty = True
         self._after_edit()
 
@@ -9446,6 +9647,61 @@ class EditorTab:
             self.app.preview.invalidate()
 
 
+class Splash:
+    """A small 'we're working on it' window for the launch sequence.
+
+    Startup does real work — a licence check over the network, then building
+    five tabs' worth of widgets — during which the main window doesn't exist
+    yet and the desktop just shows a spinning cursor. That looks indis-
+    tinguishable from a hang. This says what's actually happening."""
+
+    def __init__(self, root):
+        self.win = None
+        try:
+            self.win = tk.Toplevel(root)
+            self.win.overrideredirect(True)     # no title bar; it's transient
+            self.win.configure(background="#ffffff")
+            frame = tk.Frame(self.win, background="#ffffff", padx=26, pady=18)
+            frame.pack()
+            tk.Label(frame, text=APP_NAME, background="#ffffff",
+                     font=("", 15, "bold")).pack()
+            tk.Label(frame, text=f"version {APP_VERSION}", background="#ffffff",
+                     foreground="#777", font=("", 9)).pack(pady=(0, 10))
+            self.msg = tk.Label(frame, text="Starting…", background="#ffffff",
+                                foreground="#333", width=30)
+            self.msg.pack()
+            self.bar = ttk.Progressbar(frame, mode="indeterminate", length=230)
+            self.bar.pack(pady=(8, 0))
+            self.bar.start(12)
+            self.win.update_idletasks()
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            w, h = self.win.winfo_width(), self.win.winfo_height()
+            self.win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+            self.win.update()
+        except Exception:
+            self.win = None
+
+    def set(self, text):
+        if self.win is None:
+            return
+        try:
+            self.msg.config(text=text)
+            self.win.update()
+        except tk.TclError:
+            self.win = None
+
+    def close(self):
+        if self.win is None:
+            return
+        try:
+            self.bar.stop()
+            self.win.destroy()
+        except tk.TclError:
+            pass
+        self.win = None
+
+
 # ---------------------------------------------------------------------------
 # The application window
 # ---------------------------------------------------------------------------
@@ -9461,6 +9717,11 @@ class App:
         # True once the document has changed without being written out; drives
         # the "you haven't created this yet" prompt on close.
         self._doc_dirty = False
+        # Activity log — what the user did, in order. Written beside the
+        # output as a .log when enabled, and carried inside a .mydoc so the
+        # record survives with the project.
+        self.activity_log = []
+        self.project_path = None       # the .mydoc this document came from
         # Editor-tab edits, keyed like excluded_pages by (item.uid, local_idx):
         # {"redactions": [(x0,y0,x1,y1)...], "cleared_fields": [name...]}
         self.page_edits = {}
@@ -9550,11 +9811,29 @@ class App:
         # (everything they had pre-v1.23) and a live preview of the
         # combined PDF. Create/Save buttons stay below the notebook so
         # they're always accessible regardless of which tab is open.
-        # Row above the notebook for document-level actions (My Signatures).
+        # Row above the notebook for document-level actions.
         topbar = ttk.Frame(root)
         topbar.pack(fill="x", padx=10, pady=(4, 0))
+        tip(ttk.Button(topbar, text="📂 Open MyDoc…",
+                       command=self.open_project),
+            "Open a saved .mydoc project and carry on where you left off."
+            ).pack(side="left")
+        tip(ttk.Button(topbar, text="💾 Save MyDoc",
+                       command=self.save_project_quick),
+            "Save this whole working document — files, order, text, edits and "
+            "styling — as a .mydoc you can reopen later."
+            ).pack(side="left", padx=4)
 
         _dbg("notebook")
+        # The fixed chrome along the bottom — Create MyDoc, the status line,
+        # the progress bar and the footer — is packed BEFORE the notebook, so
+        # the packer reserves its space first and the notebook (expand=True)
+        # only gets what's left. Without this, dragging the window smaller
+        # pushes the Create button and progress bar clean off the bottom edge,
+        # and no minsize can reliably prevent it.
+        self._chrome = ttk.Frame(root)
+        self._chrome.pack(side="bottom", fill="x")
+
         self.notebook = ttk.Notebook(root)
         self.notebook.pack(fill="both", expand=True, padx=10, pady=(2, 4))
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -9798,7 +10077,7 @@ class App:
         # Create / Create and open / Create and print) were the same build
         # with a different tail, so the choice now lives in two small
         # dialogs: what to make, then what to do with it.
-        create_row = ttk.Frame(root)
+        create_row = ttk.Frame(self._chrome)
         create_row.pack(fill="x", **pad)
         # This is the point of the whole app, so it shouldn't look like
         # every other button on the window.
@@ -9819,20 +10098,21 @@ class App:
             "pick the format next — PDF, images, Word, web page or plain "
             "text — and what to do with it once it's saved.")
 
-        self.status = ttk.Label(root, text="Ready. Drop files or paste a URL to begin.",
+        self.status = ttk.Label(self._chrome,
+                                text="Ready. Drop files or paste a URL to begin.",
                                 foreground="#444")
         self.status.pack(anchor="w", padx=10, pady=(0, 4))
 
         # Always-present progress bar — sits at 0 when idle, fills during a
         # flatten pass so the user can see the page-by-page progress.
-        self.progress = ttk.Progressbar(root, mode="determinate")
+        self.progress = ttk.Progressbar(self._chrome, mode="determinate")
         self.progress.pack(fill="x", padx=10, pady=(0, 4))
 
         # Footer: clickable version on the left (opens "What's new" dialog),
         # Check-for-updates + Close centered. We use grid with weighted side
         # columns so the middle column is truly centered regardless of the
         # version label's width.
-        foot = ttk.Frame(root)
+        foot = ttk.Frame(self._chrome)
         foot.pack(fill="x", padx=10, pady=(0, 8))
         foot.columnconfigure(0, weight=1)
         foot.columnconfigure(1, weight=0)
@@ -9873,17 +10153,10 @@ class App:
         # has been configured — "▼ Set up Archive…" until first use,
         # then just "▼ Archive". _refresh_archive_button keeps it in
         # sync.
-        self.archive_btn = ttk.Button(
-            right_btns, text="▼ Archive",
-            command=self.show_archive_dialog,
-        )
-        self.archive_btn.pack(side="left", padx=(0, 6))
-        Tooltip(
-            self.archive_btn,
-            "Auto-save flattened copies of every signed PDF to a folder "
-            "you choose — a backup, separate from where you save them "
-            "yourself.",
-        )
+        tip(ttk.Button(right_btns, text="⚙ Settings",
+                       command=self.show_settings_dialog),
+            "Logging, archive folder and other preferences."
+            ).pack(side="left", padx=(0, 6))
         # ✎ My Signatures used to live here; v1.65 moved it to the top of
         # the window, at the right-hand end of the tab strip next to
         # "Add Style", so it sits with the document-level actions.
@@ -9935,10 +10208,24 @@ class App:
             # clip a button/control — but the wrapping toolbars keep tabs slim.
             content_w = min(req_w + 16, screen_w - 40)
             start_w = max(700, content_w)
-            start_h = 720
-            # Floor the MIN size at the content size so the window can never be
-            # shrunk small enough to clip a clickable control.
-            root.minsize(max(680, content_w), 620)
+
+            # Minimum HEIGHT is computed, not guessed: everything below the
+            # notebook (Create MyDoc, the status line, the progress bar and
+            # the footer) is fixed-height chrome, and the notebook is the only
+            # part that can give ground. Take the window's full requirement,
+            # subtract what the notebook wants, and leave it a usable floor —
+            # so the window can never be dragged small enough to push the
+            # Create button or the progress bar off-screen.
+            MIN_NOTEBOOK_H = 240
+            # Sum every direct child of the window except the notebook: those
+            # are all fixed-height chrome (Create MyDoc, status, progress bar,
+            # footer). Measuring them directly is the only reliable way — the
+            # root's own reqheight already assumes the notebook's full size.
+            chrome_h = (self._chrome.winfo_reqheight()
+                        + topbar.winfo_reqheight() + 24)
+            min_h = min(chrome_h + MIN_NOTEBOOK_H, screen_h - 80)
+            start_h = min(max(720, min_h), screen_h - 60)
+            root.minsize(max(680, content_w), int(min_h))
             # Center on screen (top third vertically — looks better than dead
             # center on tall displays) instead of letting the WM drop it at 0,0.
             x = max(0, (screen_w - start_w) // 2)
@@ -9973,6 +10260,230 @@ class App:
             self.order_tab.on_show()
         elif current == TAB_EDITOR and hasattr(self, "editor_tab"):
             self.editor_tab.on_show()
+
+    # --- Activity log --------------------------------------------------------
+    def log(self, message):
+        """Record one step. Cheap, always on in memory; whether it reaches a
+        file is a Settings choice."""
+        try:
+            if _get_pref("logging_enabled", True) is False:
+                return
+            stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.activity_log.append(f"{stamp}  {message}")
+            del self.activity_log[:-2000]
+        except Exception:
+            pass
+
+    def _write_log_file(self, out_path):
+        """Drop a .log next to the finished document, when Settings allow."""
+        try:
+            if not _get_pref("log_file_enabled", False):
+                return None
+            if not self.activity_log:
+                return None
+            base = out_path[:-4] if out_path.lower().endswith(".pdf") else out_path
+            log_path = base + ".log"
+            with open(log_path, "w", encoding="utf-8") as fh:
+                fh.write(f"{APP_NAME} v{APP_VERSION} — activity log\n")
+                fh.write(f"Document: {os.path.basename(out_path)}\n")
+                fh.write("=" * 60 + "\n")
+                fh.write("\n".join(self.activity_log) + "\n")
+            return log_path
+        except Exception:
+            return None
+
+    # --- .mydoc projects -----------------------------------------------------
+    def save_project_as(self, path=None, then=None):
+        """Save the working state so it can be resumed later.
+
+        `then`: "close" to shut the app down once the save actually finishes —
+        the write is asynchronous, so closing immediately would truncate it."""
+        if path is None:
+            path = filedialog.asksaveasfilename(
+                title="Save project as", defaultextension=MYDOC_EXT,
+                initialdir=default_save_dir(),
+                initialfile=f"project-{random.randint(1000, 9999)}{MYDOC_EXT}",
+                filetypes=[("MyDocMaker project", f"*{MYDOC_EXT}")],
+            )
+            if not path:
+                return False
+        # Copying the source files into the project is real work, so it runs
+        # off the UI thread and drives the footer bar — otherwise a big job
+        # looks like a freeze.
+        data, payload = prepare_project_save(self)
+        self._set_busy(True)
+        self.progress.config(maximum=len(payload) + 1, value=0)
+        self.status.config(text="Saving project…")
+
+        def worker():
+            ok, msg = write_project(
+                data, payload, path,
+                progress=lambda d, t, lbl: self.work_queue.put(
+                    ("project_progress", d, t, lbl)),
+            )
+            self.work_queue.put(("project_saved", ok, msg, path, then))
+
+        threading.Thread(target=worker, daemon=True).start()
+        return True
+
+    def save_project_quick(self):
+        """Save over the project this document came from, or ask if new."""
+        if self.project_path:
+            return self.save_project_as(self.project_path)
+        return self.save_project_as()
+
+    def _on_project_saved(self, ok, msg, path, then):
+        """Back on the UI thread once the zip is written."""
+        self._set_busy(False)
+        self.progress.config(value=0)
+        if not ok:
+            self.status.config(text="Project save failed.")
+            messagebox.showwarning(APP_NAME,
+                                   f"Couldn't save the project:\n{msg}")
+            return
+        self.project_path = path
+        self._doc_dirty = False
+        self.log(f"Saved project: {os.path.basename(path)}")
+        size = ""
+        try:
+            size = f"  ({format_size(os.path.getsize(path))})"
+        except OSError:
+            pass
+        self.status.config(
+            text=f"Project saved: {os.path.basename(path)}{size}")
+        if then == "close":
+            self._finish_close()
+
+    def open_project(self, path=None):
+        if path is None:
+            path = filedialog.askopenfilename(
+                title="Open project", initialdir=default_save_dir(),
+                filetypes=[("MyDocMaker project", f"*{MYDOC_EXT}"),
+                           ("All files", "*.*")],
+            )
+            if not path:
+                return False
+        data, err = load_project(path)
+        if err:
+            messagebox.showwarning(APP_NAME, err)
+            return False
+        data["_path"] = path
+        self.apply_project(data)
+        self.project_path = path
+        self._doc_dirty = False
+        self.log(f"Opened project: {os.path.basename(path)}")
+        self.status.config(
+            text=f"Opened {os.path.basename(path)} — "
+                 f"{len(self.items)} item(s) restored.")
+        return True
+
+    def apply_project(self, data):
+        """Rebuild the whole working state from a .mydoc payload."""
+        self.items.clear()
+        self.excluded_pages.clear()
+        self.page_order.clear()
+        self.page_rotate.clear()
+        self.page_edits.clear()
+        self.text_notes.clear()
+
+        archive = data.get("_archive")
+        recovered = 0
+        still_missing = 0
+        for entry in data.get("items", []):
+            value = entry["value"]
+            if entry.get("kind") == "file" and not os.path.exists(value):
+                # The original is gone — restore the copy kept inside the
+                # project. That is the whole point of embedding them.
+                new_path = recover_embedded_file(
+                    archive, entry.get("embedded"), data.get("_path"))
+                if new_path:
+                    value = new_path
+                    recovered += 1
+                else:
+                    still_missing += 1
+            self.items.append(Item(
+                entry["kind"], value, entry["label"],
+                size_bytes=entry.get("size_bytes", 0),
+                flat_pages_est=entry.get("flat_pages_est", 1)))
+
+        # "<index>:<page>" keys map back onto this run's fresh uids.
+        def unkey(token):
+            try:
+                i, p = str(token).split(":")
+                i, p = int(i), int(p)
+            except ValueError:
+                return None
+            if 0 <= i < len(self.items):
+                return (self.items[i].uid, p)
+            return None
+
+        for tok in data.get("excluded_pages", []):
+            k = unkey(tok)
+            if k:
+                self.excluded_pages.add(k)
+        for tok in data.get("page_order", []):
+            k = unkey(tok)
+            if k:
+                self.page_order.append(k)
+        for tok, val in (data.get("page_rotate") or {}).items():
+            k = unkey(tok)
+            if k:
+                self.page_rotate[k] = val
+        for tok, val in (data.get("page_edits") or {}).items():
+            k = unkey(tok)
+            if k:
+                self.page_edits[k] = val
+        self.text_notes.extend(dict(n) for n in data.get("text_notes", []))
+        _style_from_dict(data.get("style") or {}, self.style)
+        lay = data.get("layout") or {}
+        if lay.get("size"):
+            self.size_var.set(lay["size"])
+        if lay.get("orient"):
+            self.orient_var.set(lay["orient"])
+        if lay.get("content"):
+            self.content_var.set(lay["content"])
+        if lay.get("arrange"):
+            self.arrange_var.set(lay["arrange"])
+        self.nup_var.set(bool(lay.get("nup")))
+        self.activity_log = list(data.get("log") or [])
+
+        for it in self.items:
+            if hasattr(self, "_render_worker"):
+                self._render_worker.enqueue(it)
+        self._refresh()
+        if hasattr(self, "style_tab") and hasattr(self.style_tab, "reload"):
+            self.style_tab.reload()
+        if hasattr(self, "preview"):
+            self.preview.invalidate()
+        if recovered:
+            self.log(f"Recovered {recovered} missing source file(s) from the "
+                     f"project.")
+            messagebox.showinfo(
+                APP_NAME,
+                f"{recovered} of the original file(s) weren't where they used "
+                f"to be, so the copies saved inside the project were used "
+                f"instead. Nothing is lost.")
+        if still_missing:
+            messagebox.showwarning(
+                APP_NAME,
+                f"{still_missing} file(s) are missing and this project has no "
+                f"copy of them (it was saved before projects embedded their "
+                f"sources). They're listed but won't render.")
+        return True
+
+    def autosave_project(self):
+        """Keep a working copy in the app's own folder, so an unexpected exit
+        doesn't cost the session. Never touches the user's own files."""
+        try:
+            path = os.path.join(_state_dir(), "autosave" + MYDOC_EXT)
+            if not self.items:
+                if os.path.exists(path):
+                    os.remove(path)
+                return None
+            ok, _msg = save_project(self, path)
+            return path if ok else None
+        except Exception:
+            return None
 
     def _apply_layout_defaults(self):
         """Select the default paper size / orientation / content / 2-up
@@ -10203,28 +10714,66 @@ class App:
         self.status.config(text=msg)
 
     def _on_close(self):
-        """Don't let a closed window quietly throw away unfinished work.
+        """Three real choices, not two that do the same thing.
 
-        The page list survives (it's in the session file), but the *document*
-        — the text you typed on it, the pages you hid, the styling — only
-        becomes a real file when you Create it. Closing without doing that
-        used to lose it silently."""
-        if self._doc_dirty and self.items:
-            answer = messagebox.askyesnocancel(
-                APP_NAME,
-                "You haven't created a document from these "
-                f"{len(self.items)} item(s) yet.\n\n"
-                "Yes — create it now (this window stays open)\n"
-                "No — close and discard the unsaved work\n"
-                "Cancel — go back",
-                default=messagebox.YES,
-            )
-            if answer is None:          # Cancel → stay put
-                return
-            if answer:                  # Yes → build it, don't close
-                self.create_doc()
-                return
+        The previous version offered Yes/No/Cancel where Yes and Cancel both
+        just left the window open, so the prompt told you nothing. Now: keep
+        the work in a .mydoc you can reopen, throw it away, or go back."""
+        if not (self._doc_dirty and self.items):
+            self._finish_close()
+            return
+
+        win = tk.Toplevel(self.root)
+        win.title("Close MyDocMaker?")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        ttk.Label(win, text="You have unsaved progress",
+                  font=("", 12, "bold")).pack(anchor="w", padx=16, pady=(14, 4))
+        ttk.Label(
+            win, wraplength=460, justify="left", foreground="#444",
+            text=f"{len(self.items)} item(s) are set up, and you haven't "
+                 f"created a document from them yet. Your page order, text, "
+                 f"edits and styling only exist in this window.",
+        ).pack(anchor="w", padx=16, pady=(0, 12))
+
+        row = ttk.Frame(win)
+        row.pack(fill="x", padx=16, pady=(0, 14))
+
+        def do_save():
+            win.destroy()
+            # Closes itself once the write completes — see _on_project_saved.
+            self.save_project_as(then="close")
+
+        def do_discard():
+            win.destroy()
+            self.log("Closed without saving — progress discarded.")
+            self._finish_close()
+
+        save_btn = ttk.Button(row, text="Save progress…", command=do_save)
+        save_btn.pack(side="left")
+        tip(save_btn,
+            "Save everything — files, order, text, edits and styling — as a "
+            ".mydoc you can reopen and carry on with.")
+        tip(ttk.Button(row, text="Close and lose it", command=do_discard),
+            "Close now. Everything you set up in this window is gone."
+            ).pack(side="left", padx=6)
+        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+
+        win.protocol("WM_DELETE_WINDOW", win.destroy)
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{self.root.winfo_rooty() + 120}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+        save_btn.focus_set()
+
+    def _finish_close(self):
         self._save_state_now()
+        self.autosave_project()
         try:
             self.root.destroy()
         except tk.TclError:
@@ -10276,6 +10825,8 @@ class App:
                     too_large.append(p)
         if added:
             self._refresh()
+            self.log(f"Added {added} item(s) from {source}; "
+                     f"{len(self.items)} in the list.")
             self.status.config(
                 text=f"Added {added} item(s). Total: {len(self.items)}."
             )
@@ -11213,14 +11764,104 @@ class App:
 
     # ---- v1.45: Archive folder -----------------------------------------
     def _refresh_archive_button(self):
-        """Sync the Archive button label / tooltip with whether the
-        archive folder is configured. First-launch UX nudge: the
-        button reads 'Set up Archive…' until the user picks a folder."""
+        """No-op since v1.65.3 — the Archive button moved into Settings, but
+        several call sites still poke it."""
+        return
+
+    def show_settings_dialog(self):
+        """Preferences: logging, and the archive folder that used to have its
+        own footer button."""
+        win = tk.Toplevel(self.root)
+        win.title("Settings")
+        win.transient(self.root)
+        win.resizable(False, False)
+
+        ttk.Label(win, text="Settings", font=("", 13, "bold")
+                  ).pack(anchor="w", padx=16, pady=(14, 8))
+
+        lg = ttk.LabelFrame(win, text="Activity log")
+        lg.pack(fill="x", padx=16, pady=(0, 10))
+        log_on = tk.BooleanVar(value=bool(_get_pref("logging_enabled", True)))
+        file_on = tk.BooleanVar(value=bool(_get_pref("log_file_enabled", False)))
+
+        def sync():
+            _set_pref("logging_enabled", bool(log_on.get()))
+            _set_pref("log_file_enabled", bool(file_on.get()))
+            if log_on.get():
+                file_chk.state(["!disabled"])
+            else:
+                file_chk.state(["disabled"])
+
+        ttk.Checkbutton(
+            lg, text="Keep a log of what I do", variable=log_on,
+            command=sync).pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(
+            lg, wraplength=430, justify="left", foreground="#555",
+            text="Records each step — files added, pages removed, text "
+                 "placed, documents created. The log is stored inside your "
+                 ".mydoc project, so reopening one carries on the same "
+                 "record instead of starting over.",
+        ).pack(anchor="w", padx=(30, 10))
+        file_chk = ttk.Checkbutton(
+            lg, text="Also write a separate .log file beside each document",
+            variable=file_on, command=sync)
+        file_chk.pack(anchor="w", padx=10, pady=(6, 0))
+        ttk.Label(
+            lg, wraplength=430, justify="left", foreground="#555",
+            text="Off by default — the project file already holds the log, "
+                 "so there's no need for a second file unless you want one to "
+                 "hand to someone else.",
+        ).pack(anchor="w", padx=(30, 10), pady=(0, 8))
+        sync()
+
+        ar = ttk.LabelFrame(win, text="Archive")
+        ar.pack(fill="x", padx=16, pady=(0, 10))
         folder = _load_archive_folder()
-        if folder:
-            self.archive_btn.config(text="▼ Archive")
-        else:
-            self.archive_btn.config(text="▼ Set up Archive…")
+        ttk.Label(ar, wraplength=430, justify="left", foreground="#555",
+                  text="Auto-save a flattened copy of every signed PDF to a "
+                       "folder you choose — a backup, separate from where you "
+                       "save them yourself.").pack(anchor="w", padx=10,
+                                                   pady=(6, 4))
+        cur = ttk.Label(ar, foreground="#333",
+                        text=folder or "(not set up yet)")
+        cur.pack(anchor="w", padx=10)
+
+        def change_folder():
+            new = filedialog.askdirectory(title="Choose an archive folder")
+            if new:
+                _save_archive_folder(new)
+                cur.config(text=new)
+                self._refresh_archive_button()
+
+        ttk.Button(ar, text="Choose folder…", command=change_folder
+                   ).pack(anchor="w", padx=10, pady=(6, 8))
+
+        vw = ttk.Frame(win)
+        vw.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(vw, text="View current log",
+                   command=self.show_log_dialog).pack(side="left")
+        ttk.Button(vw, text="Close", command=win.destroy).pack(side="right")
+        win.update_idletasks()
+        try:
+            x = self.root.winfo_rootx() + max(
+                0, (self.root.winfo_width() - win.winfo_width()) // 2)
+            win.geometry(f"+{x}+{self.root.winfo_rooty() + 80}")
+        except tk.TclError:
+            pass
+        win.grab_set()
+
+    def show_log_dialog(self):
+        """Read-only view of what's been recorded so far."""
+        win = tk.Toplevel(self.root)
+        win.title("Activity log")
+        win.transient(self.root)
+        txt = tk.Text(win, width=88, height=24, wrap="none")
+        txt.pack(fill="both", expand=True, padx=10, pady=10)
+        txt.insert("1.0", "\n".join(self.activity_log)
+                   or "Nothing recorded yet.")
+        txt.config(state="disabled")
+        ttk.Button(win, text="Close", command=win.destroy
+                   ).pack(pady=(0, 10))
 
     def show_archive_dialog(self):
         """Either run the first-time folder picker or show the
@@ -12228,6 +12869,11 @@ class App:
                     self.status.config(
                         text=f"Done. Saved {pages} page(s).")
                     self._doc_dirty = False
+                    self.log(f"Created {os.path.basename(path)} "
+                             f"({pages} page(s)).")
+                    log_path = self._write_log_file(path)
+                    if log_path:
+                        text += f"\n\nActivity log: {os.path.basename(log_path)}"
                     # v1.65.1: what to do with the file is asked here rather
                     # than chosen up front by a dedicated button.
                     self._show_saved_dialog(path, text)
@@ -12260,6 +12906,13 @@ class App:
                     st = getattr(self, "_install_dialog", None)
                     if st is not None:
                         st["status_var"].set(msg[1])
+                elif msg[0] == "project_progress":
+                    _, done, total, label = msg
+                    self.progress.config(maximum=max(total, 1), value=done)
+                    self.status.config(
+                        text=f"Saving project… {done}/{total}  ({label})")
+                elif msg[0] == "project_saved":
+                    self._on_project_saved(msg[1], msg[2], msg[3], msg[4])
                 elif msg[0] == "suite_resolved":
                     self._on_suite_resolved(msg[1], msg[2])
                 elif msg[0] == "install_done":
@@ -12432,6 +13085,11 @@ def main():
     else:
         root = tk.Tk(className="mydocmaker")
 
+    # Something visible immediately: startup does a network licence check
+    # and builds five tabs, and until the main window exists the desktop
+    # shows nothing but a spinning cursor.
+    splash = Splash(root)
+
     # Set the window/taskbar icon early so the app's identity is right
     # before any other UI shows. iconphoto works on all three OSes;
     # Windows/macOS *additionally* read embedded .ico/.icns from the
@@ -12472,6 +13130,7 @@ def main():
                  and os.environ.get("MYDOCMAKER_SKIP_LICENSE"))
     if not _dev_skip:
         root.withdraw()   # keep the main window hidden until the check passes
+        splash.set("Checking your licence…")
         while True:
             online, lic_info = license_check()
             if online:
@@ -12495,8 +13154,10 @@ def main():
         # mainloop) so the user never sees an empty window during the check.
 
     _dbg("building App")
+    splash.set("Setting up the workspace…")
     app = App(root)
     _dbg("App built")
+    splash.set("Almost there…")
     if cli_paths:
         app.add_paths(cli_paths)
 
@@ -12520,6 +13181,7 @@ def main():
 
     # Reveal the window now that it's fully built (it was hidden during the
     # startup license check). No-op if it was never withdrawn.
+    splash.close()
     try:
         root.deiconify()
     except tk.TclError:

@@ -1,5 +1,41 @@
 # Changelog
 
+## v1.65.3
+- **`.mydoc` project files.** `Save MyDoc` / `Open MyDoc` (top-left) persist the
+  entire working state: items, page order, hidden pages, rotations, text notes,
+  Editor edits, style, layout and the activity log.
+  - The file is a **zip container** that embeds a copy of every source file, so
+    a project survives the originals being moved or deleted. Zip rather than
+    JSON-with-base64: no 33% encoding bloat, and compressible sources compress.
+    On open, an existing original wins (so later edits to it are picked up);
+    only a missing one is recovered from inside, and the user is told.
+  - Per-page state is keyed in memory by `Item.uid`, which is regenerated every
+    run, so keys are rewritten as the item's index on save and mapped back on
+    load — otherwise nothing would line up after a restart.
+  - Verified by a two-process playthrough: build + edit + save, then **delete
+    the source**, reopen in a fresh process, and confirm every piece of state
+    survived and the built output still had the deleted text removed and the
+    form field cleared.
+- **The close prompt offers three distinct actions.** The previous Yes/No/Cancel
+  had Yes and Cancel both leaving the window open, which told the user nothing.
+  Now: save progress to a `.mydoc`, close and discard, or go back. Saving waits
+  for the write to finish before closing rather than truncating it.
+- **Project saves run off the UI thread** with the footer progress bar showing
+  per-file progress (`prepare_project_save` on the UI thread since it reads Tk
+  variables, `write_project` on the worker).
+- **Startup shows progress.** `Splash` reports Checking your licence → Loading →
+  Setting up the workspace, instead of a bare spinning cursor while the licence
+  check and five tabs' worth of widgets are built.
+- **Settings dialog** with the Archive folder moved in from the footer, logging
+  controls and a log viewer. The log is stored inside the `.mydoc`, so a
+  separate `.log` file is off by default — one file, not two — and reopening a
+  project continues the same record.
+- **Fixed: the window could be shrunk until Create MyDoc and the progress bar
+  fell off the bottom.** The notebook was packed first with `expand=True`, so
+  the packer served it before the footer and no `minsize` could reliably help.
+  Bottom chrome now lives in a frame packed `side="bottom"` *before* the
+  notebook, and the minimum height is computed from it.
+
 ## v1.65.2
 - **Fixed: Editor deletions didn't show in Preview.** `PreviewTab._rebuild_now`
   built straight from `cached_pdf_bytes` and never consulted `page_edits`, so
