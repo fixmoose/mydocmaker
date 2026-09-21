@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.65.4
+- **Zoom no longer rasterises the whole document.** `_render_all_pages` drew
+  every page at the new scale before anything appeared — a 30-page file at 300%
+  meant 30 full-page bitmaps, hence the multi-second slider lag. Geometry now
+  comes from `get_size()` (cheap, so scrollbars are exact immediately) and only
+  pages in the viewport are rasterised, with `_render_visible()` filling in on
+  scroll. Measured on 30 pages: 2 bitmaps instead of 30, zoom 0.12s instead of
+  seconds.
+- **AutoCAD-style navigation.** The wheel always zooms and anchors on the
+  pointer (`_zoom_about_pointer` keeps the document point under the cursor
+  pinned); middle-button drag pans via `scan_mark`/`scan_dragto`. Replaces the
+  zoom-over-page / scroll-over-grey split, where the same gesture did two
+  different things depending on a few pixels of pointer position.
+- **Fixed: the Editor listed pages that had been deleted.** `EditorTab.on_show`
+  never consulted `excluded_pages`, so removing pages elsewhere left the Editor
+  offering a document that no longer existed. It now lists the live document and
+  numbers rows by finished-document page via the new
+  `App.display_index_for()` / `App.natural_keys()`.
+- **Add text in the Editor.** Text notes are keyed by finished-document page
+  while the Editor works on source pages; `display_index_for()` bridges the two
+  so a note placed in the Editor lands on the right output page and appears on
+  Preview Pages. Existing notes are drawn on the Editor canvas too.
+- **Committing text confirms itself** — the status line reports how many notes
+  are kept and that they survive a tab switch, answering the obvious worry in an
+  editor with no visible Save button.
+- Known limit, unchanged: the Editor removes text, it does not retype it in
+  place. Replacing words is delete-then-Add-text. True in-place editing needs
+  font recovery, glyph re-embedding and line re-flow.
+
 ## v1.65.3
 - **`.mydoc` project files.** `Save MyDoc` / `Open MyDoc` (top-left) persist the
   entire working state: items, page order, hidden pages, rotations, text notes,

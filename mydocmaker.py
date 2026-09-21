@@ -129,7 +129,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.3"
+APP_VERSION = "1.65.4"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -143,6 +143,23 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.4": [
+        "Zoom is fast now. It used to redraw every page in the document "
+        "before showing you anything, which is why the slider lagged for "
+        "seconds; it only draws what's on screen. On a 30-page file zooming "
+        "went from seconds to about a tenth of one.",
+        "Navigation works like a CAD program: the wheel always zooms, and it "
+        "zooms towards whatever is under your pointer. Hold the middle mouse "
+        "button to drag the page around. No more guessing whether the wheel "
+        "will zoom or scroll.",
+        "Fixed: the Editor still listed pages you'd deleted. It now shows the "
+        "document as it actually stands, numbered by document page.",
+        "The Editor has Add text too — handy right after deleting something. "
+        "Text you already placed shows up there as well, so both tabs finally "
+        "show the same document.",
+        "Finishing a piece of text now says so: you get a clear confirmation "
+        "that it's kept and will survive switching tabs.",
+    ],
     "1.65.3": [
         "Save your work as a project. 💾 Save MyDoc writes a .mydoc holding "
         "everything — your files, the page order, hidden pages, the text you "
@@ -6835,6 +6852,8 @@ class PreviewTab:
         # These map canvas clicks <-> PDF coordinates for placing notes.
         self._page_boxes = []
         self._page_render_scale = 1.0
+        self._page_photos = {}         # idx -> PhotoImage (only what's drawn)
+        self._page_items = {}          # idx -> canvas image id
         self._note_item_ids = {}       # canvas text id -> note dict
         self._selected_note = None
         self._edit_widget = None       # in-place edit state while typing
@@ -7064,6 +7083,10 @@ class PreviewTab:
         # scroll from the Files tab's listbox.
         self.canvas.bind("<Enter>", self._bind_wheel)
         self.canvas.bind("<Leave>", self._unbind_wheel)
+        # Middle-button drag pans, like every CAD and map app.
+        self.canvas.bind("<Button-2>", self._pan_start)
+        self.canvas.bind("<B2-Motion>", self._pan_move)
+        self.canvas.bind("<ButtonRelease-2>", self._pan_end)
 
         # Text-notes interactions (v1.64): click to add/select, drag to move,
         # double-click to edit, Delete to remove.
@@ -7311,10 +7334,12 @@ class PreviewTab:
                             else ["disabled"])
 
     def _on_yview(self, *args):
-        """Scrollbar callback — pass through to canvas then refresh the
-        page indicator."""
-        self.canvas.yview(*args)
+        """Scrollbar moved — fill in any page that just came into view."""
+        result = self.canvas.yview(*args)
+        self._render_visible()
         self._update_page_indicator()
+        return result
+
 
     def _prev_page(self):
         cur = self._current_visible_page()
@@ -7398,27 +7423,51 @@ class PreviewTab:
         self.canvas.unbind_all("<Button-4>")
         self.canvas.unbind_all("<Button-5>")
 
-    def _pointer_over_page(self, event):
-        """True when the pointer is on the document rather than the grey
-        workspace around it. Decides whether the wheel zooms or scrolls."""
-        try:
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
-        except tk.TclError:
-            return False
-        for (x, y, w, h) in self._page_boxes:
-            if w > 0 and h > 0 and x <= cx <= x + w and y <= cy <= y + h:
-                return True
-        return False
-
     def _wheel(self, event, direction):
-        """direction: -1 = up/away, +1 = down/toward."""
-        if self._pointer_over_page(event):
-            self._step_zoom(-direction * self.ZOOM_STEP)
-            return "break"
-        self.canvas.yview_scroll(direction * 3, "units")
-        self._update_page_indicator()
+        """AutoCAD-style: the wheel always zooms, and it zooms toward whatever
+        is under the pointer rather than the middle of the view. Panning is
+        the middle button. (The old behaviour — zoom over a page, scroll over
+        the grey — meant the same gesture did two different things depending
+        on a few pixels of pointer position.)
+
+        direction: -1 = wheel up = zoom in."""
+        factor = 1.0 / 1.15 if direction > 0 else 1.15
+        self._zoom_about_pointer(event, factor)
         return "break"
+
+    def _zoom_about_pointer(self, event, factor):
+        """Re-render at a new zoom, keeping the document point under the
+        pointer pinned where it is."""
+        old = self._page_render_scale or 1.0
+        new = max(self.ZOOM_MIN / 100.0,
+                  min(self.ZOOM_MAX / 100.0, old * factor))
+        if abs(new - old) < 1e-4:
+            return
+        try:
+            px, py = event.x, event.y            # pointer, widget coords
+            doc_x = self.canvas.canvasx(px)
+            doc_y = self.canvas.canvasy(py)
+        except (tk.TclError, AttributeError):
+            doc_x = doc_y = 0
+            px = py = 0
+
+        self._current_zoom = f"{int(round(new * 100))}%"
+        self.zoom_var.set(self._current_zoom)
+        self._render_all_pages()
+
+        # The same spot on the page should still sit under the cursor.
+        ratio = new / old
+        try:
+            x0, y0, x1, y1 = [float(v) for v in
+                              self.canvas.cget("scrollregion").split()]
+            total_w = max(1.0, x1 - x0)
+            total_h = max(1.0, y1 - y0)
+            self.canvas.xview_moveto(max(0.0, (doc_x * ratio - px) / total_w))
+            self.canvas.yview_moveto(max(0.0, (doc_y * ratio - py) / total_h))
+        except (tk.TclError, ValueError):
+            pass
+        self._render_visible()
+        self._update_page_indicator()
 
     def _on_mousewheel(self, event):
         # Windows event.delta is ±120/notch; macOS uses smaller integers.
@@ -7430,39 +7479,59 @@ class PreviewTab:
     def _on_wheel_linux_down(self, event=None):
         return self._wheel(event, 1)
 
+    def _pan_start(self, event):
+        self.canvas.scan_mark(event.x, event.y)
+        try:
+            self.canvas.config(cursor="fleur")
+        except tk.TclError:
+            pass
+        return "break"
+
+    def _pan_move(self, event):
+        self.canvas.scan_dragto(event.x, event.y, gain=1)
+        self._update_page_indicator()
+        return "break"
+
+    def _pan_end(self, _event=None):
+        try:
+            self.canvas.config(
+                cursor="crosshair" if self.text_mode.get() else "")
+        except tk.TclError:
+            pass
+        self._render_visible()
+        return "break"
+
     # ---- Rendering ------------------------------------------------------
     def _render_all_pages(self):
-        """Render every page of the combined PDF stacked vertically into the
-        canvas. Continuous scroll is the primary navigation; Prev/Next jump
-        to page boundaries.
+        """Lay the document out at the current zoom and draw what's on screen.
 
-        For very large PDFs this loads every page bitmap into memory at
-        once — fine for typical sessions (<50 pages); a future version can
-        lazy-render on scroll if real users hit memory pressure."""
+        v1.65.4: this used to rasterise EVERY page on every zoom change, which
+        is why the zoom slider took seconds to respond on a long document — a
+        40-page file at 300% is 40 full-page bitmaps before anything appears.
+        Page geometry comes from the page sizes (cheap), so the layout and
+        scrollbars are exact immediately, and only pages actually in view get
+        rasterised. Scrolling fills in the rest."""
         if self._combined_pdf is None or self._page_count == 0:
+            return
+        if not PIL_TK_OK:
+            self._set_placeholder("Install Pillow ImageTk to render preview.")
             return
 
         cw = max(self.canvas.winfo_width(), 100)
         z = self._current_zoom
-        # For Fit, scale every page to the canvas width. For fixed %,
-        # use the % directly. Cap to keep bitmaps reasonable.
         if z == "Fit":
-            # Use the FIRST page's width to pick a uniform scale so the
-            # whole document renders at a consistent on-screen size.
             try:
                 w_pt, _ = self._combined_pdf[0].get_size()
             except Exception:
-                w_pt = 612  # US Letter fallback
+                w_pt = 612
             scale = max((cw - 32) / w_pt, 0.5)
         else:
             try:
-                scale = int(z.rstrip("%")) / 100.0
+                scale = int(str(z).rstrip("%")) / 100.0
             except ValueError:
                 scale = 1.0
         scale = min(scale, 6.0)
 
-        # Destroy any per-page Remove buttons from the previous render before
-        # clearing the canvas, so the Button child widgets don't leak.
         for w in self._page_btn_widgets:
             try:
                 w.destroy()
@@ -7472,48 +7541,41 @@ class PreviewTab:
 
         self.canvas.delete("all")
         self._cached_image_refs = []
+        self._page_photos = {}
+        self._page_items = {}
         self._page_y_positions = []
         self._page_boxes = []
         self._page_mark_vars = []
         self._note_item_ids = {}
         self._page_render_scale = scale
-        y = 8
-        max_w = 0
         nup_on = bool(getattr(self.app, "nup_var", None)
                       and self.app.nup_var.get())
 
+        # --- geometry first, from page sizes: no rasterising needed ---
+        y = 8
+        max_w = 0
         for idx in range(self._page_count):
             try:
-                page = self._combined_pdf[idx]
-                bitmap = page.render(scale=scale)
-                pil = bitmap.to_pil()
+                w_pt, h_pt = self._combined_pdf[idx].get_size()
             except Exception:
-                # Skip unrenderable pages but record an empty slot so
-                # Prev/Next stays accurate.
-                self._page_y_positions.append(y)
-                self._page_boxes.append((8, y, 0, 0))
-                continue
-            if not PIL_TK_OK:
-                self._set_placeholder("Install Pillow ImageTk to render preview.")
-                return
-            photo = _ImageTk.PhotoImage(pil)
-            self._cached_image_refs.append(photo)
+                w_pt, h_pt = 612, 792
+            pw, ph = int(w_pt * scale), int(h_pt * scale)
+            x = max((cw - pw) // 2, 8)
+            self._page_boxes.append((x, y, pw, ph))
             self._page_y_positions.append(y)
-            x = max((cw - pil.width) // 2, 8)
-            self._page_boxes.append((x, y, pil.width, pil.height))
-            self.canvas.create_image(x, y, anchor="nw", image=photo)
-            # v1.65: a "Mark to delete" tick-box floating at the page's
-            # top-right. Tick as many pages as you like, then use the Delete
-            # button on the page-actions row. Skipped under 2-up: a displayed
-            # sheet holds two source pages, so there's no 1:1 page→source
-            # mapping to delete. (Turn 2-up off to delete individual pages.)
+            # A page-shaped placeholder so the document reads correctly even
+            # before its bitmap exists.
+            self.canvas.create_rectangle(x, y, x + pw, y + ph,
+                                         fill="#ffffff", outline="#b8b8b8",
+                                         tags=("placeholder", f"ph{idx}"))
+            self.canvas.create_text(
+                cw // 2, y + ph + 4, anchor="n",
+                text=f"— Page {idx + 1} of {self._page_count} —",
+                fill="#777", font=("", 8))
             if not nup_on:
                 src = (self._page_sources[idx]
                        if idx < len(self._page_sources) else None)
                 var = tk.BooleanVar(value=src in self._marked)
-                # Just a square. No label, and parked in the margin beside the
-                # page rather than on top of the artwork — a caption sitting
-                # over the document was both ugly and in the way.
                 chk = tk.Checkbutton(
                     self.canvas, variable=var, cursor="hand2",
                     bg="#dadada", activebackground="#dadada",
@@ -7523,47 +7585,71 @@ class PreviewTab:
                 )
                 Tooltip(chk, "Select this page, then use Delete or Export "
                              "on the toolbar above.")
-                if x >= 30:          # room in the left margin
-                    self.canvas.create_window(x - 6, y, anchor="ne",
-                                              window=chk)
-                else:                # narrow window - tuck it just inside
+                if x >= 30:
+                    self.canvas.create_window(x - 6, y, anchor="ne", window=chk)
+                else:
                     self.canvas.create_window(x + 3, y + 3, anchor="nw",
                                               window=chk)
-                # Track for cleanup — only when actually created (under 2-up
-                # there's no tick-box, so nothing to append).
                 self._page_btn_widgets.append(chk)
                 self._page_mark_vars.append((src, var))
-            # Page number label below each page so users can see where they are.
-            label_y = y + pil.height + 4
-            self.canvas.create_text(
-                cw // 2, label_y, anchor="n",
-                text=f"— Page {idx + 1} of {self._page_count} —",
-                fill="#777", font=("", 8),
-            )
-            max_w = max(max_w, pil.width)
-            y += pil.height + 28  # gap between pages
+            max_w = max(max_w, pw)
+            y += ph + 28
 
-        # Safety net: never leave the canvas cleared-but-blank (the old
-        # "gray, no preview" state). If nothing rendered, show a placeholder.
-        if not self._cached_image_refs:
-            self._set_placeholder("Preview couldn't render these pages — "
-                                  "click ↻ Refresh.")
-            return
         self.canvas.config(
-            scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100))
-        )
-        # Sync the zoom readout with what was actually rendered, so "Fit"
-        # shows the percentage it worked out to.
+            scrollregion=(0, 0, max(max_w + 16, cw), max(y, 100)))
         if hasattr(self, "zoombar"):
             shown = int(round(scale * 100))
             if self._current_zoom == "Fit":
                 self.zoombar.show_fit(shown)
             else:
                 self.zoombar.set(shown)
+        self._render_visible()
         self._redraw_mark_outlines()
         self._update_delete_button(nup_on=nup_on)
         self._redraw_notes()
         self._update_page_indicator()
+
+    def _visible_range(self, margin=1):
+        """Indices of the pages on screen, plus `margin` either side so a
+        small scroll doesn't land on an unrendered page."""
+        if not self._page_boxes:
+            return []
+        try:
+            top = self.canvas.canvasy(0)
+            bottom = self.canvas.canvasy(self.canvas.winfo_height())
+        except tk.TclError:
+            return []
+        hits = [i for i, (_x, py, _pw, ph) in enumerate(self._page_boxes)
+                if py + ph >= top and py <= bottom]
+        if not hits:
+            return []
+        return list(range(max(0, hits[0] - margin),
+                          min(len(self._page_boxes), hits[-1] + 1 + margin)))
+
+    def _render_visible(self):
+        """Rasterise any on-screen page that isn't drawn yet."""
+        if self._combined_pdf is None or not PIL_TK_OK:
+            return
+        scale = self._page_render_scale
+        for idx in self._visible_range():
+            if idx in self._page_photos:
+                continue
+            x, y, pw, ph = self._page_boxes[idx]
+            if pw <= 0 or ph <= 0:
+                continue
+            try:
+                pil = self._combined_pdf[idx].render(scale=scale).to_pil()
+            except Exception:
+                continue
+            photo = _ImageTk.PhotoImage(pil)
+            self._page_photos[idx] = photo
+            self._cached_image_refs.append(photo)
+            item = self.canvas.create_image(x, y, anchor="nw", image=photo)
+            self._page_items[idx] = item
+            self.canvas.delete(f"ph{idx}")
+            # Keep notes and selection boxes above the page bitmaps.
+            self.canvas.tag_lower(item)
+        self._redraw_notes()
 
     # ---- Text notes (v1.64) ---------------------------------------------
     def _pdf_to_canvas(self, page, x_pt, y_pt):
@@ -7883,6 +7969,13 @@ class PreviewTab:
         self._redraw_notes()
         self._invalidate_output_only()
         self._update_text_buttons()
+        # Say so out loud. "Will this survive if I switch tabs?" is the
+        # obvious worry with an editor that has no visible Save.
+        kept = len([n for n in self.app.text_notes if n.get("text", "").strip()])
+        if kept:
+            self.status_lbl.config(
+                text=f"✓ Text kept — {kept} note(s) saved with the document. "
+                     f"They stay when you switch tabs and appear in the PDF.")
 
     def _cancel_edit(self):
         if self._edit_widget:
@@ -9226,7 +9319,15 @@ class EditorTab:
         self.fill_mode_btn = ttk.Button(
             bar, text="Form fills", width=13,
             command=lambda: self._set_mode("fill"))
-        self.fill_mode_btn.pack(side="left", padx=(4, 10))
+        self.fill_mode_btn.pack(side="left", padx=(4, 4))
+        self.addtext_btn = ttk.Button(
+            bar, text="Add text", width=11,
+            command=lambda: self._set_mode("addtext"))
+        self.addtext_btn.pack(side="left", padx=(0, 10))
+        tip(self.addtext_btn,
+            "Click the page to drop text on it — handy straight after "
+            "deleting something. Font, size, moving and editing live on the "
+            "Preview Pages tab.")
         tip(self.fill_mode_btn,
             "Highlight the form fields on this page so you can clear them. "
             "Esc turns the tool off.")
@@ -9305,11 +9406,13 @@ class EditorTab:
         self._sel = set()
         try:
             self.canvas.config(
-                cursor={"text": "xterm", "fill": "hand2"}.get(self._mode, ""))
+                cursor={"text": "xterm", "fill": "hand2",
+                        "addtext": "crosshair"}.get(self._mode, ""))
         except tk.TclError:
             pass
         for btn, name, base in ((self.text_mode_btn, "text", "Select text"),
-                                (self.fill_mode_btn, "fill", "Form fills")):
+                                (self.fill_mode_btn, "fill", "Form fills"),
+                                (self.addtext_btn, "addtext", "Add text")):
             on = self._mode == name
             btn.state(["pressed"] if on else ["!pressed"])
             btn.config(text=("● " if on else "") + base)
@@ -9332,6 +9435,48 @@ class EditorTab:
             self._set_mode("none")
             return "break"
         return None
+
+    def _add_text_here(self, event):
+        """Drop a text note where the user clicked.
+
+        Notes are keyed by their page in the FINISHED document, while the
+        Editor works on source pages — display_index_for() bridges the two,
+        so a note placed here lands on the right page in the output and shows
+        up on Preview Pages, where it can be typed into and moved."""
+        if self._cur is None:
+            return
+        page = self.app.display_index_for(self._cur)
+        if page is None:
+            messagebox.showinfo(
+                APP_NAME,
+                "That page isn't part of the document right now, so there's "
+                "nowhere to put the text.")
+            return
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        x_pt, y_pt = self._canvas_to_pdf(cx, cy)
+        note = {"page": page, "x_pt": round(x_pt, 2), "y_pt": round(y_pt, 2),
+                "text": "New text", "font": "Helvetica", "size": 14,
+                "bold": False, "italic": False}
+        self.app.text_notes.append(note)
+        self.app._doc_dirty = True
+        self.app.log(f"Editor: added text on page {page + 1}.")
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+        self._set_mode("none")
+        self._draw()
+        self.info.config(
+            text="Text added — switch to Preview Pages to type into it, "
+                 "restyle it or drag it.")
+
+    def _notes_on_page(self):
+        """The text notes that belong to the page currently open here."""
+        if self._cur is None:
+            return []
+        page = self.app.display_index_for(self._cur)
+        if page is None:
+            return []
+        return [n for n in self.app.text_notes if int(n.get("page", -1)) == page]
 
     # ---- zoom ------------------------------------------------------------
     def _on_zoom(self, pct):
@@ -9371,9 +9516,16 @@ class EditorTab:
 
     # ---- page list -------------------------------------------------------
     def on_show(self):
-        """Rebuild the page list. Called on every switch to this tab."""
+        """Rebuild the page list. Called on every switch to this tab.
+
+        Lists the document as it currently stands: pages removed on Preview
+        Pages are gone from here too, and the numbering is the finished
+        document's, not each source file's. Previously this listed every page
+        of every file regardless, so deleting pages elsewhere left the Editor
+        showing a document that no longer existed."""
         self._pages = []
         self.listbox.delete(0, tk.END)
+        excluded = self.app.excluded_pages
         for it in self.app.items:
             if not it.cached_pdf_bytes:
                 continue
@@ -9382,14 +9534,29 @@ class EditorTab:
             except Exception:
                 continue
             for i in range(n):
+                if (it.uid, i) in excluded:
+                    continue
                 self._pages.append((it, i))
-                edits = self.app.page_edits.get((it.uid, i))
-                mark = "  •" if edits else ""
-                self.listbox.insert(
-                    tk.END, f"{it.label[:24]} — p{i + 1}{mark}")
+        for (it, i) in self._pages:
+            edits = self.app.page_edits.get((it.uid, i))
+            mark = "  •" if edits else ""
+            doc_no = self.app.display_index_for((it.uid, i))
+            where = f"p{doc_no + 1}" if doc_no is not None else f"p{i + 1}"
+            self.listbox.insert(
+                tk.END, f"{where} — {it.label[:24]}{mark}")
         if not self._pages:
             self._set_placeholder(
                 f"Nothing to edit yet — add files on the {TAB_FILES} tab.")
+        elif self._cur is not None:
+            # Keep showing the same page if it's still in the document.
+            for row, (it, i) in enumerate(self._pages):
+                if (it.uid, i) == self._cur:
+                    self.listbox.selection_set(row)
+                    break
+            else:
+                self._cur = None
+                self._set_placeholder("That page is no longer in the "
+                                      "document. Pick another.")
 
     def _on_pick(self, _event=None):
         sel = self.listbox.curselection()
@@ -9500,6 +9667,19 @@ class EditorTab:
                                                  width=2, dash=(4, 2))
                 except Exception:
                     pass
+        # Text notes already on this page, so the Editor shows the same
+        # document Preview does.
+        for n in self._notes_on_page():
+            try:
+                a, b = self._pdf_to_canvas(float(n["x_pt"]), float(n["y_pt"]))
+                self.canvas.create_text(
+                    a, b, anchor="sw", text=n.get("text", ""),
+                    fill="#111111",
+                    font=("Helvetica",
+                          max(6, int(round(float(n.get("size", 14))
+                                           * self._scale)))))
+            except Exception:
+                pass
         # Current selection.
         for i in self._sel:
             _ch, x0, y0, x1, y1 = self._chars[i]
@@ -9525,6 +9705,9 @@ class EditorTab:
     # ---- selection -------------------------------------------------------
     def _on_press(self, event):
         self.canvas.focus_set()
+        if self._mode == "addtext":
+            self._add_text_here(event)
+            return
         if self._mode != "text" or not self._chars:
             return
         self._drag_from = (self.canvas.canvasx(event.x),
@@ -10519,6 +10702,31 @@ class App:
             (getattr(self, "arrange_var", None) and self.arrange_var.get())
             or "side",
         )
+
+    def natural_keys(self):
+        """Every page of every ready item, in file order, minus the ones
+        removed on Preview Pages."""
+        keys = []
+        for it in self.items:
+            if not it.cached_pdf_bytes:
+                continue
+            try:
+                n = len(PdfReader(io.BytesIO(it.cached_pdf_bytes)).pages)
+            except Exception:
+                continue
+            for i in range(n):
+                if (it.uid, i) not in self.excluded_pages:
+                    keys.append((it.uid, i))
+        return keys
+
+    def display_index_for(self, key):
+        """Which page of the FINISHED document a source page ends up as, or
+        None if it isn't in there. Lets the Editor talk in document page
+        numbers and place text notes, which are keyed by final page."""
+        try:
+            return self.reorder_keys(self.natural_keys()).index(key)
+        except (ValueError, Exception):
+            return None
 
     def reorder_keys(self, natural_keys):
         """Apply the user's custom page order (self.page_order) to the current
