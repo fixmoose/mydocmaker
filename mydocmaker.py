@@ -129,7 +129,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.4"
+APP_VERSION = "1.65.5"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -143,6 +143,18 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.5": [
+        "Fixed: deleted text still showed faint traces on the Preview. It was "
+        "painting one box per letter, and letters overhang their own box, so "
+        "edges leaked through. Whole words are covered in one go now.",
+        "The Delete and Backspace keys work in the Editor — before, only the "
+        "toolbar button did anything.",
+        "New '✓ Apply changes' button in the Editor. Your edits were always "
+        "kept, but nothing said so; now it confirms exactly what was removed "
+        "and that it's saved with the document.",
+        "Removed text is shown as removed — painted out the way the finished "
+        "page will look, instead of the red boxes that looked like an error.",
+    ],
     "1.65.4": [
         "Zoom is fast now. It used to redraw every page in the document "
         "before showing you anything, which is why the slider lagged for "
@@ -9340,6 +9352,13 @@ class EditorTab:
         self.selall_btn = ttk.Button(bar, text="Select all text",
                                      command=self._select_all)
         self.selall_btn.pack(side="left", padx=(6, 0))
+        self.apply_btn = ttk.Button(bar, text="✓ Apply changes",
+                                    command=self._apply_changes)
+        self.apply_btn.pack(side="left", padx=(6, 0))
+        tip(self.apply_btn,
+            "Push this page's edits through to the Preview and the finished "
+            "document. Your edits are kept either way — this is the button "
+            "that tells you so.")
         self.clear_btn = ttk.Button(bar, text="↺ Undo edits on this page",
                                     command=self._clear_page_edits)
         self.clear_btn.pack(side="left", padx=(6, 0))
@@ -9368,6 +9387,10 @@ class EditorTab:
         self.canvas.bind("<Leave>", self._unbind_wheel)
         self.canvas.configure(takefocus=1)
         self.canvas.bind("<Escape>", self._on_escape)
+        # Delete/Backspace do the obvious thing once something is selected.
+        self.canvas.bind("<Delete>", self._delete_selection)
+        self.canvas.bind("<BackSpace>", self._delete_selection)
+        self.listbox.bind("<Delete>", self._delete_selection)
 
         zoomrow = ttk.Frame(right)
         zoomrow.pack(fill="x", pady=(4, 0))
@@ -9652,11 +9675,15 @@ class EditorTab:
         w, h = self._photo.width(), self._photo.height()
         self.canvas.config(scrollregion=(0, 0, w + 16, h + 16))
         # Already-removed regions, so the page shows what the output will.
+        # Painted out, exactly as the finished page will look. The old
+        # red-outlined boxes read as "something went wrong" rather than
+        # "this text is gone".
         for (x0, y0, x1, y1) in self._redactions():
             a, b = self._pdf_to_canvas(x0, y1)
             c, d = self._pdf_to_canvas(x1, y0)
             self.canvas.create_rectangle(a, b, c, d, fill="#ffffff",
-                                         outline="#d40000", width=1)
+                                         outline="#e2e2e2", width=1,
+                                         dash=(2, 2))
         # Form fields, outlined while the fill tool is active.
         if self._mode == "fill":
             for (_name, _val, rect) in self._fields:
@@ -9776,19 +9803,44 @@ class EditorTab:
         return self.app.page_edits.setdefault(
             self._cur, {"redactions": [], "cleared_fields": []})
 
-    def _delete_selection(self):
+    def _merge_selection_boxes(self):
+        """Turn the selected characters into as few rectangles as possible.
+
+        One box per character left hairline gaps between letters and clipped
+        the bits of a glyph that overhang its own box (accents, descenders,
+        italic tails), so a "deleted" word still showed faint fringes. Runs of
+        neighbouring characters on the same line become a single padded box
+        instead — cleaner to look at and actually opaque."""
+        pad = 1.0
+        runs = []
+        for i in sorted(self._sel):
+            _ch, x0, y0, x1, y1 = self._chars[i]
+            if runs and runs[-1][0] == i - 1 and abs(runs[-1][1][1] - y0) < 2.5:
+                px0, py0, px1, py1 = runs[-1][1]
+                runs[-1] = (i, (min(px0, x0), min(py0, y0),
+                                max(px1, x1), max(py1, y1)))
+            else:
+                runs.append((i, (x0, y0, x1, y1)))
+        return [(round(b[0] - pad, 2), round(b[1] - pad, 2),
+                 round(b[2] + pad, 2), round(b[3] + pad, 2))
+                for _i, b in runs]
+
+    def _delete_selection(self, _event=None):
         if not self._sel or self._cur is None:
-            return
-        # One rectangle per contiguous run keeps the output tidy.
-        boxes = [self._chars[i][1:] for i in sorted(self._sel)]
+            return "break"
+        boxes = self._merge_selection_boxes()
         picked = "".join(self._chars[i][0] for i in sorted(self._sel))[:60]
-        self.app.log(f"Editor: deleted {len(boxes)} character(s) "
+        self.app.log(f"Editor: deleted {len(self._sel)} character(s) "
                      f"({picked!r}) from a page.")
-        self._edits()["redactions"].extend(
-            [tuple(round(v, 2) for v in b) for b in boxes])
+        self._edits()["redactions"].extend(boxes)
+        n = len(self._sel)
         self._sel = set()
         self.app._doc_dirty = True
         self._after_edit()
+        self.info.config(
+            text=f"Deleted {n} character(s) — press Apply to update the rest "
+                 f"of the app.")
+        return "break"
 
     def _clear_fill(self):
         sel = self.fill_list.curselection()
@@ -9813,6 +9865,32 @@ class EditorTab:
         self.app._doc_dirty = True
         self._after_edit()
 
+    def _apply_changes(self):
+        """Commit this page's edits everywhere and say so plainly."""
+        if self._cur is None:
+            return
+        edits = self.app.page_edits.get(self._cur) or {}
+        nred = len(edits.get("redactions", []))
+        ncle = len(edits.get("cleared_fields", []))
+        if hasattr(self.app, "preview"):
+            self.app.preview.invalidate()
+            self.app.preview.refresh_preview()
+        self.app.autosave_project()
+        if not (nred or ncle):
+            self.info.config(text="Nothing to apply on this page yet.")
+            return
+        bits = []
+        if nred:
+            bits.append(f"{nred} text removal(s)")
+        if ncle:
+            bits.append(f"{ncle} cleared form field(s)")
+        self.info.config(
+            text=f"✓ Applied — {' and '.join(bits)} on this page. "
+                 f"Saved with the document.")
+        self.app.status.config(
+            text=f"Editor changes applied to page "
+                 f"{(self.app.display_index_for(self._cur) or 0) + 1}.")
+
     def _after_edit(self):
         """Repaint here, refresh the list marks, and invalidate the preview so
         the rest of the app reflects the change."""
@@ -9827,7 +9905,10 @@ class EditorTab:
         if keep:
             self.listbox.selection_set(keep[0])
         if hasattr(self.app, "preview"):
+            # Rebuild straight away rather than waiting for a tab switch, so
+            # Preview can never be caught still showing text removed here.
             self.app.preview.invalidate()
+            self.app.preview.refresh_preview()
 
 
 class Splash:

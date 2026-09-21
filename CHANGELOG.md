@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.65.5
+- **Fixed: deleted text leaked through on the Preview.** Redactions were stored
+  as one rectangle *per character*, and glyphs overhang their own box (accents,
+  descenders, italic tails) with hairline gaps between letters — so a deleted
+  word still showed fringes. `_merge_selection_boxes()` now collapses runs of
+  neighbouring characters on a line into a single padded rectangle. Measured on
+  the same page: 8 boxes → 1, and pixels-white in the deleted area went from
+  230/245 to 245/245.
+  - The previous "verification" of this was a test containing
+    `"yes" if True else "no"` — an assertion that passed regardless. Replaced
+    with a real pixel check of the Preview's own rendered output.
+- **Preview rebuilds immediately after an Editor edit** rather than waiting for
+  a tab switch, so it can never be caught showing text the Editor has removed.
+- **Delete / BackSpace / Escape are bound in the Editor** (canvas and page
+  list). Previously only the toolbar button deleted anything, which is why the
+  tool felt unresponsive.
+- **New `✓ Apply changes`** in the Editor: pushes the page's edits to Preview
+  and the output, autosaves the project, and reports what was removed. The
+  edits were always being kept — there was simply no feedback saying so.
+- **Pending removals render as removals**: painted white with a faint dashed
+  edge, matching the finished page, instead of red-outlined boxes that read as
+  an error.
+
 ## v1.65.4
 - **Zoom no longer rasterises the whole document.** `_render_all_pages` drew
   every page at the new scale before anything appeared — a 30-page file at 300%
