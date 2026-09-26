@@ -129,7 +129,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.5"
+APP_VERSION = "1.65.6"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -143,6 +143,13 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.6": [
+        "Fixed a crash that could take the whole app down, most often just "
+        "after adding several files at once. Two background workers and the "
+        "window were reading the same settings at the same time, which is "
+        "not safe and could corrupt memory. The workers now use their own "
+        "copy.",
+    ],
     "1.65.5": [
         "Fixed: deleted text still showed faint traces on the Preview. It was "
         "painting one box per letter, and letters overhang their own box, so "
@@ -9981,6 +9988,10 @@ class App:
         # True once the document has changed without being written out; drives
         # the "you haven't created this yet" prompt on close.
         self._doc_dirty = False
+        # Last layout read from the widgets. Worker threads read THIS rather
+        # than the Tk variables — see _current_layout().
+        self._layout_snapshot = PageLayout("letter", "portrait", "auto",
+                                           1, "side")
         # Activity log — what the user did, in order. Written beside the
         # output as a .log when enabled, and carried inside a .mydoc so the
         # record survives with the project.
@@ -10749,6 +10760,13 @@ class App:
         except Exception:
             return None
 
+    def _refresh_layout_snapshot(self):
+        """Re-read the widgets on the main thread so workers see the change."""
+        try:
+            self._layout_snapshot = self._build_layout_from_widgets()
+        except Exception:
+            pass
+
     def _apply_layout_defaults(self):
         """Select the default paper size / orientation / content / 2-up
         arrangement, once the radio buttons exist.
@@ -10766,12 +10784,30 @@ class App:
         self.orient_var.set("portrait")
         self.content_var.set("auto")
         self.arrange_var.set("side")
+        self._refresh_layout_snapshot()
 
     def _current_layout(self):
+        """Snapshot the page-layout controls into a PageLayout.
+
+        THREAD SAFETY: Tk/Tcl must only ever be touched from the thread that
+        owns the interpreter. This is called from render workers, the signing
+        build and the export worker, so off the main thread it returns the
+        last snapshot taken instead of reading the widgets. Two render threads
+        reading Tk variables at once was a genuine race — Tcl object refcounts
+        are not atomic — and it segfaulted the whole app, most reliably when
+        several files were added together and the workers started in step."""
+        if threading.current_thread() is not threading.main_thread():
+            return self._layout_snapshot
+        layout = self._build_layout_from_widgets()
+        self._layout_snapshot = layout
+        return layout
+
+    def _build_layout_from_widgets(self):
         """Snapshot the page-layout controls into a PageLayout. Defensive so
         it works even if called before every widget exists."""
         # The "or" fallbacks matter during construction: the variables are
-        # empty until _apply_layout_defaults() runs.
+        # empty until _apply_layout_defaults() runs. Main thread only — see
+        # _current_layout().
         return PageLayout(
             (getattr(self, "size_var", None) and self.size_var.get())
             or default_page_size(),
@@ -10896,6 +10932,9 @@ class App:
         # Order tab warns the user to Create first if they want to keep them).
         if self.page_rotate:
             self.page_rotate = {}
+        # Update the snapshot first: the workers we are about to wake read it
+        # instead of the Tk variables.
+        self._refresh_layout_snapshot()
         for it in self.items:
             self._render_worker.reset_cache(it)
             self._render_worker.enqueue(it)
@@ -11343,6 +11382,10 @@ class App:
         self.status.config(text="Cleared.")
 
     def _refresh(self, select=None):
+        # Every list mutation funnels through here, and each one may wake a
+        # render worker — so this is the natural place to keep the worker's
+        # copy of the layout current. Cheap: five Tk variable reads.
+        self._refresh_layout_snapshot()
         self.listbox.delete(0, tk.END)
         for it in self.items:
             self.listbox.insert(tk.END, f"{it.label}{it.status_glyph()}")

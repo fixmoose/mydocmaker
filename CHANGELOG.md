@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.65.6
+- **Fixed a data race that could segfault the whole app**, reported after
+  combining three files. `RenderWorker._loop` called `App._current_layout()`
+  *inside* the worker thread, and that reads Tk variables (`size_var.get()`
+  and friends). With `concurrency=2`, adding several files starts two workers
+  together, so two threads plus the main loop were touching Tcl objects at
+  once — Tcl refcounts are not atomic, so this corrupts the heap and lands in
+  libc with a null register, which matches the collected core dump exactly.
+  Intermittent by nature, which is why it surfaced on a multi-file add.
+  - `_current_layout()` now returns `_layout_snapshot` when called off the
+    main thread and only reads the widgets on it; the snapshot is refreshed in
+    `_refresh()` (the funnel every list mutation passes through) and in
+    `_on_page_mode_changed()` before workers are woken.
+  - Verified by poisoning every Tk variable so any off-thread read raises: the
+    worker still gets a correct layout and touches nothing. A stress run —
+    9 files rendering while paper size and orientation are flipped 12 times
+    mid-flight — completes clean.
+  - Caveat: the reporter's exact crash was not reproduced locally, so this is
+    a genuine race that fits the evidence rather than a confirmed same-fault
+    fix.
+
 ## v1.65.5
 - **Fixed: deleted text leaked through on the Preview.** Redactions were stored
   as one rectangle *per character*, and glyphs overhang their own box (accents,
