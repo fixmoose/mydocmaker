@@ -1,5 +1,42 @@
 # Changelog
 
+## v1.65.8
+- **Crop tool (Editor).** Choosing a Paper size and clicking **Crop** puts a
+  box of exactly those proportions on the page, anchored to the top and as
+  wide as it will go — the shape of the problem it exists for, a scan that
+  came out longer than the sheet. Drag to move, drag a corner to resize
+  (the aspect is held), then *Crop this page* or *Crop every page*. A live
+  readout shows the kept area in inches.
+- **The crop is applied to the source, before the paper-size fitting.** This
+  was the whole difficulty. With Paper size set to Letter, the Editor used to
+  be handed the already-fitted render, so a 8.5×14in scan arrived as 612×792
+  pt with nothing hanging off the bottom to trim — the feature only did
+  anything at all in "Original" mode. Crop boxes are now stored as
+  `crop_src` in the *source's* own units and applied by the render worker
+  (`crop_pdf_bytes` / `crop_image_box`) before `_impose_doc`, so the overrun
+  is removed and the remaining content keeps its size instead of the whole
+  page being squashed onto the sheet. Measured on a 612×1008 pt PDF and a
+  2550×4200 px 300-dpi PNG: under `original`, `letter` and `a4` the crop tool
+  now sees the true 612×1008 / 2550×4200 source, and after cropping the
+  bottom 20% of the output holds 0 non-white pixels (was 4.8% / 11.9%).
+- Scans are images, so **cropping works on images too**, in pixel space at
+  full scan resolution; the inch readout uses the file's own DPI.
+- *Crop every page* only takes pages whose source geometry matches the one
+  on screen — a box in source units means something different on a
+  differently-sized page — and reports how many it skipped.
+- Cropping a page **clears that page's text removals** and says so: those
+  boxes were measured against the pre-crop page and would otherwise land on
+  the wrong words. Cleared form fields are stored by name, so they survive.
+- Undoing (**Clear this page's edits**) rebuilds the render, so a crop can be
+  taken back.
+- **Zoom is a hover pad, not a slider.** The `ttk.Scale` only reported on
+  mouse release, so dragging it did nothing visible until you let go. It is
+  replaced by a 132×26 px "zoom here" pad with the percentage inside and
+  −/+ buttons; the wheel over it steps 5% and applies immediately
+  (verified: 100% → 105% on one notch, no drag).
+- **"Create MyDoc" renamed to "Create the File (PDF, img, jpg, …)"** and no
+  longer stretched across the window (310 px of a 1284 px window).
+
 ## v1.65.7
 - **Scanning: fixed quality and added multi-page.** The old code ran
   `scanimage --format=png --resolution=200` and nothing else — it never set

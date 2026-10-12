@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.7"
+APP_VERSION = "1.65.8"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -162,6 +162,20 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.8": [
+        "New Crop tool in the Editor, built for scans that come out longer "
+        "than the paper. Pick your Paper size, click Crop, and a box in "
+        "exactly those proportions appears on the page — drag it to position, "
+        "drag a corner to resize, then crop this page or every page the same. "
+        "The trim happens on the original scan before it is fitted to the "
+        "sheet, so the bottom is genuinely removed and the rest keeps its "
+        "size, instead of the whole thing being shrunk onto the page.",
+        "Zoom is now a small 'zoom here' pad instead of a slider: put the "
+        "pointer over it and use the wheel. It changes as you turn the wheel "
+        "rather than only when you let go, which is what the old slider did.",
+        "'Create MyDoc' is now 'Create the File (PDF, img, jpg, …)' and is a "
+        "normal-sized button instead of a bar stretched across the window.",
+    ],
     "1.65.7": [
         "Scanning actually works properly now. Your scanner was being left "
         "on its own default — black-and-white line art at 100 dpi — which is "
@@ -1716,6 +1730,50 @@ def _reportlab_font(family, bold, italic):
     if italic:
         return f"{base}-Oblique"
     return base
+
+
+def crop_page_box(page, box):
+    """Trim `page` to `box` (PDF points, measured on that page).
+
+    Applied to the SOURCE page before the paper-size fitting, which is the
+    only order that does what people want: trimming the bottom off an
+    over-long scan and THEN fitting letter keeps the content at its original
+    size. Doing it the other way round squashes the whole scan onto letter
+    first, leaving nothing to trim."""
+    try:
+        from pypdf.generic import RectangleObject
+        x0, y0, x1, y1 = [float(v) for v in box]
+        mb = page.mediabox
+        px0, py0 = float(mb.left), float(mb.bottom)
+        px1, py1 = float(mb.right), float(mb.top)
+        x0 = max(px0, min(px1, x0)); x1 = max(px0, min(px1, x1))
+        y0 = max(py0, min(py1, y0)); y1 = max(py0, min(py1, y1))
+        if x1 - x0 > 4 and y1 - y0 > 4:
+            rect = RectangleObject((x0, y0, x1, y1))
+            page.mediabox = rect
+            page.cropbox = rect
+    except Exception:
+        pass
+    return page
+
+
+def crop_pdf_bytes(pdf_bytes, crops):
+    """Apply {page_index: box} to a PDF, returning new bytes."""
+    if not crops:
+        return pdf_bytes
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        for i, page in enumerate(reader.pages):
+            box = crops.get(i)
+            if box:
+                page = crop_page_box(page, box)
+            writer.add_page(page)
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception:
+        return pdf_bytes
 
 
 def apply_page_edits(page, edits):
@@ -3349,12 +3407,36 @@ def install_component(component_id, status_cb=None):
 # ---------------------------------------------------------------------------
 # Converters — each returns a BytesIO containing a PDF
 # ---------------------------------------------------------------------------
-def image_to_pdf_bytes(path, layout=DEFAULT_LAYOUT):
+def crop_image_box(img, box):
+    """Trim a PIL image to `box`, given in PIXELS with a bottom-left origin.
+
+    Crop boxes are stored bottom-left-origin everywhere so one coordinate
+    convention covers both PDF pages (points) and scans (pixels); PIL counts
+    from the top, hence the flip."""
+    try:
+        x0, y0, x1, y1 = [float(v) for v in box]
+        iw, ih = img.size
+        x0 = max(0.0, min(iw, x0)); x1 = max(0.0, min(iw, x1))
+        y0 = max(0.0, min(ih, y0)); y1 = max(0.0, min(ih, y1))
+        if x1 - x0 < 4 or y1 - y0 < 4:
+            return img
+        return img.crop((int(round(x0)), int(round(ih - y1)),
+                         int(round(x1)), int(round(ih - y0))))
+    except Exception:
+        return img
+
+
+def image_to_pdf_bytes(path, layout=DEFAULT_LAYOUT, crop=None):
     img = Image.open(path)
     try:
         img = ImageOps.exif_transpose(img)
     except Exception:
         pass
+    # Crop before the sheet fitting: a scan that came out long is trimmed at
+    # its full resolution and only then fitted, so the content keeps its size
+    # instead of being squashed onto the sheet first.
+    if crop:
+        img = crop_image_box(img, crop)
     if img.mode in ("RGBA", "LA", "P"):
         bg = Image.new("RGB", img.size, (255, 255, 255))
         if img.mode == "P":
@@ -4769,11 +4851,14 @@ class Item:
 # every Tk-touching operation itself.
 # ---------------------------------------------------------------------------
 class RenderWorker:
-    def __init__(self, on_event, layout_fn, concurrency=2):
+    def __init__(self, on_event, layout_fn, concurrency=2, crops_fn=None):
         """on_event: callable(msg_tuple) — pushed onto App.work_queue.
         layout_fn: zero-arg callable returning the current PageLayout."""
         self._on_event = on_event
         self._layout_fn = layout_fn
+        # Returns {page_index: crop_box} for an item, or None. Read on the
+        # worker thread, so it must not touch Tk.
+        self._crops_fn = crops_fn
         self._queue = queue.Queue()
         self._stop = threading.Event()
         for _ in range(concurrency):
@@ -4805,7 +4890,8 @@ class RenderWorker:
                 item.render_status = "rendering"
                 self._on_event(("item_status", item.uid))
                 layout = self._layout_fn()
-                data = self._render(item, layout)
+                crops = self._crops_fn(item) if self._crops_fn else None
+                data = self._render(item, layout, crops)
                 item.cached_pdf_bytes = data
                 # Per-item render depends on size/paper/content (NOT nup —
                 # 2-up imposition happens later at assembly time).
@@ -4826,7 +4912,7 @@ class RenderWorker:
                 self._on_event(("item_render_failed", item.uid, str(e)))
 
     @staticmethod
-    def _render(item, layout):
+    def _render(item, layout, crops=None):
         """Convert one Item to PDF bytes. Mirrors what _build_worker does
         at Create-PDF time so the cache is byte-equivalent. (2-up imposition
         is applied later, on the assembled document, not here.)"""
@@ -4838,15 +4924,20 @@ class RenderWorker:
             return url_to_pdf_bytes(item.value, layout).getvalue()
         kind = file_kind(item.value)
         if kind == "image":
-            return image_to_pdf_bytes(item.value, layout).getvalue()
+            return image_to_pdf_bytes(
+                item.value, layout,
+                crop=(crops or {}).get(0)).getvalue()
         if kind == "pdf":
             with open(item.value, "rb") as fh:
-                return _impose_doc(fh.read(), layout)
+                raw = fh.read()
+            # Crop BEFORE fitting to the paper size — see crop_page_box().
+            return _impose_doc(crop_pdf_bytes(raw, crops), layout)
         if kind == "text":
             return text_to_pdf_bytes(item.value, layout).getvalue()
         if kind == "office":
             return _impose_doc(
-                office_to_pdf_bytes(item.value).getvalue(), layout)
+                crop_pdf_bytes(office_to_pdf_bytes(item.value).getvalue(),
+                               crops), layout)
         raise ValueError(f"Unsupported file kind: {item.value}")
 
 
@@ -8497,7 +8588,7 @@ class OrderTab:
         self.zoombar.set(100)
         self.zoombar.pack(side="right")
         ttk.Label(zoomrow, foreground="#777",
-                  text="Wheel scrolls · wheel over the zoom slider zooms"
+                  text="Wheel scrolls the page · hover the zoom box and roll to zoom"
                   ).pack(side="right", padx=(0, 10))
 
         # Re-flow the grid when the tab is resized.
@@ -9615,45 +9706,53 @@ def wheel_scroll(canvas, direction, fraction=0.22, minimum=60):
 
 
 class ZoomBar:
-    """Compact zoom strip that sits under the bottom-right corner of a canvas.
+    """A small zoom pad: park the pointer on it and use the wheel.
 
-    Shared by Preview Pages and the Editor so zooming behaves the same in
-    both. Dragging the slider only updates the readout — the expensive
-    re-render happens when the drag ends, which is what makes it feel smooth
-    instead of lurching a frame at a time.
+    This replaced a slider. A ttk.Scale only reported its new value when the
+    drag ended, so dragging it did nothing visible until release — which read
+    as broken rather than deliberate. Making it live meant re-rendering on
+    every pixel of travel, which is the opposite problem. A hover zone sized
+    to one wheel notch per step gives immediate feedback with no dragging at
+    all, and the − / + buttons stay for precise work.
     """
 
-    # Fine steps: 50% jumps made zooming feel like a toggle rather than a
-    # control.
     MIN, MAX, STEP = 25, 400, 5
 
     def __init__(self, parent, on_change, label_fit=True):
         self._on_change = on_change
         self._pct = 100
-        self._fit = label_fit
         self.frame = ttk.Frame(parent)
-        # The label is built first: ttk.Scale fires its command from set(),
-        # so it must have somewhere to write before that can happen.
-        self.lbl = ttk.Label(self.frame, text="100%", width=8, anchor="e")
+
         ttk.Button(self.frame, text="−", width=2,
                    command=lambda: self.step(-self.STEP)).pack(side="left")
-        self.scale = ttk.Scale(self.frame, from_=self.MIN, to=self.MAX,
-                               orient="horizontal", length=130,
-                               command=self._on_slide)
-        self.scale.pack(side="left", padx=3)
+
+        # The zone itself: a plain canvas so it reads as a target, not a
+        # button you are meant to click.
+        self.zone = tk.Canvas(self.frame, width=132, height=26,
+                              background="#eef3fa", highlightthickness=1,
+                              highlightbackground="#9bb8d8", cursor="sizing")
+        self.zone.pack(side="left", padx=3)
+        self.zone.create_text(66, 9, text="zoom here", fill="#2b5c8f",
+                              font=("", 8, "bold"))
+        self._pct_id = self.zone.create_text(66, 19, text="100%",
+                                             fill="#2b5c8f", font=("", 8))
+        Tooltip(self.zone, "Rest the mouse pointer in this box and roll the "
+                           "wheel to zoom in and out. It changes as you roll "
+                           "— no dragging, no clicking.")
+
         ttk.Button(self.frame, text="+", width=2,
                    command=lambda: self.step(self.STEP)).pack(side="left")
+        self.lbl = ttk.Label(self.frame, text="100%", width=8, anchor="e")
         self.lbl.pack(side="left", padx=(4, 0))
-        self.scale.set(100)
-        # Commit on release, not on every pixel of travel.
-        self.scale.bind("<ButtonRelease-1>", self._commit)
-        # Wheel anywhere over the strip zooms. This is the ONLY place the
-        # wheel zooms — over the document it scrolls, which is what people
-        # expect and what was asked for.
-        for w in (self.frame, self.scale, self.lbl):
+
+        for w in (self.zone, self.frame, self.lbl):
             w.bind("<MouseWheel>", self._on_wheel)
             w.bind("<Button-4>", lambda e: self._wheel(1))
             w.bind("<Button-5>", lambda e: self._wheel(-1))
+
+    def pack(self, **kw):
+        self.frame.pack(**kw)
+        return self.frame
 
     def _on_wheel(self, event):
         return self._wheel(1 if getattr(event, "delta", 0) > 0 else -1)
@@ -9662,45 +9761,27 @@ class ZoomBar:
         self.step(direction * self.STEP)
         return "break"
 
-    def pack(self, **kw):
-        self.frame.pack(**kw)
-        return self.frame
-
-    def _on_slide(self, value):
-        if getattr(self, "lbl", None) is None:
-            return
+    def _paint(self, text=None):
+        shown = text or f"{self._pct}%"
+        self.lbl.config(text=shown)
         try:
-            self._pct = int(max(self.MIN, min(self.MAX, round(float(value)))))
-        except (TypeError, ValueError):
-            return
-        self.lbl.config(text=f"{self._pct}%")
-
-    def _commit(self, _event=None):
-        self._on_change(self._pct)
+            self.zone.itemconfig(self._pct_id, text=shown)
+        except tk.TclError:
+            pass
 
     def step(self, delta):
-        self.set(self._pct + delta)
+        self.set(self._pct + delta, quiet=True)
         self._on_change(self._pct)
 
     def set(self, pct, quiet=False):
         self._pct = int(max(self.MIN, min(self.MAX, round(pct))))
-        try:
-            self.scale.set(self._pct)
-        except tk.TclError:
-            pass
-        self.lbl.config(text=f"{self._pct}%")
-        if not quiet:
-            self.lbl.config(text=f"{self._pct}%")
+        self._paint()
 
     def show_fit(self, pct):
-        """Report what Fit actually resolved to without changing the slider
-        into a manual zoom."""
+        """Report what a Fit mode worked out to, without pretending the user
+        chose that number."""
         self._pct = int(max(self.MIN, min(self.MAX, round(pct))))
-        try:
-            self.scale.set(self._pct)
-        except tk.TclError:
-            pass
-        self.lbl.config(text=f"Fit {self._pct}%")
+        self._paint(f"Fit {self._pct}%")
 
     def get(self):
         return self._pct
@@ -9739,7 +9820,11 @@ class EditorTab:
         self._photo = None
         self._scale = self.DEFAULT_SCALE
         self._cur_page = None         # (item, local_idx) for re-render
-        self._mode = "none"           # none | text | fill
+        self._mode = "none"    # none | text | fill | addtext | crop
+        self._crop = None      # (x0, y0, x1, y1) in SOURCE units, this page
+        self._crop_drag = None # ("move"|corner, start info) while dragging
+        self._crop_src = None  # True while the canvas shows the raw source
+        self._crop_dpi = 72.0  # source units per inch (72 for PDF, DPI for scans)
 
         ttk.Label(parent, text="Page editor", font=("", 13, "bold")
                   ).pack(anchor="w", padx=12, pady=(10, 0))
@@ -9785,7 +9870,17 @@ class EditorTab:
         self.addtext_btn = ttk.Button(
             bar, text="Add text", width=11,
             command=lambda: self._set_mode("addtext"))
-        self.addtext_btn.pack(side="left", padx=(0, 10))
+        self.addtext_btn.pack(side="left", padx=(0, 4))
+        self.crop_mode_btn = ttk.Button(
+            bar, text="Crop", width=9,
+            command=lambda: self._set_mode("crop"))
+        self.crop_mode_btn.pack(side="left", padx=(0, 10))
+        tip(self.crop_mode_btn,
+            "Puts a box on the page shaped to your chosen Paper size. Drag "
+            "it to position, drag a corner to resize, then crop this page — "
+            "or every page the same. Made for scans that come out longer "
+            "than the paper. Crop before removing text: cropping moves the "
+            "page, so it clears any text removals already made here.")
         tip(self.addtext_btn,
             "Click the page to drop text on it — handy straight after "
             "deleting something. Font, size, moving and editing live on the "
@@ -9802,6 +9897,13 @@ class EditorTab:
         self.selall_btn = ttk.Button(bar, text="Select all text",
                                      command=self._select_all)
         self.selall_btn.pack(side="left", padx=(6, 0))
+        self.crop_page_btn = ttk.Button(bar, text="Crop this page",
+                                        command=lambda: self._do_crop(False))
+        self.crop_all_btn = ttk.Button(bar, text="Crop every page",
+                                       command=lambda: self._do_crop(True))
+        tip(self.crop_all_btn,
+            "Apply this exact box to every page in the document — the usual "
+            "case for a stack of scans that all came out the same.")
         self.apply_btn = ttk.Button(bar, text="✓ Apply changes",
                                     command=self._apply_changes)
         self.apply_btn.pack(side="left", padx=(6, 0))
@@ -9848,7 +9950,7 @@ class EditorTab:
         self.zoombar.set(int(self.DEFAULT_SCALE * 100))
         self.zoombar.pack(side="right")
         ttk.Label(zoomrow, foreground="#777",
-                  text="Wheel over the page zooms · wheel outside scrolls"
+                  text="Wheel scrolls the page · hover the zoom box and roll to zoom"
                   ).pack(side="right", padx=(0, 10))
 
         fills = ttk.LabelFrame(parent, text="Form fills on this page")
@@ -9880,17 +9982,40 @@ class EditorTab:
         try:
             self.canvas.config(
                 cursor={"text": "xterm", "fill": "hand2",
-                        "addtext": "crosshair"}.get(self._mode, ""))
+                        "addtext": "crosshair", "crop": "fleur"}
+                .get(self._mode, ""))
         except tk.TclError:
             pass
         for btn, name, base in ((self.text_mode_btn, "text", "Select text"),
                                 (self.fill_mode_btn, "fill", "Form fills"),
-                                (self.addtext_btn, "addtext", "Add text")):
+                                (self.addtext_btn, "addtext", "Add text"),
+                                (self.crop_mode_btn, "crop", "Crop")):
             on = self._mode == name
             btn.state(["pressed"] if on else ["!pressed"])
             btn.config(text=("● " if on else "") + base)
         self.mode_hint.config(
             text="Esc to stop" if self._mode != "none" else "")
+        was_src = bool(self._crop_src)
+        if self._mode == "crop":
+            # Crop has to act on the original, UNFITTED page: with a paper
+            # size chosen, the cached render has already been scaled onto the
+            # sheet, so there is nothing left hanging off the bottom to trim.
+            if self._load_crop_source():
+                self._init_crop()
+                self.crop_page_btn.pack(side="left", padx=(6, 0))
+                self.crop_all_btn.pack(side="left", padx=(4, 0))
+            else:
+                self._mode = "none"
+                self.crop_mode_btn.state(["!pressed"])
+                self.crop_mode_btn.config(text="Crop")
+        else:
+            self._crop = None
+            self.crop_page_btn.pack_forget()
+            self.crop_all_btn.pack_forget()
+            if was_src and self._cur_page:
+                # Back to the fitted render the other tools work in.
+                self._crop_src = None
+                self._load_page(*self._cur_page)
         if self._mode == "fill":
             self._sel = set()
         self.canvas.focus_set()
@@ -9908,6 +10033,381 @@ class EditorTab:
             self._set_mode("none")
             return "break"
         return None
+
+    # ---- Crop -----------------------------------------------------------
+    HANDLE = 7        # corner grab size, in canvas pixels
+
+    def _paper_aspect(self):
+        """Width/height of the chosen Paper size, or None for 'Original'."""
+        try:
+            dims = _sheet_dims(self.app.size_var.get(),
+                               self.app.orient_var.get())
+        except Exception:
+            dims = None
+        if not dims:
+            return None
+        w, h = dims
+        return (w / h) if h else None
+
+    def _init_crop(self):
+        """Start the crop box at the chosen paper's proportions.
+
+        Anchored to the TOP of the page and as wide as it will go, because the
+        job this exists for is a scan that came out longer than the paper and
+        needs its bottom trimmed."""
+        if self._cur is None:
+            self._crop = None
+            return
+        pw, ph = self._cur_size
+        ar = self._paper_aspect()
+        existing = (self.app.page_edits.get(self._cur) or {}).get("crop_src")
+        if existing:
+            # Re-opening Crop on a page that already has one: show that box so
+            # it can be nudged instead of starting over.
+            self._crop = tuple(float(v) for v in existing)
+            self.info.config(
+                text="This page is already cropped — drag to adjust, then "
+                     "crop again.")
+            self._draw()
+            return
+        if ar is None:
+            # No fixed paper size chosen — start with a 90% box.
+            m_x, m_y = pw * 0.05, ph * 0.05
+            self._crop = (m_x, m_y, pw - m_x, ph - m_y)
+        else:
+            w = pw
+            h = w / ar
+            if h > ph:
+                h = ph
+                w = h * ar
+            x0 = (pw - w) / 2.0
+            self._crop = (x0, ph - h, x0 + w, ph)      # top-anchored
+        self.info.config(
+            text="Drag the box to move it, drag a corner to resize, then "
+                 "crop this page or every page.")
+        self._draw()
+
+    def _load_crop_source(self):
+        """Show the page exactly as it came off disk, uncropped.
+
+        Returns False (with a reason on the info line) when the item has no
+        meaningful source geometry to crop. Sets self._crop_dpi so the live
+        readout can still be given in inches for a scan measured in pixels."""
+        if self._cur_page is None:
+            self.info.config(text="Pick a page first, then choose Crop.")
+            return False
+        item, idx = self._cur_page
+        self._chars = []
+        self._fields = []
+        self._sel = set()
+        try:
+            kind = "url" if item.kind == "url" else file_kind(item.value)
+        except Exception:
+            kind = None
+
+        if kind == "image":
+            try:
+                img = Image.open(item.value)
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                if img.mode not in ("RGB", "L"):
+                    img = img.convert("RGB")
+            except Exception as e:
+                self.info.config(text=f"Couldn't open that image: {e}")
+                return False
+            self._cur_size = (float(img.width), float(img.height))
+            dpi = 72.0
+            try:
+                xd = (img.info.get("dpi") or (72, 72))[0]
+                if xd and float(xd) > 1:
+                    dpi = float(xd)
+            except Exception:
+                pass
+            self._crop_dpi = dpi
+            # Fit the (possibly huge) scan into the canvas rather than
+            # rendering it 1:1 at 300dpi.
+            self._scale = min(1.0, 900.0 / max(1, img.width),
+                              1100.0 / max(1, img.height))
+            show = img
+            if self._scale < 1.0:
+                show = img.resize(
+                    (max(1, int(img.width * self._scale)),
+                     max(1, int(img.height * self._scale))), LANCZOS)
+            self._crop_src = True
+            self._draw(show)
+            return True
+
+        src = self._crop_source_pdf(item, idx)
+        if src is None:
+            self.info.config(
+                text="This item has no separate original to crop — crop it "
+                     "after creating the file, or set Paper size to "
+                     "'Original'.")
+            return False
+        try:
+            doc = pdfium.PdfDocument(src)
+            pg = doc[0]
+            self._cur_size = pg.get_size()
+            self._crop_dpi = 72.0
+            self._scale = min(self.DEFAULT_SCALE,
+                              900.0 / max(1.0, self._cur_size[0]),
+                              1100.0 / max(1.0, self._cur_size[1]))
+            pil = pg.render(scale=self._scale).to_pil()
+            doc.close()
+        except Exception as e:
+            self.info.config(text=f"Couldn't render the original page: {e}")
+            return False
+        self._crop_src = True
+        self._draw(pil)
+        return True
+
+    @staticmethod
+    def _crop_source_pdf(item, idx):
+        """One-page PDF of the item's ORIGINAL page `idx`, or None."""
+        try:
+            kind = file_kind(item.value)
+        except Exception:
+            return None
+        try:
+            if kind == "pdf":
+                with open(item.value, "rb") as fh:
+                    raw = fh.read()
+            elif kind == "office":
+                raw = office_to_pdf_bytes(item.value).getvalue()
+            else:
+                return None
+            reader = PdfReader(io.BytesIO(raw))
+            if idx >= len(reader.pages):
+                return None
+            writer = PdfWriter()
+            writer.add_page(reader.pages[idx])
+            buf = io.BytesIO()
+            writer.write(buf)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    def _draw_crop(self):
+        """The box, its corner grips, and a dimmed margin for what goes."""
+        if self._mode != "crop" or not self._crop:
+            return
+        x0, y0, x1, y1 = self._crop
+        a, b = self._pdf_to_canvas(x0, y1)      # top-left on screen
+        c, d = self._pdf_to_canvas(x1, y0)      # bottom-right
+        if self._photo is not None:
+            pw_px = self._photo.width()
+            ph_px = self._photo.height()
+            # Shade everything outside the box so the trim is obvious.
+            for rect in ((8, 8, 8 + pw_px, b), (8, d, 8 + pw_px, 8 + ph_px),
+                         (8, b, a, d), (c, b, 8 + pw_px, d)):
+                rx0, ry0, rx1, ry1 = rect
+                if rx1 > rx0 and ry1 > ry0:
+                    self.canvas.create_rectangle(
+                        rx0, ry0, rx1, ry1, fill="#000000", outline="",
+                        stipple="gray50", tags="cropdim")
+        self.canvas.create_rectangle(a, b, c, d, outline="#0a64d8", width=2,
+                                     tags="cropbox")
+        for (hx, hy) in ((a, b), (c, b), (a, d), (c, d)):
+            self.canvas.create_rectangle(
+                hx - self.HANDLE, hy - self.HANDLE,
+                hx + self.HANDLE, hy + self.HANDLE,
+                fill="#0a64d8", outline="white", tags="cropbox")
+        dpi = self._crop_dpi or 72.0
+        keep_w = abs(x1 - x0) / dpi
+        keep_h = abs(y1 - y0) / dpi
+        self.canvas.create_text(
+            (a + c) / 2, max(b - 10, 10),
+            text=f'{keep_w:.2f}" × {keep_h:.2f}"',
+            fill="#0a64d8", font=("", 9, "bold"), tags="cropbox")
+
+    def _crop_hit(self, cx, cy):
+        """Which part of the crop box is under the pointer."""
+        if not self._crop:
+            return None
+        x0, y0, x1, y1 = self._crop
+        a, b = self._pdf_to_canvas(x0, y1)
+        c, d = self._pdf_to_canvas(x1, y0)
+        for name, (hx, hy) in (("nw", (a, b)), ("ne", (c, b)),
+                               ("sw", (a, d)), ("se", (c, d))):
+            if abs(cx - hx) <= self.HANDLE + 2 and abs(cy - hy) <= self.HANDLE + 2:
+                return name
+        if a <= cx <= c and b <= cy <= d:
+            return "move"
+        return None
+
+    def _crop_press(self, event):
+        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        hit = self._crop_hit(cx, cy)
+        if hit is None:
+            return
+        self._crop_drag = (hit, cx, cy, tuple(self._crop))
+
+    def _crop_motion(self, event):
+        if not self._crop_drag:
+            return
+        hit, sx, sy, orig = self._crop_drag
+        cx, cy = self.canvas.canvasx(event.x), self.canvas.canvasy(event.y)
+        dx_pt = (cx - sx) / self._scale
+        dy_pt = -(cy - sy) / self._scale          # canvas y grows downward
+        pw, ph = self._cur_size
+        x0, y0, x1, y1 = orig
+        ar = self._paper_aspect()
+
+        if hit == "move":
+            w, h = x1 - x0, y1 - y0
+            nx0 = min(max(0.0, x0 + dx_pt), pw - w)
+            ny0 = min(max(0.0, y0 + dy_pt), ph - h)
+            self._crop = (nx0, ny0, nx0 + w, ny0 + h)
+        else:
+            # Resize from the grabbed corner, keeping the paper's shape so
+            # the result still fits the size the user picked.
+            if hit in ("nw", "sw"):
+                nx0 = min(max(0.0, x0 + dx_pt), x1 - 20)
+            else:
+                nx0 = x0
+            if hit in ("ne", "se"):
+                nx1 = max(min(pw, x1 + dx_pt), nx0 + 20)
+            else:
+                nx1 = x1
+            w = max(20.0, nx1 - nx0)
+            if ar:
+                h = w / ar
+            else:
+                h = max(20.0, (y1 - y0) + (dy_pt if hit.startswith("s")
+                                           else -dy_pt))
+            if hit.startswith("n"):          # top edge grabbed: keep bottom
+                ny0 = y0
+                ny1 = min(ph, ny0 + h)
+            else:                            # keep the top edge pinned
+                ny1 = y1
+                ny0 = max(0.0, ny1 - h)
+            if ar and (ny1 - ny0) < h - 0.5:
+                h = ny1 - ny0
+                w = h * ar
+                nx1 = min(pw, nx0 + w)
+            self._crop = (nx0, ny0, nx1, ny1)
+        self._draw()
+
+    def _crop_release(self, _event=None):
+        self._crop_drag = None
+
+    def _do_crop(self, every_page):
+        """Commit the box: this page, or the same box on all of them.
+
+        The box is in SOURCE units (points for a PDF, pixels for a scan) and
+        is applied before the paper-size fitting, so "every page" only makes
+        sense for pages that share the current page's geometry — a mixed-size
+        document would otherwise get a box that means something different on
+        each page. Pages that don't match are skipped and reported."""
+        if not self._crop or self._cur is None:
+            return
+        box = tuple(round(float(v), 2) for v in self._crop)
+        dpi = self._crop_dpi or 72.0
+        cur_dims = (round(self._cur_size[0], 1), round(self._cur_size[1], 1))
+        targets, skipped = [], 0
+        if every_page:
+            for (it, idx) in self._pages:
+                if (it.uid, idx) == self._cur:
+                    targets.append((it.uid, idx))
+                    continue
+                dims = self._source_dims(it, idx)
+                if dims and (round(dims[0], 1), round(dims[1], 1)) == cur_dims:
+                    targets.append((it.uid, idx))
+                else:
+                    skipped += 1
+        else:
+            targets.append(self._cur)
+        dropped = 0
+        for key in targets:
+            edits = self.app.page_edits.setdefault(
+                key, {"redactions": [], "cleared_fields": []})
+            # Text removals were measured against the FITTED page; cropping
+            # changes that page, so keeping them would move white boxes onto
+            # the wrong words. Cleared form fields are by name, so they stay.
+            if edits.get("redactions"):
+                dropped += len(edits["redactions"])
+                edits["redactions"] = []
+            edits["crop_src"] = list(box)
+        self.app._doc_dirty = True
+        w_in = (box[2] - box[0]) / dpi
+        h_in = (box[3] - box[1]) / dpi
+        self.app.log(f"Cropped {len(targets)} page(s) to "
+                     f"{w_in:.2f}in x {h_in:.2f}in"
+                     + (f" ({skipped} skipped: different page size)."
+                        if skipped else "."))
+        # The crop happens before imposition, so the cached renders are stale.
+        uids = {uid for (uid, _i) in targets}
+        for it in self.app.items:
+            if it.uid in uids:
+                self.app._render_worker.reset_cache(it)
+                self.app._render_worker.enqueue(it)
+        self.app._refresh()
+        self._set_mode("none")
+        note = (f" {skipped} page(s) skipped — different page size."
+                if skipped else "")
+        if dropped:
+            note += (f" {dropped} earlier text removal(s) were cleared — "
+                     f"cropping moves the page, so please re-apply them.")
+        self.info.config(
+            text=f'✓ Cropped {len(targets)} page(s) to {w_in:.2f}" × '
+                 f'{h_in:.2f}". Re-rendering…{note}')
+        self._await_rerender(
+            uids, 0,
+            done_msg=f'✓ Cropped {len(targets)} page(s) to {w_in:.2f}" × '
+                     f'{h_in:.2f}". Saved with the document.{note}')
+
+    def _source_dims(self, item, idx):
+        """(w, h) of an item's original page `idx`, in that item's own units."""
+        try:
+            kind = file_kind(item.value)
+        except Exception:
+            return None
+        if kind == "image":
+            try:
+                img = Image.open(item.value)
+                try:
+                    img = ImageOps.exif_transpose(img)
+                except Exception:
+                    pass
+                return (float(img.width), float(img.height))
+            except Exception:
+                return None
+        src = self._crop_source_pdf(item, idx)
+        if src is None:
+            return None
+        try:
+            doc = pdfium.PdfDocument(src)
+            dims = doc[0].get_size()
+            doc.close()
+            return (float(dims[0]), float(dims[1]))
+        except Exception:
+            return None
+
+    def _await_rerender(self, uids, tries, done_msg=None):
+        """Wait for the background render, then repaint the page and Preview.
+
+        The crop is applied by the render worker, so there is nothing correct
+        to show until it has finished — polling beats guessing at a delay."""
+        pending = [it for it in self.app.items
+                   if it.uid in uids and not it.cached_pdf_bytes]
+        if pending and tries < 60:
+            self.frame.after(
+                250,
+                lambda: self._await_rerender(uids, tries + 1, done_msg))
+            return
+        if self._cur_page:
+            try:
+                self._load_page(*self._cur_page)
+            except Exception:
+                pass
+        self._after_edit()
+        # _load_page / _after_edit repaint the info line, so the confirmation
+        # goes on last — otherwise the one thing the user is waiting to read
+        # is overwritten by a character count.
+        if done_msg:
+            self.info.config(text=done_msg)
 
     def _add_text_here(self, event):
         """Drop a text note where the user clicked.
@@ -10043,6 +10543,12 @@ class EditorTab:
             self._sel = set()
         self._chars = []
         self._fields = []
+        self._crop_src = None
+        self._crop_dpi = 72.0
+        self._scale = self.DEFAULT_SCALE
+        if not item.cached_pdf_bytes:
+            self._set_placeholder("Still rendering this file — one moment.")
+            return
         try:
             writer = PdfWriter()
             reader = PdfReader(io.BytesIO(item.cached_pdf_bytes))
@@ -10125,7 +10631,8 @@ class EditorTab:
         # Painted out, exactly as the finished page will look. The old
         # red-outlined boxes read as "something went wrong" rather than
         # "this text is gone".
-        for (x0, y0, x1, y1) in self._redactions():
+        for (x0, y0, x1, y1) in ([] if self._crop_src
+                                 else self._redactions()):
             a, b = self._pdf_to_canvas(x0, y1)
             c, d = self._pdf_to_canvas(x1, y0)
             self.canvas.create_rectangle(a, b, c, d, fill="#ffffff",
@@ -10154,6 +10661,7 @@ class EditorTab:
                                            * self._scale)))))
             except Exception:
                 pass
+        self._draw_crop()
         # Current selection.
         for i in self._sel:
             _ch, x0, y0, x1, y1 = self._chars[i]
@@ -10179,6 +10687,9 @@ class EditorTab:
     # ---- selection -------------------------------------------------------
     def _on_press(self, event):
         self.canvas.focus_set()
+        if self._mode == "crop":
+            self._crop_press(event)
+            return
         if self._mode == "addtext":
             self._add_text_here(event)
             return
@@ -10194,6 +10705,9 @@ class EditorTab:
         self._update_info()
 
     def _on_drag(self, event):
+        if self._mode == "crop":
+            self._crop_motion(event)
+            return
         if self._drag_from is None:
             return
         x0, y0 = self._drag_from
@@ -10203,6 +10717,9 @@ class EditorTab:
         self._update_info()
 
     def _on_release(self, _event):
+        if self._mode == "crop":
+            self._crop_release()
+            return
         self._drag_from = None
         self._update_info()
 
@@ -10306,10 +10823,22 @@ class EditorTab:
             ["!disabled"] if self.fill_list.curselection() else ["disabled"])
 
     def _clear_page_edits(self):
+        had_crop = bool((self.app.page_edits.get(self._cur) or {})
+                        .get("crop_src"))
         if self._cur in self.app.page_edits:
             del self.app.page_edits[self._cur]
         self._sel = set()
         self.app._doc_dirty = True
+        if had_crop:
+            # The crop lives in the cached render, so undoing it means
+            # rebuilding that render.
+            for it in self.app.items:
+                if self._cur and it.uid == self._cur[0]:
+                    self.app._render_worker.reset_cache(it)
+                    self.app._render_worker.enqueue(it)
+            self.app._refresh()
+            self._await_rerender({self._cur[0]}, 0)
+            return
         self._after_edit()
 
     def _apply_changes(self):
@@ -10319,11 +10848,12 @@ class EditorTab:
         edits = self.app.page_edits.get(self._cur) or {}
         nred = len(edits.get("redactions", []))
         ncle = len(edits.get("cleared_fields", []))
+        ncrop = 1 if edits.get("crop_src") else 0
         if hasattr(self.app, "preview"):
             self.app.preview.invalidate()
             self.app.preview.refresh_preview()
         self.app.autosave_project()
-        if not (nred or ncle):
+        if not (nred or ncle or ncrop):
             self.info.config(text="Nothing to apply on this page yet.")
             return
         bits = []
@@ -10331,6 +10861,8 @@ class EditorTab:
             bits.append(f"{nred} text removal(s)")
         if ncle:
             bits.append(f"{ncle} cleared form field(s)")
+        if ncrop:
+            bits.append("a crop")
         self.info.config(
             text=f"✓ Applied — {' and '.join(bits)} on this page. "
                  f"Saved with the document.")
@@ -10809,10 +11341,15 @@ class App:
             _font = (_base["family"], _base["size"] + 1, "bold")
         except Exception:
             _font = ("", 11, "bold")
-        self.create_btn = tk.Button(create_row, text="Create MyDoc",
-                                    font=_font, cursor="hand2",
-                                    command=self.create_doc)
-        self.create_btn.pack(fill="x", ipady=4)
+        # Named for what it produces, and only as wide as its own label —
+        # stretching it across the window made it less noticeable, not more.
+        self.create_btn = tk.Button(
+            create_row, text="Create the File  (PDF, img, jpg, …)",
+            font=_font, cursor="hand2", command=self.create_doc,
+            padx=18, pady=2, bd=2, relief="raised",
+            activebackground="#dceaf7",
+        )
+        self.create_btn.pack(ipady=3)
         tip(self.create_btn,
             "Turn everything in your list into one finished document. You "
             "pick the format next — PDF, images, Word, web page or plain "
@@ -10899,6 +11436,7 @@ class App:
         self._render_worker = RenderWorker(
             on_event=lambda msg: self.work_queue.put(msg),
             layout_fn=self._current_layout,
+            crops_fn=self._crops_for_item,
             concurrency=2,
         )
 
@@ -11264,6 +11802,15 @@ class App:
             (getattr(self, "arrange_var", None) and self.arrange_var.get())
             or "side",
         )
+
+    def _crops_for_item(self, item):
+        """{page_index: box} of source crops for one item. Thread-safe: it
+        only reads the plain page_edits dict, never a Tk variable."""
+        out = {}
+        for (uid, idx), edits in list(self.page_edits.items()):
+            if uid == item.uid and edits.get("crop_src"):
+                out[idx] = edits["crop_src"]
+        return out or None
 
     def natural_keys(self):
         """Every page of every ready item, in file order, minus the ones
