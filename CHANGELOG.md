@@ -1,5 +1,48 @@
 # Changelog
 
+## v1.65.7
+- **Scanning: fixed quality and added multi-page.** The old code ran
+  `scanimage --format=png --resolution=200` and nothing else — it never set
+  `--mode`, so the scan came out in the device's default, which on a Brother
+  DCP-L2640DW is `Lineart` (1-bit). New `show_scan_dialog()` asks the device
+  what it supports (`scanner_devices()`, `scanner_capabilities()`), defaults to
+  **Colour at 300 dpi**, and offers the glass or the feeder. `run_scan()` uses
+  `--batch` for the feeder so a whole stack arrives in one pass; from the glass
+  you press Scan repeatedly and add the lot. Capability detection verified
+  against real hardware: modes `[Lineart, Gray, Color]`, resolutions
+  `[100, 200, 300, 600]`, sources `[Flatbed, ADF]`.
+- **Preview scrolling and zooming fixed.** Three compounding causes, measured:
+  `Fit` fitted the page *width* (≈196% on a wide window, making a letter page
+  1549 px tall inside a 278 px viewport); a wheel notch moved ~83 px because
+  Tk's canvas "unit" is ~28 px and the code scrolled three of them; and six
+  stacked control rows left only 39% of the window for the document. Now
+  `Fit page` fits the whole page and is the default (`Fit width` remains a
+  preset), `wheel_scroll()` moves a fraction of the visible area at any zoom,
+  and merged rows take the viewing area to 45%. A page went from 1549 px to
+  290 px in a 326 px view.
+- **Order zoom: 2851 ms → 21 ms** on a 20-page document. Pages are rendered
+  once at a size covering maximum zoom and cached (`_page_source`), so a zoom
+  step only resizes (`_fit_thumb`); and `_rezoom()` reuses the existing cards
+  instead of destroying and rebuilding all of them (~140 ms each).
+- **Order thumbnails are trimmed to their content** (`auto_crop_pil`), on by
+  default. Measured on a dense page, content went from 29.8% to 67.3% of the
+  thumbnail; a guard stops a sparse page collapsing into an unrecognisable
+  sliver.
+- **One wheel rule everywhere**: over the document it scrolls, over the zoom
+  strip it zooms. The shared `ZoomBar` now appears in Order too, in the same
+  place as the other tabs, and steps 5% instead of 50%.
+- **Add Style has a live page-1 preview**, debounced 350 ms, listing what is
+  applied.
+- Dropped the custom `Create.TButton` style in favour of a classic bold
+  button: defining that style measurably destabilised later ttk widget
+  creation on Linux (4/4 crashes with it, 0/4 without).
+- Added `_ensure_ui_ready()` before modal dialogs and a `MYDOCMAKER_NO_DND=1`
+  escape hatch plus a Settings toggle for drag-and-drop.
+- **Known issue:** an intermittent segfault inside Tk during widget creation
+  remains unexplained. It needs abnormal timing to provoke — 12/12 normal
+  launches are clean — and files, render threads, queue reentrancy, the logo,
+  drag-and-drop and `pillow_heif` have all been eliminated as causes.
+
 ## v1.65.6
 - **Fixed a data race that could segfault the whole app**, reported after
   combining three files. `RenderWorker._loop` called `App._current_layout()`
