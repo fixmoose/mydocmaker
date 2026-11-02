@@ -1,5 +1,26 @@
 # Changelog
 
+## v1.65.10
+- **The Add-text pointer shows what a click will do.** A crosshair cannot
+  answer "is this the top, middle or bottom of my text?" — the answer is the
+  *baseline*, and nothing on screen said so. The cursor is now a text I-beam,
+  and a caret is drawn at the pointer using `note_text_metrics()`, the same
+  font metrics that write the PDF: the vertical stroke spans the real ascent
+  above and descent below, two serifs cap it, and a heavier stroke runs to the
+  right along the baseline, the direction the text will flow. A status line
+  states it in words while the tool is armed. Verified at 9, 14, 24 and 48 pt
+  that the caret height equals the printed text height and that the baseline
+  stroke sits exactly on the pointer.
+- Caught while testing: the first version of the caret applied a 4-pixel
+  minimum to its height, which reported a 9 pt caret as 13.56 pt against the
+  text's real 8.32 pt — the same class of bug as the `max(6, ...)` font floor
+  removed in 1.65.9. A minimum in pixels stops a preview shrinking with the
+  page and makes it lie about the printed size, so the floor is gone; only the
+  purely decorative serif width keeps one.
+- Regression suite grew a `ghost` group (21 checks) covering the cursor, the
+  caret geometry at four sizes, clearing on disarm and drawing nothing when
+  the pointer is off the page. 96 checks total.
+
 ## v1.65.9
 - **Text notes now land exactly where they are placed.** The reported bug
   ("this non alignment makes this software useless") had a measurable cause:

@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.9"
+APP_VERSION = "1.65.10"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -162,6 +162,16 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.10": [
+        "Adding text now shows you where the text will go before you click. "
+        "The old crosshair gave no clue whether that point was the top, "
+        "middle or bottom of the text — it is the baseline, the line the "
+        "letters stand on. You now get a text I-beam cursor plus a caret "
+        "drawn at the real height of your chosen font size: the full height "
+        "above the pointer, descenders just below, and a heavier line "
+        "running right along the baseline. Put that line straight on a "
+        "form's rule and the text lands on it.",
+    ],
     "1.65.9": [
         "Text you add now prints exactly where you put it. This was the big "
         "one: the page on screen and the finished PDF were drawn by two "
@@ -7671,7 +7681,8 @@ class PreviewTab:
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
-        self.canvas.bind("<Motion>", self._hover_corner)
+        self.canvas.bind("<Motion>", self._on_canvas_motion)
+        self.canvas.bind("<Leave>", self._clear_ghost, add="+")
         self.canvas.bind("<Button-3>", self._on_shape_menu)
         # macOS trackpads report a right-click as Control-click; Button-2 is
         # already taken here by panning.
@@ -8402,12 +8413,22 @@ class PreviewTab:
         """Reflect the armed/idle state in the cursor and the button label."""
         armed = self.text_mode.get()
         try:
-            self.canvas.config(cursor="crosshair" if armed else "")
+            # An I-beam, not a crosshair: a target says "pick a point", an
+            # I-beam says "text starts here", which is what is about to
+            # happen.
+            self.canvas.config(cursor="xterm" if armed else "")
         except tk.TclError:
             pass
+        if not armed:
+            self.canvas.delete("textghost")
         if hasattr(self, "add_text_btn"):
             self.add_text_btn.config(
                 text="✎ Placing — Esc to stop" if armed else "✎ Add text")
+        if armed and hasattr(self, "status_lbl"):
+            self.status_lbl.config(
+                text="Click where the text should start. The pointer marks "
+                     "the BASELINE — the line the letters stand on — so put "
+                     "it straight on a form's rule. Esc to stop.")
 
     def _disarm_text_mode(self, _event=None):
         if self.text_mode.get():
@@ -8658,6 +8679,7 @@ class PreviewTab:
             "caret": len(note.get("text", "")),
         }
         self._select_note(note)
+        self.canvas.delete("textghost")
         self.canvas.focus_set()
         self._blink_on = True
         self._redraw_notes()
@@ -9027,6 +9049,55 @@ class PreviewTab:
                 if abs(cx - hx) <= h and abs(cy - hy) <= h:
                     return shape, name, (hx, hy)
         return None, None, None
+
+    def _clear_ghost(self, _event=None):
+        self.canvas.delete("textghost")
+
+    def _on_canvas_motion(self, event):
+        """Pointer moved: show whatever tells the user what a click will do."""
+        self._hover_corner(event)
+        self._draw_text_ghost(event)
+
+    def _draw_text_ghost(self, event):
+        """A caret at the pointer, the exact height of the text that a click
+        would place, sitting on the baseline the text will sit on.
+
+        The point is to show what is about to happen BEFORE it happens, so a
+        value can be lined up with a form's rule rather than placed and then
+        nudged. Height comes from the real PDF font metrics, so what is drawn
+        here is the height the printed text will have."""
+        self.canvas.delete("textghost")
+        if not self.text_mode.get():
+            return
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        if self._canvas_to_pdf(cx, cy) is None:
+            return                       # pointer is off the page
+        probe = {"text": "Hg", "font": self.note_font.get(),
+                 "size": _safe_int(self.note_size.get(), 14),
+                 "bold": bool(self.note_bold.get()),
+                 "italic": bool(self.note_italic.get())}
+        m = note_text_metrics(probe)
+        s = self._page_render_scale or 1.0
+        asc = m["ascent"] * s
+        desc = m["descent"] * s
+        top, bot = cy - asc, cy + desc
+        # Serif width is pure decoration, so it may have a minimum; the
+        # STROKE HEIGHT may not -- a floor there would overstate how tall the
+        # printed text is, which is the whole thing this is here to show.
+        arm = max(3.0, asc * 0.22)
+        col = "#0a64d8"
+        self.canvas.create_line(cx, top, cx, bot, fill=col, width=1,
+                                tags="textghost")
+        for y in (top, bot):
+            self.canvas.create_line(cx - arm, y, cx + arm, y, fill=col,
+                                    width=1, tags="textghost")
+        # The baseline, drawn heavier and running to the RIGHT the way the
+        # text will flow. "Is the pointer the top, middle or bottom of my
+        # text?" is unanswerable from a crosshair; this says: it is the line
+        # the letters stand on, with descenders dropping just below it.
+        self.canvas.create_line(cx, cy, cx + max(18.0, arm * 3.0), cy,
+                                fill=col, width=2, tags="textghost")
 
     def _hover_corner(self, event):
         """Show a small black corner marker when the pointer is over a frame's

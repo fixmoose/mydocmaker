@@ -538,9 +538,77 @@ def g_guards():
         h.close()
 
 
+def g_ghost():
+    """The Add-text pointer: I-beam cursor and a caret that previews the
+    real text height on the real baseline."""
+    h = Harness([make_pdf(os.path.join(TMP, "gh.pdf"), 1, text=None)])
+    try:
+        check("ghost", "idle cursor is default",
+              str(h.pv.canvas.cget("cursor")) in ("", "arrow"),
+              repr(h.pv.canvas.cget("cursor")))
+        h.pv.text_mode.set(True)
+        h.pv._sync_text_mode()
+        check("ghost", "armed cursor is an I-beam",
+              str(h.pv.canvas.cget("cursor")) == "xterm",
+              repr(h.pv.canvas.cget("cursor")))
+
+        scale = h.pv._page_render_scale
+        for size in (9, 14, 24, 48):
+            h.pv.note_size.set(str(size))
+            cx, cy = h.cpt(200, 500)
+            h.pv._draw_text_ghost(Ev(cx, cy))
+            h.root.update()
+            ids = h.pv.canvas.find_withtag("textghost")
+            check("ghost", f"{size}pt caret drawn", len(ids) == 4,
+                  f"{len(ids)} items")
+            # The vertical stroke must span ascent+descent of the REAL font.
+            spans = [h.pv.canvas.coords(i) for i in ids]
+            vert = [c for c in spans if abs(c[0] - c[2]) < 0.5]
+            check("ghost", f"{size}pt has one vertical stroke",
+                  len(vert) == 1, str(len(vert)))
+            if vert:
+                drawn = abs(vert[0][3] - vert[0][1]) / scale
+                m = note_metrics_for(size)
+                want = m["ascent"] + m["descent"]
+                check("ghost", f"{size}pt height matches printed text",
+                      abs(drawn - want) < max(1.0, want * 0.06),
+                      f"caret {drawn:.2f}pt vs text {want:.2f}pt")
+                # The baseline stroke must sit at the pointer, not above it.
+                base = [c for c in spans
+                        if abs(c[1] - c[3]) < 0.5
+                        and abs(c[1] - int(cy)) < 0.6]
+                check("ghost", f"{size}pt baseline on the pointer",
+                      len(base) == 1, str(spans))
+
+        # and it must vanish when the tool is put away
+        h.pv._disarm_text_mode()
+        h.root.update()
+        check("ghost", "cleared on disarm",
+              len(h.pv.canvas.find_withtag("textghost")) == 0)
+        check("ghost", "cursor restored",
+              str(h.pv.canvas.cget("cursor")) in ("", "arrow"),
+              repr(h.pv.canvas.cget("cursor")))
+
+        # off the page there is nothing to preview
+        h.pv.text_mode.set(True)
+        h.pv._sync_text_mode()
+        h.pv._draw_text_ghost(Ev(3, 3))
+        h.root.update()
+        check("ghost", "nothing drawn off-page",
+              len(h.pv.canvas.find_withtag("textghost")) == 0)
+        h.pv._disarm_text_mode()
+    finally:
+        h.close()
+
+
+def note_metrics_for(size):
+    return M.note_text_metrics({"text": "Hg", "font": "Helvetica",
+                                "size": size, "bold": False, "italic": False})
+
+
 GROUPS = {"startup": g_startup, "notes": g_notes, "shapes": g_shapes,
           "crop": g_crop, "project": g_project, "print": g_print,
-          "guards": g_guards, "tabs": g_tabs}
+          "guards": g_guards, "ghost": g_ghost, "tabs": g_tabs}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(GROUPS)
