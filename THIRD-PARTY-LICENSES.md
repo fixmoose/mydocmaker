@@ -67,3 +67,15 @@ license files that ship inside each Python package (e.g.
 bundle directory. End users wanting to read the verbatim text of any
 particular upstream license can extract the bundle and find the relevant
 `*.dist-info/LICENSE` files alongside the application.
+
+## Not bundled: other PDF editors
+
+Evaluated and deliberately not used, recorded so the question isn't reopened:
+
+| Project | Licence | Why not |
+| --- | --- | --- |
+| [Stirling-PDF](https://github.com/Stirling-Tools/stirling-pdf) | MIT shell; `engine/`, `frontend/src/editor/proprietary/`, `frontend/src/processor/` and the `app/proprietary/`, `app/saas/` trees under the "Stirling PDF User License" | Open-core. The editor itself is the proprietary part: "Production use of the Stirling PDF Software is only permitted with a valid Stirling PDF User License." Also Java/Gradle, so reuse would mean shipping a JVM. |
+| [word-sys-pdf-editor](https://github.com/word-sys/word-sys-pdf-editor) | GPL-3.0-or-later | Free of charge, but strong copyleft: incorporating its code would license all of MyDocMaker under GPL-3.0, which cannot coexist with PolyForm Noncommercial plus a paid commercial tier. It also depends on PyMuPDF (AGPL-3.0), which is why it is GPL in the first place. |
+| [open-pdf-studio](https://github.com/OpenAEC-Foundation/open-pdf-studio) | LGPL-3.0 | Free and the only licence-compatible one of the three — LGPL allows linking from a differently-licensed application when the library ships as a replaceable dynamic library with source available. Not used because it is a separate Rust/Tauri desktop application whose rendering is PDFium, which this app already uses via pypdfium2. |
+
+Checked 2026-11-02.

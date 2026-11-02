@@ -1,5 +1,63 @@
 # Changelog
 
+## v1.65.9
+- **Text notes now land exactly where they are placed.** The reported bug
+  ("this non alignment makes this software useless") had a measurable cause:
+  the Preview drew notes as Tk canvas text while the PDF drew them with
+  reportlab — two renderers that could not agree. Three faults compounded in
+  `_note_canvas_font()`: the on-screen size was computed in **pixels** and
+  handed to Tk as **points**, which Tk then scaled by the display DPI (1.33x
+  here, and a different figure on a different monitor); a `max(6, ...)` floor
+  stopped the text shrinking with the page when zoomed out; and `anchor="sw"`
+  put the glyph's *descender* on the baseline point, so the output sat lower
+  than the screen showed. Measured on a letter page at 14pt: preview text was
+  40.7 pt wide and 24.4 pt tall against the output's 22.8 x 12.8 — **1.79x
+  too big**.
+- **The fix is one renderer, not two.** `PreviewTab._rebuild_now()` now runs
+  `apply_text_notes()` — the function that writes the PDF — over the page it
+  rasterises, so the pixels on screen come from the output pipeline by
+  construction. Only the note actually being typed or dragged is drawn by Tk,
+  and it is excluded from the bake so it cannot appear twice. Verified at 9,
+  14 and 24 pt: preview vs output **dx +0.00, dy +0.00** in every case.
+  `note_text_metrics()` / `note_pdf_box()` supply the real base-14 font
+  metrics so selection, hit-testing and the caret use the printed geometry
+  too. Rebuilding costs ~11 ms on a 10-page document, so this happens on
+  every click into and out of a note.
+- **Add text is sticky.** It stays armed after each placement — a form can be
+  filled in one pass instead of returning to the button each time. Esc or a
+  second press disarms. The old "nudge the new note clear of an existing one"
+  hack is gone; text lands on the exact click point.
+- **New Rectangle tool** for framing something important, built on the same
+  single-renderer rule — `apply_shapes()` draws both the preview and the file,
+  verified identical bbox *and* identical ink-pixel count for every style.
+  - Drag **left-to-right** for a plain rectangle, **right-to-left** for a
+    scalloped revision cloud (the CAD window/crossing convention).
+  - Styles: rectangle, revision cloud, dashed, dotted, double line — settable
+    before drawing, from the toolbar, or by **right-clicking** any frame.
+    Measured ink per style: 39680 / 55852 / 23808 / 15459 / 78336 px, so they
+    are visibly distinct.
+  - **Always hollow.** Content under a frame is untouched (13906 dark pixels
+    inside the frame before and after) and the middle stays transparent.
+  - **Hover a corner** and a small black L appears with a sizing cursor; drag
+    to resize. Nothing is drawn around a selected frame — a dashed selection
+    box was a second rectangle and made it impossible to tell which one was
+    really on the page.
+  - Resize and move stay smooth by moving existing canvas items with
+    `coords()` rather than rebuilding them: **0.03 ms** per frame for a
+    rectangle, **0.66 ms** for a 100-arc cloud.
+- **An existing annotation always wins over making a new one**, whichever tool
+  is armed: clicking text you already placed edits that text, and pressing a
+  frame adjusts that frame. Stacking a new one on top was how the first became
+  unreachable, and everything added has to stay editable later.
+- **New Print button** beside Create. Prints the working document through
+  `assemble_from_cache()` — the same call Create and Sign use — so page order,
+  hidden pages, crops, style, text and frames all come with it, with no file
+  created first. Verified: a 3-page document with one page hidden printed 2
+  pages with the frame present.
+- **Regression suite moved into the repo** at `tests/regress.py`. The previous
+  one lived in `/tmp` and was deleted by a system cleanup, taking all coverage
+  with it.
+
 ## v1.65.8
 - **Crop tool (Editor).** Choosing a Paper size and clicking **Crop** puts a
   box of exactly those proportions on the page, anchored to the top and as

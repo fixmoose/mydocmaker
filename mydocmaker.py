@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.8"
+APP_VERSION = "1.65.9"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -162,6 +162,31 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.9": [
+        "Text you add now prints exactly where you put it. This was the big "
+        "one: the page on screen and the finished PDF were drawn by two "
+        "different pieces of code, and they disagreed — on this screen the "
+        "on-screen text came out about 1.8x too big, so text you had lined "
+        "up against a form's line landed somewhere else in the file. The "
+        "preview is now drawn by the same code that writes the PDF, so what "
+        "you see is what you get, measured to the point.",
+        "Add text stays switched on. Click it once and keep clicking down a "
+        "form; Esc (or the button again) goes back to the pointer.",
+        "New Rectangle tool for framing something important. Drag LEFT to "
+        "RIGHT for a plain rectangle, RIGHT to LEFT for a scalloped revision "
+        "cloud. Pick the colour and thickness, or right-click any frame to "
+        "switch it between rectangle, cloud, dashed, dotted and double line. "
+        "Frames are always hollow, so they never hide what they mark.",
+        "Hover a frame's corner and a small black corner mark appears — drag "
+        "it to resize. Nothing is drawn around a selected frame any more, so "
+        "there is never a second rectangle confusing you about which one is "
+        "really on the page.",
+        "Clicking on text or a frame you already added always edits that one "
+        "instead of dropping a new one on top, so everything stays reachable "
+        "however much later you come back to it.",
+        "New Print button next to Create: sends the document straight to your "
+        "printer mid-edit, with no need to create and save a file first.",
+    ],
     "1.65.8": [
         "New Crop tool in the Editor, built for scans that come out longer "
         "than the paper. Pick your Paper size, click Crop, and a box in "
@@ -1876,6 +1901,194 @@ def rasterize_page(page):
         return page
 
 
+NOTE_LINE_SPACING = 1.25     # must match apply_text_notes()
+
+# ---------------------------------------------------------------------------
+# Shapes (v1.65.9): rectangles the user draws to frame something important.
+# Each is {page (final display index), x0_pt, y0_pt, x1_pt, y1_pt (corners from
+# the page's bottom-left), color '#rrggbb', width (frame thickness in points),
+# style 'rect' or 'cloud'}. Dragging left-to-right gives a plain rectangle,
+# right-to-left a scalloped revision cloud — the same window/crossing
+# convention CAD uses. Always an outline: the middle stays transparent so the
+# framed content shows through. Drawn into the output by apply_shapes(), and into
+# the Preview by the SAME call — see PreviewTab._rebuild_now. One renderer, so
+# what is on screen is what lands in the file.
+# ---------------------------------------------------------------------------
+SHAPE_COLORS = (("Red", "#d00000"), ("Yellow", "#f2c200"),
+                ("Green", "#128a3c"), ("Blue", "#0a64d8"),
+                ("Black", "#000000"), ("White", "#ffffff"))
+SHAPE_WIDTH_DEFAULT = 2.0
+
+
+def _hex_to_rgb01(value, default=(0.8, 0.0, 0.0)):
+    """'#rrggbb' -> (r, g, b) floats for reportlab."""
+    try:
+        h = str(value).lstrip("#")
+        if len(h) == 3:
+            h = "".join(ch * 2 for ch in h)
+        return tuple(int(h[i:i + 2], 16) / 255.0 for i in (0, 2, 4))
+    except Exception:
+        return default
+
+
+def shape_pdf_box(shape):
+    """A shape's normalised box in PDF points: (x0, y0, x1, y1), x0<x1, y0<y1."""
+    x0 = min(float(shape["x0_pt"]), float(shape["x1_pt"]))
+    x1 = max(float(shape["x0_pt"]), float(shape["x1_pt"]))
+    y0 = min(float(shape["y0_pt"]), float(shape["y1_pt"]))
+    y1 = max(float(shape["y0_pt"]), float(shape["y1_pt"]))
+    return x0, y0, x1, y1
+
+
+CLOUD_BUMP_PT = 12.0      # target scallop diameter for a revision cloud
+
+# Frame styles, in the order they appear in the picker and the right-click
+# menu. The value is what goes in the shape dict's "style".
+SHAPE_STYLES = (("Rectangle", "rect"),
+                ("Revision cloud", "cloud"),
+                ("Dashed", "dashed"),
+                ("Dotted", "dotted"),
+                ("Double line", "double"))
+SHAPE_STYLE_NAMES = {v: k for k, v in SHAPE_STYLES}
+
+# Dash patterns in points, per style, for a 1pt line; scaled by the frame's
+# own thickness so a thick dashed frame doesn't turn into a solid one.
+SHAPE_DASHES = {"dashed": (6.0, 4.0), "dotted": (0.6, 3.0)}
+
+
+def cloud_bumps(x0, y0, x1, y1, bump=CLOUD_BUMP_PT):
+    """The scallops of a revision cloud around (x0, y0)-(x1, y1).
+
+    Yields (cx, cy, r, start_deg) per bump, each a 180-degree arc bulging
+    OUTWARD from the frame. One generator feeds both the PDF renderer and the
+    on-screen one, so a cloud can't look different in the two places. The
+    radius is adjusted per side so a whole number of bumps fits exactly,
+    otherwise the corners end up with a stub."""
+    sides = (
+        # (along-axis length, start point, step vector, outward start angle)
+        (x1 - x0, (x0, y1), (1, 0), 0),      # top    -> bulge up
+        (y1 - y0, (x1, y1), (0, -1), 270),   # right  -> bulge right
+        (x1 - x0, (x1, y0), (-1, 0), 180),   # bottom -> bulge down
+        (y1 - y0, (x0, y0), (0, 1), 90),     # left   -> bulge left
+    )
+    for length, (sx, sy), (ux, uy), ang in sides:
+        if length <= 0:
+            continue
+        n = max(1, int(round(length / bump)))
+        r = length / (2.0 * n)
+        for i in range(n):
+            d = (2 * i + 1) * r
+            yield (sx + ux * d, sy + uy * d, r, ang)
+
+
+def apply_shapes(pdf_bytes, shapes):
+    """Draw the user's rectangles onto the matching pages. Mirrors
+    apply_text_notes(): keyed by final display page index, no-op when empty."""
+    if not shapes:
+        return pdf_bytes
+    by_page = {}
+    for sh in shapes:
+        x0, y0, x1, y1 = shape_pdf_box(sh)
+        if x1 - x0 < 1 or y1 - y0 < 1:
+            continue                      # a stray click, not a rectangle
+        by_page.setdefault(int(sh["page"]), []).append(sh)
+    if not by_page:
+        return pdf_bytes
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception:
+        return pdf_bytes
+    writer = PdfWriter()
+    for idx, page in enumerate(reader.pages):
+        page_shapes = by_page.get(idx)
+        if page_shapes:
+            w = float(page.mediabox.width)
+            h = float(page.mediabox.height)
+            buf = io.BytesIO()
+            c = canvas.Canvas(buf, pagesize=(w, h))
+            for sh in page_shapes:
+                x0, y0, x1, y1 = shape_pdf_box(sh)
+                lw = max(0.1, float(sh.get("width", SHAPE_WIDTH_DEFAULT)))
+                c.setLineWidth(lw)
+                c.setStrokeColorRGB(*_hex_to_rgb01(sh.get("color", "#d00000")))
+                # Outline only — a frame marks what is underneath it, so the
+                # middle stays transparent and never hides the content.
+                style = sh.get("style", "rect")
+                if style == "cloud":
+                    c.setDash()
+                    for cx, cy, r, ang in cloud_bumps(x0, y0, x1, y1):
+                        c.arc(cx - r, cy - r, cx + r, cy + r,
+                              startAng=ang, extent=180)
+                else:
+                    dash = SHAPE_DASHES.get(style)
+                    if dash:
+                        # Round caps turn the short "on" run into a real dot.
+                        c.setLineCap(1 if style == "dotted" else 0)
+                        c.setDash([max(0.2, d * lw) for d in dash])
+                    else:
+                        c.setDash()
+                        c.setLineCap(0)
+                    c.rect(x0, y0, x1 - x0, y1 - y0, stroke=1, fill=0)
+                    if style == "double":
+                        inset = lw * 2.0
+                        if x1 - x0 > 2 * inset + 1 and y1 - y0 > 2 * inset + 1:
+                            c.rect(x0 + inset, y0 + inset,
+                                   (x1 - x0) - 2 * inset,
+                                   (y1 - y0) - 2 * inset, stroke=1, fill=0)
+                    c.setDash()
+                    c.setLineCap(0)
+            c.showPage()
+            c.save()
+            try:
+                overlay = PdfReader(io.BytesIO(buf.getvalue())).pages[0]
+                page.merge_page(overlay)
+            except Exception:
+                pass
+        writer.add_page(page)
+    out = io.BytesIO()
+    writer.write(out)
+    return out.getvalue()
+
+
+
+def note_text_metrics(note):
+    """A note's true size on the page, from the very font metrics that
+    apply_text_notes() will draw it with.
+
+    This exists so the Preview can box, hit-test and caret a note using the
+    same numbers the PDF will use. Guessing at it with Tk font metrics is
+    what made what you saw differ from what you got."""
+    from reportlab.pdfbase import pdfmetrics
+    size = max(4, int(note.get("size", 14)))
+    fontname = _reportlab_font(note.get("font", "Helvetica"),
+                               note.get("bold"), note.get("italic"))
+    lines = str(note.get("text", "")).split("\n")
+    try:
+        width = max([pdfmetrics.stringWidth(ln, fontname, size)
+                     for ln in lines] or [0.0])
+        face = pdfmetrics.getFont(fontname).face
+        ascent = abs(face.ascent) / 1000.0 * size
+        descent = abs(face.descent) / 1000.0 * size
+    except Exception:
+        # Never let a metrics lookup break the editor.
+        width = size * 0.5 * max(len(ln) for ln in lines)
+        ascent, descent = size * 0.75, size * 0.25
+    extra = (len(lines) - 1) * size * NOTE_LINE_SPACING
+    return {"width": width, "ascent": ascent, "descent": descent,
+            "lines": len(lines), "extra": extra, "size": size,
+            "font": fontname}
+
+
+def note_pdf_box(note):
+    """A note's bounding box in PDF points, (x0, y0, x1, y1) from the page's
+    bottom-left — x_pt/y_pt being the FIRST line's baseline."""
+    m = note_text_metrics(note)
+    x0 = float(note["x_pt"])
+    y_base = float(note["y_pt"])
+    return (x0, y_base - m["descent"] - m["extra"],
+            x0 + m["width"], y_base + m["ascent"])
+
+
 def apply_text_notes(pdf_bytes, notes):
     """Overlay the user's text notes onto the matching pages of the already-
     assembled+styled document. `notes` are keyed by final display page index;
@@ -1909,8 +2122,9 @@ def apply_text_notes(pdf_bytes, notes):
                 c.setFillColorRGB(0, 0, 0)
                 # Multi-line: successive lines go DOWN from the baseline.
                 for j, line in enumerate(str(n["text"]).split("\n")):
-                    c.drawString(float(n["x_pt"]),
-                                 float(n["y_pt"]) - j * size * 1.25, line)
+                    c.drawString(
+                        float(n["x_pt"]),
+                        float(n["y_pt"]) - j * size * NOTE_LINE_SPACING, line)
             c.showPage()
             c.save()
             try:
@@ -2762,6 +2976,7 @@ def build_project_data(app):
         "page_rotate": rekey(app.page_rotate),
         "page_edits": rekey(app.page_edits),
         "text_notes": [dict(n) for n in app.text_notes],
+        "shapes": [dict(sh) for sh in app.shapes],
         "style": _style_to_dict(app.style),
         "layout": {
             "size": app.size_var.get(), "orient": app.orient_var.get(),
@@ -7153,6 +7368,14 @@ class PreviewTab:
         self._selected_note = None
         self._edit_widget = None       # in-place edit state while typing
         self._note_drag = None         # (note, start_cx, start_cy, moved)
+        self._live_note = None         # note drawn on the canvas, not baked
+        self._live_shape = None        # ditto for the rectangle being drawn
+        self._selected_shape = None
+        self._shape_draw = None        # (page, x0, y0) while dragging one out
+        self._shape_drag = None        # (shape, offsets) while moving one
+        self._hover_shape = None       # frame whose corner marker is showing
+        self._hover_corner_name = None
+        self._live_items = []          # canvas items of the live frame
         self._undo_stack = []          # snapshots of the whole note list
         self._redo_stack = []
         self._blink_id = None          # caret blink timer
@@ -7288,18 +7511,38 @@ class PreviewTab:
         # ----- Text-notes toolbar (v1.64): its own row so nothing clips.
         tbar = ttk.Frame(self.frame)
         tbar.pack(fill="x", padx=8, pady=(0, 2))
-        # v1.65: a BUTTON, not a checkbox. Clicking it arms ONE placement —
-        # the next click on a page drops a text box there and opens the
-        # editor, then it disarms itself. Existing notes were always
+        # v1.65: a BUTTON, not a checkbox. Clicking it arms placement and it
+        # STAYS armed (v1.65.9) — every click on a page drops a text box and
+        # opens the editor, so a form can be filled in one pass. Esc or a
+        # second press puts the pointer back. Existing notes were always
         # clickable/editable without any mode; only *creating* one is armed.
         self.text_mode = tk.BooleanVar(value=False)
         self.add_text_btn = ttk.Button(tbar, text="✎ Add text", width=17,
                                        command=self._toggle_text_mode)
         self.add_text_btn.pack(side="left")
         tip(self.add_text_btn,
-            "Click this, then click where you want the text — handy for "
-            "filling in a form. To change text you've already added, just "
-            "click it (or double-click to edit); no need to press this first.")
+            "Click this, then click every spot you want text — it stays on, "
+            "so a whole form can be filled in one pass. Esc (or pressing this "
+            "again) goes back to the pointer. To change text you've already "
+            "added, just click it; no need to press this first.")
+        self.shape_mode = tk.BooleanVar(value=False)
+        self.add_rect_btn = ttk.Button(tbar, text="▭ Rectangle", width=15,
+                                       command=self._toggle_shape_mode)
+        self.add_rect_btn.pack(side="left", padx=(6, 0))
+        tip(self.add_rect_btn,
+            "Click this, then drag on a page to draw a frame around something "
+            "important. Drag LEFT to RIGHT for a plain rectangle, RIGHT to "
+            "LEFT for a scalloped revision cloud. It stays on, so you can "
+            "mark several spots in one pass; Esc goes back to the pointer. "
+            "Hover a corner to drag it bigger or smaller.")
+
+        # The two tools want different options, and a second toolbar row would
+        # eat into the page view — so each tool's options appear in place of
+        # the other's.
+        self.text_opts = ttk.Frame(tbar)
+        self.shape_opts = ttk.Frame(tbar)
+        self.text_opts.pack(side="left")
+        tbar = self.text_opts            # text options go in their own group
         ttk.Label(tbar, text="Font:").pack(side="left", padx=(10, 2))
         self.note_font = tk.StringVar(value="Helvetica")
         fcb = ttk.Combobox(tbar, textvariable=self.note_font, width=9,
@@ -7337,6 +7580,50 @@ class PreviewTab:
         tip(self.note_del_btn,
             "Delete the selected text. Select it by clicking it on the page; "
             "the Delete key does the same.")
+
+        # ----- Rectangle options (shown in place of the text ones)
+        sbar = self.shape_opts
+        ttk.Label(sbar, text="Style:").pack(side="left", padx=(10, 2))
+        self.shape_style = tk.StringVar(value=SHAPE_STYLES[0][1])
+        self.shape_style_cb = ttk.Combobox(
+            sbar, width=14, state="readonly",
+            values=[nm for nm, _v in SHAPE_STYLES])
+        self.shape_style_cb.set(SHAPE_STYLES[0][0])
+        self.shape_style_cb.pack(side="left")
+        self.shape_style_cb.bind("<<ComboboxSelected>>",
+                                 lambda _e: self._on_shape_style_pick())
+        tip(self.shape_style_cb,
+            "The frame's outline. Dragging right-to-left on the page gives a "
+            "revision cloud whatever is picked here; right-click any frame to "
+            "change it afterwards.")
+        ttk.Label(sbar, text="Colour:").pack(side="left", padx=(10, 2))
+        self.shape_color = tk.StringVar(value=SHAPE_COLORS[0][1])
+        self.shape_color_cb = ttk.Combobox(
+            sbar, width=8, state="readonly",
+            values=[nm for nm, _hx in SHAPE_COLORS])
+        self.shape_color_cb.set(SHAPE_COLORS[0][0])
+        self.shape_color_cb.pack(side="left")
+        self.shape_color_cb.bind("<<ComboboxSelected>>",
+                                 lambda _e: self._on_shape_color_pick())
+        self.shape_swatch = tk.Label(sbar, width=2, relief="sunken", bd=1,
+                                     background=SHAPE_COLORS[0][1])
+        self.shape_swatch.pack(side="left", padx=(4, 0))
+        tip(self.shape_swatch, "The colour new frames are drawn in. Click to "
+                               "pick any other colour.")
+        self.shape_swatch.bind("<Button-1>", lambda _e: self._pick_shape_color())
+        ttk.Label(sbar, text="Thickness:").pack(side="left", padx=(10, 2))
+        self.shape_width = tk.StringVar(value=str(SHAPE_WIDTH_DEFAULT))
+        wsb = ttk.Spinbox(sbar, from_=0.5, to=12, increment=0.5, width=4,
+                          textvariable=self.shape_width,
+                          command=self._apply_shape_style_to_selected)
+        wsb.pack(side="left")
+        wsb.bind("<KeyRelease>",
+                 lambda _e: self._apply_shape_style_to_selected())
+        tip(wsb, "Frame thickness in points. 0.5 is hairline, 2 is a clear "
+                 "marker pen, 6 shouts.")
+        self.shape_del_btn = ttk.Button(sbar, text="Delete frame",
+                                        command=self._delete_selected_shape)
+        self.shape_del_btn.pack(side="left", padx=(8, 0))
 
         # ----- Status line, sharing its row with the zoom strip so the
         # viewing area keeps the space.
@@ -7384,6 +7671,11 @@ class PreviewTab:
         self.canvas.bind("<B1-Motion>", self._on_canvas_drag)
         self.canvas.bind("<ButtonRelease-1>", self._on_canvas_release)
         self.canvas.bind("<Double-Button-1>", self._on_canvas_double)
+        self.canvas.bind("<Motion>", self._hover_corner)
+        self.canvas.bind("<Button-3>", self._on_shape_menu)
+        # macOS trackpads report a right-click as Control-click; Button-2 is
+        # already taken here by panning.
+        self.canvas.bind("<Control-Button-1>", self._on_shape_menu)
         # Typing goes to the canvas itself while a note is being edited.
         self.canvas.configure(takefocus=1)
         self.canvas.bind("<Key>", self._bind_edit_key)
@@ -7393,6 +7685,7 @@ class PreviewTab:
         # Esc cancels an armed placement (the inline editor binds its own Esc
         # while it's open, so this only fires when nothing is being typed).
         self.canvas.bind_all("<Escape>", self._disarm_text_mode, add="+")
+        self.canvas.bind_all("<Escape>", self._disarm_shape_mode, add="+")
 
         self._update_text_buttons()
         self._set_placeholder(
@@ -7534,6 +7827,17 @@ class PreviewTab:
         combined_bytes = _apply_nup(buf.getvalue(), self.app._current_layout(),
                                     getattr(self, "_asis_idx", None))
         combined_bytes = apply_style(combined_bytes, self.app.style, self.app)
+        # Draw the text notes through the SAME function the output uses, so
+        # the pixels on screen come from the real PDF renderer rather than
+        # from Tk's idea of a font. The note being typed or dragged is left
+        # out and drawn live on the canvas instead, otherwise it would appear
+        # twice (once baked, once live).
+        combined_bytes = apply_shapes(
+            combined_bytes,
+            [sh for sh in self.app.shapes if sh is not self._live_shape])
+        combined_bytes = apply_text_notes(
+            combined_bytes,
+            [n for n in self.app.text_notes if n is not self._live_note])
         self._teardown_pdf()
         try:
             self._combined_pdf = pdfium.PdfDocument(combined_bytes)
@@ -7952,6 +8256,7 @@ class PreviewTab:
             # Keep notes and selection boxes above the page bitmaps.
             self.canvas.tag_lower(item)
         self._redraw_notes()
+        self._redraw_shapes()
 
     # ---- Text notes (v1.64) ---------------------------------------------
     def _pdf_to_canvas(self, page, x_pt, y_pt):
@@ -7981,8 +8286,14 @@ class PreviewTab:
     def _note_canvas_font(self, note):
         fam = {"Helvetica": "Helvetica", "Times": "Times", "Courier": "Courier"}\
             .get(note.get("font", "Helvetica"), "Helvetica")
-        # Match the on-page size at the current zoom.
-        px_size = max(6, int(round(note.get("size", 14) * self._page_render_scale)))
+        # NEGATIVE = pixels. A positive Tk size means POINTS, which Tk scales
+        # by the display's DPI (1.33x on a typical 96dpi screen) — that alone
+        # made the on-screen text a third too big, and by a different amount
+        # on different monitors. The old max(6, ...) floor made it worse still
+        # when zoomed out, since the text then could not shrink with the page.
+        px_size = max(1, int(round(note.get("size", 14)
+                                   * self._page_render_scale)))
+        px_size = -px_size
         styles = []
         if note.get("bold"):
             styles.append("bold")
@@ -8001,41 +8312,90 @@ class PreviewTab:
         self.canvas.delete("note")
         self.canvas.delete("notebox")
         self._note_item_ids = {}
-        for note in self.app.text_notes:
+        # Only the note being typed or dragged is drawn by Tk; every other
+        # note is already in the page bitmap, drawn by the PDF renderer.
+        for note in ([self._live_note] if self._live_note is not None else []):
+            if note not in self.app.text_notes:
+                continue
             pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
             if pos is None:
                 continue
             cx, cy = pos
             selected = note is self._selected_note
+            spec = self._note_canvas_font(note)
+            # Tk has no baseline anchor: "sw" puts the DESCENDER at cy, so the
+            # text sat a few points high on screen and dropped when written to
+            # the PDF. Nudge down by the descender to put the baseline on the
+            # point the note is actually anchored to.
+            try:
+                import tkinter.font as _tkfont
+                desc = _tkfont.Font(root=self.canvas, font=spec).metrics(
+                    "descent")
+            except Exception:
+                desc = 0
             item = self.canvas.create_text(
-                cx, cy, anchor="sw", text=note.get("text", ""),
-                font=self._note_canvas_font(note),
-                fill="#111111", tags="note")
+                cx, cy + desc, anchor="sw", text=note.get("text", ""),
+                font=spec, fill="#111111", tags="note")
             self._note_item_ids[item] = note
             if selected:
-                # A thin box so the selected note is unmistakable — the old
-                # "turn the text red" cue was almost invisible on a page.
-                x1, y1, x2, y2 = self.canvas.bbox(item)
-                self.canvas.create_rectangle(
-                    x1 - 3, y1 - 2, x2 + 3, y2 + 2,
-                    outline="#0a64d8", width=1, dash=(3, 2), tags="notebox")
                 self.canvas.tag_raise(item)
+        # A thin box so the selected note is unmistakable — the old "turn the
+        # text red" cue was almost invisible on a page. Drawn for baked notes
+        # as well, which have no canvas item to measure.
+        self._draw_selection_box()
         # Keep the caret alive across redraws, otherwise it vanishes after
         # every keystroke until the next blink tick.
         if self._editing():
             self._draw_caret()
 
+    def _note_canvas_box(self, note):
+        """A note's canvas bbox (x1, y1, x2, y2) from its REAL PDF metrics, so
+        the outline and the hit area match the text that gets printed."""
+        page = int(note.get("page", -1))
+        if page < 0 or page >= len(self._page_boxes):
+            return None
+        x0, y0, x1, y1 = note_pdf_box(note)
+        tl = self._pdf_to_canvas(page, x0, y1)
+        br = self._pdf_to_canvas(page, x1, y0)
+        if tl is None or br is None:
+            return None
+        return (tl[0], tl[1], br[0], br[1])
+
+    def _draw_selection_box(self):
+        """Outline the selected note. Drawn from the PDF metrics rather than
+        from a Tk text item, because committed notes no longer have one."""
+        note = self._selected_note
+        if note is None or note not in self.app.text_notes:
+            return
+        box = self._note_canvas_box(note)
+        if box is None:
+            return
+        x1, y1, x2, y2 = box
+        self.canvas.create_rectangle(
+            x1 - 3, y1 - 2, x2 + 3, y2 + 2,
+            outline="#0a64d8", width=1, dash=(3, 2), tags="notebox")
+
     def _note_at(self, cx, cy):
-        """Return the note whose canvas item is at/near (cx, cy), or None."""
-        for item in self.canvas.find_overlapping(cx - 2, cy - 2, cx + 2, cy + 2):
-            if item in self._note_item_ids:
-                return self._note_item_ids[item]
+        """Return the note under (cx, cy), topmost first.
+
+        Hit-tested against each note's true text box instead of a Tk canvas
+        item, so a note you can see is a note you can click."""
+        for note in reversed(self.app.text_notes):
+            box = self._note_canvas_box(note)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            if x1 - 3 <= cx <= x2 + 3 and y1 - 3 <= cy <= y2 + 3:
+                return note
         return None
 
     def _toggle_text_mode(self):
         """Arm (or cancel) a single text placement. Kept as a toggle so a
         mis-click on the button is undone by clicking it again, and Esc."""
         self.text_mode.set(not self.text_mode.get())
+        if self.text_mode.get() and self.shape_mode.get():
+            self.shape_mode.set(False)
+            self._sync_shape_mode()
         self._sync_text_mode()
 
     def _sync_text_mode(self):
@@ -8047,7 +8407,7 @@ class PreviewTab:
             pass
         if hasattr(self, "add_text_btn"):
             self.add_text_btn.config(
-                text="✎ Click a page…" if armed else "✎ Add text")
+                text="✎ Placing — Esc to stop" if armed else "✎ Add text")
 
     def _disarm_text_mode(self, _event=None):
         if self.text_mode.get():
@@ -8058,47 +8418,176 @@ class PreviewTab:
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
         note = self._note_at(cx, cy)
+        shape, part = self._shape_hit(cx, cy)
         # Clicking away from the note you're editing finishes that edit.
         if self._editing() and note is not self._edit_widget["note"]:
             self._commit_edit()
-        # Armed to add? Then add — _create_note_at nudges clear of anything
-        # already there, so a new note can't be hidden under an old one.
+
+        # An annotation already here ALWAYS wins over making a new one, no
+        # matter which tool is armed. Dropping a second text box on top of the
+        # first, or a frame onto a frame, is how the first one becomes
+        # unreachable — and everything you have added has to stay editable
+        # however many steps later you come back to it.
+        if note is not None:
+            self._select_note(note)
+            if self.text_mode.get():
+                # Armed to add, but there is text right here: edit THAT.
+                self._begin_edit(note)
+                self.status_lbl.config(
+                    text="Editing the text already here — click an empty spot "
+                         "to add a new one.")
+                return
+            # Remember where inside the text it was grabbed, so it doesn't
+            # jump its own width the instant you start dragging.
+            pos = self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"])
+            off = (cx - pos[0], cy - pos[1]) if pos else (0.0, 0.0)
+            self._note_drag = [note, cx, cy, False, off]
+            self._update_text_buttons()
+            return
+
+        if shape is not None:
+            # Same rule for frames: a corner resizes, an edge moves, and the
+            # rectangle tool does NOT start a new frame on top of this one.
+            self._select_shape(shape)
+            self._live_shape = shape
+            self._rebuild_now()
+            x0, y0, x1, y1 = shape_pdf_box(shape)
+            self._shape_drag = [shape, cx, cy, False, part, x0, y0, x1, y1]
+            self._redraw_shapes()
+            if self.shape_mode.get():
+                self.status_lbl.config(
+                    text="Adjusting the frame already here — drag out from an "
+                         "empty spot to add a new one.")
+            return
+        if self._selected_shape is not None:
+            self._select_shape(None)
+
+        # Nothing here: the armed tool gets the click.
+        if self.shape_mode.get():
+            loc = self._canvas_to_pdf(cx, cy)
+            if loc is not None:
+                page, x_pt, y_pt = loc
+                try:
+                    width = max(0.1, float(self.shape_width.get()))
+                except (TypeError, ValueError):
+                    width = SHAPE_WIDTH_DEFAULT
+                new_shape = {"page": page, "x0_pt": x_pt, "y0_pt": y_pt,
+                             "x1_pt": x_pt, "y1_pt": y_pt,
+                             "color": self.shape_color.get(), "width": width,
+                             "style": self.shape_style.get()}
+                self.app.shapes.append(new_shape)
+                self._live_shape = new_shape
+                self._shape_draw = new_shape
+                self._select_shape(new_shape)
+                self._redraw_shapes()
+            return
         if self.text_mode.get() and self._canvas_to_pdf(cx, cy) is not None:
             self._create_note_at(cx, cy)
-            return
-        if note is not None:
-            # Select the existing note and start a drag — never drop a new
-            # one on top of it.
-            self._select_note(note)
-            self._note_drag = [note, cx, cy, False]
-            self._update_text_buttons()
             return
         self._select_note(None)
         self._update_text_buttons()
 
     def _on_canvas_drag(self, event):
+        if self._shape_draw is not None:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            loc = self._canvas_to_pdf(cx, cy)
+            if loc is not None and loc[0] == self._shape_draw["page"]:
+                self._shape_draw["x1_pt"] = loc[1]
+                self._shape_draw["y1_pt"] = loc[2]
+                # Drag direction picks the style, CAD window/crossing style:
+                # rightwards is a plain rectangle, leftwards a revision cloud.
+                # Decided live, so you can see which you're getting and cross
+                # back over the start point to change your mind.
+                self._shape_draw["style"] = (
+                    "cloud" if loc[1] < self._shape_draw["x0_pt"]
+                    else self.shape_style.get())
+                self._redraw_shapes()
+            return
+        if self._shape_drag is not None:
+            shape, sx, sy, _moved, part, ox0, oy0, ox1, oy1 = self._shape_drag
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            s = self._page_render_scale or 1.0
+            dx = (cx - sx) / s
+            dy = -(cy - sy) / s          # canvas y grows downward
+            if part == "edge":
+                nx0, ny0, nx1, ny1 = ox0 + dx, oy0 + dy, ox1 + dx, oy1 + dy
+            else:
+                nx0, ny0, nx1, ny1 = ox0, oy0, ox1, oy1
+                if "w" in part:
+                    nx0 = min(ox0 + dx, ox1 - 3)
+                if "e" in part:
+                    nx1 = max(ox1 + dx, ox0 + 3)
+                if "n" in part:                 # canvas top = the HIGHER y_pt
+                    ny1 = max(oy1 + dy, oy0 + 3)
+                if "s" in part:
+                    ny0 = min(oy0 + dy, oy1 - 3)
+            shape["x0_pt"], shape["y0_pt"] = nx0, ny0
+            shape["x1_pt"], shape["y1_pt"] = nx1, ny1
+            self._shape_drag[3] = True
+            self.canvas.delete("shapegrip")
+            self._hover_shape = None
+            self._redraw_shapes()
+            return
         if not self._note_drag:
             return
-        note, sx, sy, moved = self._note_drag
+        note, sx, sy, moved, off = self._note_drag
         cx = self.canvas.canvasx(event.x)
         cy = self.canvas.canvasy(event.y)
-        loc = self._canvas_to_pdf(cx, cy)
+        loc = self._canvas_to_pdf(cx - off[0], cy - off[1])
         if loc is None:
             return
         if not moved:
             self._push_undo()      # so a drag can be undone
+            # Take it out of the baked page for the duration of the drag,
+            # otherwise the old position stays painted under the cursor.
+            self._set_live_note(note)
         self._note_drag[3] = True
         note["page"], note["x_pt"], note["y_pt"] = loc
-        # Move its canvas item live.
-        for item, n in self._note_item_ids.items():
-            if n is note:
-                self.canvas.coords(item, cx, cy)
-                break
+        self._redraw_notes()
 
     def _on_canvas_release(self, _event):
+        if self._shape_draw is not None:
+            shape = self._shape_draw
+            self._shape_draw = None
+            x0, y0, x1, y1 = shape_pdf_box(shape)
+            if x1 - x0 < 3 or y1 - y0 < 3:
+                # A click rather than a drag — don't leave an invisible frame.
+                if shape in self.app.shapes:
+                    self.app.shapes.remove(shape)
+                self._selected_shape = None
+                self._live_shape = None
+                self._redraw_shapes()
+                self.status_lbl.config(
+                    text="Drag to size the frame — a single click makes none.")
+                return
+            self._live_shape = None
+            self._rebuild_now()          # hand it to the PDF renderer
+            self._redraw_shapes()
+            self._invalidate_output_only()
+            kind = ("revision cloud" if shape.get("style") == "cloud"
+                    else "rectangle")
+            self.status_lbl.config(
+                text=f'Frame added — {kind}, {(x1 - x0) / 72.0:.2f}" x '
+                     f'{(y1 - y0) / 72.0:.2f}". Still drawing; Esc to stop.')
+            return
+        if self._shape_drag is not None:
+            moved = self._shape_drag[3]
+            self._shape_drag = None
+            self._live_shape = None
+            if moved:
+                self._invalidate_output_only()
+            self._rebuild_now()
+            self._redraw_shapes()
+            return
         if self._note_drag and self._note_drag[3]:
             self._invalidate_output_only()
-            self._redraw_notes()      # repaint the selection box at the new spot
+            if not self._editing():
+                # Back into the page bitmap at its new spot, via the real
+                # renderer; _rebuild_now also repaints the selection box.
+                self._set_live_note(None)
+            self._redraw_notes()
         self._note_drag = None
 
     def _on_canvas_double(self, event):
@@ -8111,23 +8600,20 @@ class PreviewTab:
 
     def _on_delete_key(self, _event=None):
         # Only act when the Preview tab is active and a note is selected.
-        if (self.app._tab_is(TAB_PREVIEW) and self._selected_note is not None
-                and self._edit_widget is None):
+        if not self.app._tab_is(TAB_PREVIEW) or self._edit_widget is not None:
+            return
+        if self._selected_note is not None:
             self._delete_selected()
+        elif self._selected_shape is not None:
+            self._delete_selected_shape()
 
     def _create_note_at(self, cx, cy):
         loc = self._canvas_to_pdf(cx, cy)
         if loc is None:
             return
-        # Nudge clear of anything already sitting here, so a new note can
-        # never land invisibly on top of an existing one.
-        for _ in range(12):
-            if self._note_at(cx, cy) is None:
-                break
-            cy += 14
-            loc = self._canvas_to_pdf(cx, cy)
-            if loc is None:
-                return
+        # No nudging away from the click any more: _on_canvas_press only gets
+        # here when the spot is empty, and the text has to land exactly where
+        # it was put.
         page, x_pt, y_pt = loc
         note = {
             "page": page, "x_pt": x_pt, "y_pt": y_pt, "text": "",
@@ -8138,8 +8624,9 @@ class PreviewTab:
         }
         self._push_undo()
         self.app.text_notes.append(note)
-        # One click, one text box — the button re-arms for the next one.
-        self._disarm_text_mode()
+        # The tool STAYS armed: filling a form means placing twenty boxes, and
+        # going back to the button between each one is the slow way to do it.
+        # Esc, or clicking the button again, puts the pointer back.
         self._select_note(note)
         self._begin_edit(note, is_new=True)
 
@@ -8149,11 +8636,21 @@ class PreviewTab:
     # the canvas text item: you type ON the page, over the background, with a
     # blinking caret and a dashed selection box.
 
+    def _set_live_note(self, note):
+        """Mark the one note that the canvas draws itself, and rebuild so the
+        page bitmap stops (or resumes) including it. ~20 ms, so this is
+        cheap enough to do on every click into and out of a note."""
+        if note is self._live_note:
+            return
+        self._live_note = note
+        self._rebuild_now()
+
     def _begin_edit(self, note, is_new=False):
         """Start editing `note` in place. No popup, nothing opaque."""
         self._cancel_edit()
         if self._pdf_to_canvas(note["page"], note["x_pt"], note["y_pt"]) is None:
             return
+        self._set_live_note(note)
         self._push_undo()
         self._edit_widget = {
             "note": note, "is_new": is_new,
@@ -8268,6 +8765,9 @@ class PreviewTab:
                 self.app.text_notes.remove(note)
             if note is self._selected_note:
                 self._selected_note = None
+        # Hand it back to the PDF renderer, so what is now on screen is
+        # exactly what will be written to the file.
+        self._set_live_note(None)
         self._redraw_notes()
         self._invalidate_output_only()
         self._update_text_buttons()
@@ -8298,6 +8798,8 @@ class PreviewTab:
         self._selected_note = None
         self._edit_widget = None
         self.canvas.delete("caret")
+        self._live_note = None
+        self._rebuild_now()           # undo/redo changes the baked pages
         self._redraw_notes()
         self._invalidate_output_only()
         self._update_text_buttons()
@@ -8345,6 +8847,8 @@ class PreviewTab:
         note["size"] = _safe_int(self.note_size.get(), 14)
         note["bold"] = bool(self.note_bold.get())
         note["italic"] = bool(self.note_italic.get())
+        if note is not self._live_note:
+            self._rebuild_now()
         self._redraw_notes()
         self._invalidate_output_only()
 
@@ -8358,9 +8862,335 @@ class PreviewTab:
         self._selected_note = None
         self._edit_widget = None
         self.canvas.delete("caret")
+        self._live_note = None
+        self._rebuild_now()           # the baked copy has to go too
         self._redraw_notes()
         self._invalidate_output_only()
         self._update_text_buttons()
+
+    # ---- Rectangles (v1.65.9) -------------------------------------------
+    SHAPE_HANDLE = 5        # corner grip half-size, canvas pixels
+
+    def _toggle_shape_mode(self):
+        """Arm (or cancel) rectangle drawing. Mutually exclusive with the text
+        tool — two armed creation tools would fight over the same click."""
+        want = not self.shape_mode.get()
+        self.shape_mode.set(want)
+        if want and self.text_mode.get():
+            self.text_mode.set(False)
+            self._sync_text_mode()
+        self._sync_shape_mode()
+
+    def _sync_shape_mode(self):
+        armed = self.shape_mode.get()
+        try:
+            self.canvas.config(cursor="tcross" if armed else "")
+        except tk.TclError:
+            pass
+        self.add_rect_btn.config(
+            text="▭ Drawing — Esc to stop" if armed else "▭ Rectangle")
+        # Show the options that belong to the active tool.
+        try:
+            if armed:
+                self.text_opts.pack_forget()
+                self.shape_opts.pack(side="left")
+            else:
+                self.shape_opts.pack_forget()
+                self.text_opts.pack(side="left")
+        except tk.TclError:
+            pass
+
+    def _disarm_shape_mode(self, _event=None):
+        if self.shape_mode.get():
+            self.shape_mode.set(False)
+            self._sync_shape_mode()
+
+    def _on_shape_style_pick(self):
+        name = self.shape_style_cb.get()
+        for nm, val in SHAPE_STYLES:
+            if nm == name:
+                self.shape_style.set(val)
+                break
+        shape = self._selected_shape
+        if shape is not None and shape in self.app.shapes:
+            self._set_shape_style(shape, self.shape_style.get())
+
+    def _set_shape_style(self, shape, style):
+        """Change one frame's outline, re-rendering so the page shows it."""
+        if shape not in self.app.shapes:
+            return
+        shape["style"] = style
+        # Keep the toolbar picker in step, so it never claims a style the
+        # selected frame doesn't have.
+        self.shape_style.set(style)
+        try:
+            self.shape_style_cb.set(SHAPE_STYLE_NAMES.get(style, "Rectangle"))
+        except tk.TclError:
+            pass
+        self._live_items = []          # the item count changes with the style
+        if shape is not self._live_shape:
+            self._rebuild_now()
+        self._redraw_shapes()
+        self._invalidate_output_only()
+        self.status_lbl.config(
+            text=f"Frame set to {SHAPE_STYLE_NAMES.get(style, style)}.")
+
+    def _on_shape_menu(self, event):
+        """Right-click a frame: change its style, or delete it."""
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        shape, _part = self._shape_hit(cx, cy)
+        if shape is None:
+            return
+        self._select_shape(shape)
+        menu = tk.Menu(self.canvas, tearoff=0)
+        current = shape.get("style", "rect")
+        for nm, val in SHAPE_STYLES:
+            menu.add_command(
+                label=("● " if val == current else "    ") + nm,
+                command=lambda v=val, sh=shape: self._set_shape_style(sh, v))
+        menu.add_separator()
+        menu.add_command(label="Delete frame",
+                         command=self._delete_selected_shape)
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+        return "break"
+
+    def _on_shape_color_pick(self):
+        name = self.shape_color_cb.get()
+        for nm, hx in SHAPE_COLORS:
+            if nm == name:
+                self.shape_color.set(hx)
+                break
+        self.shape_swatch.config(background=self.shape_color.get())
+        self._apply_shape_style_to_selected()
+
+    def _pick_shape_color(self):
+        from tkinter import colorchooser
+        got = colorchooser.askcolor(color=self.shape_color.get(),
+                                    parent=self.app.root)
+        if got and got[1]:
+            self.shape_color.set(got[1])
+            self.shape_swatch.config(background=got[1])
+            self._apply_shape_style_to_selected()
+
+    def _shape_canvas_box(self, shape):
+        """A shape's canvas bbox, or None when its page isn't on screen."""
+        page = int(shape.get("page", -1))
+        if page < 0 or page >= len(self._page_boxes):
+            return None
+        x0, y0, x1, y1 = shape_pdf_box(shape)
+        tl = self._pdf_to_canvas(page, x0, y1)
+        br = self._pdf_to_canvas(page, x1, y0)
+        if tl is None or br is None:
+            return None
+        return (tl[0], tl[1], br[0], br[1])
+
+    def _shape_at(self, cx, cy):
+        """The topmost rectangle whose FRAME is under the point. Hit on the
+        edge only, so a frame drawn around a paragraph doesn't swallow the
+        clicks meant for the text inside it."""
+        for shape in reversed(self.app.shapes):
+            box = self._shape_canvas_box(shape)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            if not (x1 - 4 <= cx <= x2 + 4 and y1 - 4 <= cy <= y2 + 4):
+                continue
+            edge = max(3.0, float(shape.get("width", SHAPE_WIDTH_DEFAULT))
+                       * self._page_render_scale) + 3.0
+            near_v = abs(cx - x1) <= edge or abs(cx - x2) <= edge
+            near_h = abs(cy - y1) <= edge or abs(cy - y2) <= edge
+            if near_v or near_h:
+                return shape
+        return None
+
+    def _shape_corner_at(self, cx, cy):
+        """(shape, corner, (hx, hy)) when the pointer is on any frame's
+        corner, else (None, None, None). The selected frame is checked first
+        so its corners stay grabbable where two frames overlap."""
+        order = list(self.app.shapes)
+        sel = self._selected_shape
+        if sel in order:
+            order.remove(sel)
+            order.append(sel)
+        for shape in reversed(order):
+            box = self._shape_canvas_box(shape)
+            if box is None:
+                continue
+            x1, y1, x2, y2 = box
+            h = self.SHAPE_HANDLE + 3
+            for name, (hx, hy) in (("nw", (x1, y1)), ("ne", (x2, y1)),
+                                   ("sw", (x1, y2)), ("se", (x2, y2))):
+                if abs(cx - hx) <= h and abs(cy - hy) <= h:
+                    return shape, name, (hx, hy)
+        return None, None, None
+
+    def _hover_corner(self, event):
+        """Show a small black corner marker when the pointer is over a frame's
+        corner — the only hint that it can be dragged bigger or smaller. It is
+        drawn on hover and nowhere else, so the document never appears to have
+        a frame it doesn't."""
+        if self._shape_draw is not None or self._shape_drag is not None:
+            return
+        cx = self.canvas.canvasx(event.x)
+        cy = self.canvas.canvasy(event.y)
+        shape, corner, pos = self._shape_corner_at(cx, cy)
+        if shape is self._hover_shape and corner == self._hover_corner_name:
+            return                       # already drawn for this corner
+        self._hover_shape, self._hover_corner_name = shape, corner
+        self.canvas.delete("shapegrip")
+        if shape is None:
+            if not self.shape_mode.get() and not self.text_mode.get():
+                try:
+                    self.canvas.config(cursor="")
+                except tk.TclError:
+                    pass
+            return
+        hx, hy = pos
+        arm = 9
+        dx = arm if "w" in corner else -arm      # the L opens INTO the frame
+        dy = arm if "n" in corner else -arm
+        for pts in (((hx, hy), (hx + dx, hy)), ((hx, hy), (hx, hy + dy))):
+            self.canvas.create_line(*pts[0], *pts[1], fill="#000000",
+                                    width=2, capstyle="projecting",
+                                    tags="shapegrip")
+        try:
+            self.canvas.config(cursor={"nw": "top_left_corner",
+                                       "ne": "top_right_corner",
+                                       "sw": "bottom_left_corner",
+                                       "se": "bottom_right_corner"}[corner])
+        except (tk.TclError, KeyError):
+            pass
+
+    def _shape_hit(self, cx, cy):
+        """(shape, part) under the point. `part` is a corner name for a
+        resize, or 'edge' for a move."""
+        shape, corner, _pos = self._shape_corner_at(cx, cy)
+        if shape is not None:
+            return shape, corner
+        shape = self._shape_at(cx, cy)
+        return (shape, "edge") if shape is not None else (None, None)
+
+    def _redraw_shapes(self):
+        """Only the rectangle being drawn or moved is drawn by Tk; the rest
+        are already in the page bitmap, drawn by the PDF renderer."""
+        live = self._live_shape
+        box = self._shape_canvas_box(live) if live is not None else None
+        if live is None or live not in self.app.shapes or box is None:
+            self.canvas.delete("shape")
+            self._live_items = []
+        else:
+            lw = max(1, int(round(float(live.get("width",
+                                                 SHAPE_WIDTH_DEFAULT))
+                                  * self._page_render_scale)))
+            colour = live.get("color", "#d00000")
+            style = live.get("style", "rect")
+            if style == "cloud":
+                self._draw_live_cloud(box, colour, lw)
+            else:
+                self._draw_live_rect(box, colour, lw, style)
+        self.canvas.delete("shapebox")
+        # Deliberately nothing else: no outline, no permanent grips. A
+        # second rectangle round the selection made it impossible to tell
+        # which one was really going into the document. The corner marker
+        # appears on hover instead — see _hover_corner().
+
+    def _draw_live_rect(self, box, colour, lw, style):
+        """The rectangle family, drawn with coords() on existing items rather
+        than destroyed and rebuilt, which is what keeps a resize drag
+        smooth."""
+        x1, y1, x2, y2 = box
+        scale = self._page_render_scale or 1.0
+        dash = SHAPE_DASHES.get(style)
+        opts = {"outline": colour, "width": lw, "fill": ""}
+        if dash:
+            opts["dash"] = tuple(max(1, int(round(d * lw))) for d in dash)
+        want = 2 if style == "double" else 1
+        if len(self._live_items) != want or not all(
+                self.canvas.type(i) == "rectangle" for i in self._live_items):
+            self.canvas.delete("shape")
+            self._live_items = [
+                self.canvas.create_rectangle(*box, tags="shape", **opts)
+                for _ in range(want)]
+        boxes = [box]
+        if want == 2:
+            ins = lw * 2.0
+            if (x2 - x1) > 2 * ins + 1 and (y2 - y1) > 2 * ins + 1:
+                boxes.append((x1 + ins, y1 + ins, x2 - ins, y2 - ins))
+            else:
+                boxes.append(box)
+        for item, bx in zip(self._live_items, boxes):
+            self.canvas.coords(item, *bx)
+            self.canvas.itemconfig(item, **opts)
+
+    def _draw_live_cloud(self, box, colour, lw):
+        """The scalloped preview, from the SAME generator the PDF uses.
+
+        Bump count changes with the frame's size, so the arcs are reused while
+        the count holds and only rebuilt when it actually changes — a resize
+        drag otherwise destroys and recreates sixty canvas items per mouse
+        move, which is exactly the lag that makes a tool feel broken."""
+        x1, y1, x2, y2 = box
+        s = self._page_render_scale or 1.0
+        bumps = list(cloud_bumps(min(x1, x2), min(y1, y2),
+                                 max(x1, x2), max(y1, y2),
+                                 bump=max(4.0, CLOUD_BUMP_PT * s)))
+        if len(self._live_items) != len(bumps) or not all(
+                self.canvas.type(i) == "arc" for i in self._live_items):
+            self.canvas.delete("shape")
+            self._live_items = [
+                self.canvas.create_arc(0, 0, 1, 1, style="arc",
+                                       outline=colour, width=lw, tags="shape")
+                for _ in bumps]
+        for item, (cx, cy, r, ang) in zip(self._live_items, bumps):
+            # Canvas y grows downward, so an "up" bulge in PDF terms is a
+            # "down" one here; mirroring the angle keeps them the same arc.
+            self.canvas.coords(item, cx - r, cy - r, cx + r, cy + r)
+            self.canvas.itemconfig(item, start=-ang, extent=-180,
+                                   outline=colour, width=lw)
+
+    def _select_shape(self, shape):
+        self._selected_shape = shape
+        if shape is not None:
+            self.shape_color.set(shape.get("color", "#d00000"))
+            self.shape_swatch.config(background=self.shape_color.get())
+            self.shape_width.set(str(shape.get("width",
+                                               SHAPE_WIDTH_DEFAULT)))
+            st = shape.get("style", "rect")
+            self.shape_style.set(st)
+            self.shape_style_cb.set(SHAPE_STYLE_NAMES.get(st, "Rectangle"))
+        self._redraw_shapes()
+
+    def _apply_shape_style_to_selected(self):
+        shape = self._selected_shape
+        if shape is None or shape not in self.app.shapes:
+            return
+        try:
+            width = max(0.1, float(self.shape_width.get()))
+        except (TypeError, ValueError):
+            width = SHAPE_WIDTH_DEFAULT
+        shape["color"] = self.shape_color.get()
+        shape["width"] = width
+        if shape is not self._live_shape:
+            self._rebuild_now()
+        self._redraw_shapes()
+        self._invalidate_output_only()
+
+    def _delete_selected_shape(self):
+        shape = self._selected_shape
+        if shape is None:
+            return
+        if shape in self.app.shapes:
+            self.app.shapes.remove(shape)
+        self._selected_shape = None
+        self._live_shape = None
+        self._rebuild_now()
+        self._redraw_shapes()
+        self._invalidate_output_only()
+        self.status_lbl.config(text="Frame deleted.")
 
     def _invalidate_output_only(self):
         """Notes are drawn live on the canvas, so we don't need to re-render
@@ -11000,6 +11830,8 @@ class App:
         # Each: {page, x_pt, y_pt, text, font, size, bold, italic}. Baked into
         # the output by apply_text_notes; drawn interactively by PreviewTab.
         self.text_notes = []
+        # Rectangles drawn to frame something; same model, same renderer.
+        self.shapes = []
         self.work_queue = queue.Queue()
         self._update_dialog_state = None  # populated while auto-update is open
         self._install_dialog = None       # populated while install-deps dialog is open
@@ -11343,17 +12175,32 @@ class App:
             _font = ("", 11, "bold")
         # Named for what it produces, and only as wide as its own label —
         # stretching it across the window made it less noticeable, not more.
+        # Both buttons live in a wrapper that is packed with no side, which
+        # is what actually centres the PAIR. Packing them side="left" straight
+        # into create_row pinned them to the left edge instead.
+        btn_wrap = ttk.Frame(create_row)
+        btn_wrap.pack()
         self.create_btn = tk.Button(
-            create_row, text="Create the File  (PDF, img, jpg, …)",
+            btn_wrap, text="Create the File  (PDF, img, jpg, …)",
             font=_font, cursor="hand2", command=self.create_doc,
             padx=18, pady=2, bd=2, relief="raised",
             activebackground="#dceaf7",
         )
-        self.create_btn.pack(ipady=3)
+        self.create_btn.pack(side="left", ipady=3, padx=(0, 8))
         tip(self.create_btn,
             "Turn everything in your list into one finished document. You "
             "pick the format next — PDF, images, Word, web page or plain "
             "text — and what to do with it once it's saved.")
+        # Print straight from the working document — no need to create and
+        # save a file first just to get paper out of it.
+        self.print_btn = ttk.Button(btn_wrap, text="🖨 Print",
+                                    command=self.print_now)
+        self.print_btn.pack(side="left")
+        tip(self.print_btn,
+            "Send the document as it stands to your default printer, without "
+            "creating a file first. Everything you can see — page order, "
+            "deletions, crops, style, text and frames — goes with it, so you "
+            "can print part-way through and carry on editing.")
 
         self.status = ttk.Label(self._chrome,
                                 text="Ready. Drop files or paste a URL to begin.",
@@ -11643,6 +12490,7 @@ class App:
         self.page_rotate.clear()
         self.page_edits.clear()
         self.text_notes.clear()
+        self.shapes.clear()
 
         archive = data.get("_archive")
         recovered = 0
@@ -11692,6 +12540,7 @@ class App:
             if k:
                 self.page_edits[k] = val
         self.text_notes.extend(dict(n) for n in data.get("text_notes", []))
+        self.shapes.extend(dict(sh) for sh in data.get("shapes", []))
         _style_from_dict(data.get("style") or {}, self.style)
         lay = data.get("layout") or {}
         if lay.get("size"):
@@ -13624,6 +14473,62 @@ class App:
         except Exception as e:
             self.work_queue.put(("error", f"Couldn't build PDF for signing: {e}"))
 
+    def print_now(self):
+        """Print the current document directly, bypassing Create entirely.
+
+        Built with assemble_from_cache(), the very same call Create and Sign
+        use, so what prints is what the Preview shows — not an approximation
+        of it. The assembly runs on a worker thread because it can take a
+        second or two on a big document."""
+        if not self.items:
+            messagebox.showinfo(
+                APP_NAME, "There's nothing to print yet — add some files "
+                          "first.")
+            return
+        pending = [it for it in self.items if not it.cached_pdf_bytes]
+        if pending:
+            messagebox.showinfo(
+                APP_NAME,
+                f"{len(pending)} file(s) are still being prepared. Give it a "
+                f"moment and press Print again.")
+            return
+        self._set_busy(True)
+        self.status.config(text="Preparing the document for printing…")
+        self._refresh_layout_snapshot()
+
+        def worker():
+            try:
+                data = self.assemble_from_cache()
+                if not data:
+                    self.work_queue.put(
+                        ("warn", "Every page is hidden, so there's nothing "
+                                 "to print."))
+                    self.work_queue.put(("print_done", None))
+                    return
+                fd, path = tempfile.mkstemp(prefix="mydocmaker_print_",
+                                            suffix=".pdf")
+                with os.fdopen(fd, "wb") as fh:
+                    fh.write(data)
+                self.work_queue.put(("print_ready", path))
+            except Exception as e:
+                self.work_queue.put(("warn", f"Couldn't prepare the "
+                                             f"document to print:\n{e}"))
+                self.work_queue.put(("print_done", None))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_print_ready(self, path):
+        """The temp PDF is written — hand it to the printer."""
+        self._set_busy(False)
+        try:
+            pages = len(PdfReader(path).pages)
+        except Exception:
+            pages = None
+        _print_with_default_printer(path, self.work_queue)
+        what = f"{pages} page(s)" if pages else "the document"
+        self.status.config(text=f"Sent {what} to your default printer.")
+        self.log(f"Printed {what} directly from the working document.")
+
     def assemble_from_cache(self, keep=None):
         """Stitch the finished PDF from the per-item cached bytes — the same
         document the Preview shows, with Order, per-page flips, 2-up, Style
@@ -13685,6 +14590,9 @@ class App:
         writer.write(staged)
         final = _apply_nup(staged.getvalue(), layout, asis_idx)
         final = apply_style(final, self.style, self)
+        final = apply_shapes(
+            final, self._remap_pages(self.shapes, ordered_all, ordered_out,
+                                     layout))
         final = apply_text_notes(
             final, self._notes_for(ordered_all, ordered_out, layout))
         return final
@@ -13700,8 +14608,12 @@ class App:
         Under 2-up a display "page" is a sheet of two source pages, so we work
         in sheet indices and let the first surviving page of a pair claim the
         sheet — its notes were positioned on that sheet's layout."""
-        if not self.text_notes or ordered_out is ordered_all:
-            return self.text_notes
+        return self._remap_pages(self.text_notes, ordered_all, ordered_out,
+                                 layout)
+
+    @staticmethod
+    def _page_remap(ordered_all, ordered_out, layout):
+        """old display page -> new display page for a filtered output."""
         nup = 2 if layout.nup == 2 else 1
         pos_out = {k: i for i, k in enumerate(ordered_out)}
         remap = {}
@@ -13709,11 +14621,19 @@ class App:
             new_i = pos_out.get(key)
             if new_i is not None:
                 remap.setdefault(old_i // nup, new_i // nup)
+        return remap
+
+    def _remap_pages(self, overlays, ordered_all, ordered_out, layout):
+        """Re-key any page-indexed overlay list (notes or shapes) for a
+        filtered document, dropping whatever falls on a page not in it."""
+        if not overlays or ordered_out is ordered_all:
+            return overlays
+        remap = self._page_remap(ordered_all, ordered_out, layout)
         out = []
-        for n in self.text_notes:
-            new_page = remap.get(int(n["page"]))
+        for ov in overlays:
+            new_page = remap.get(int(ov["page"]))
             if new_page is not None:
-                out.append(dict(n, page=new_page))
+                out.append(dict(ov, page=new_page))
         return out
 
     def _open_sign_dialog(self, pdf_bytes, label=""):
@@ -14289,6 +15209,7 @@ class App:
         # Style pass: watermark / page numbers / header-footer / Bates / cover.
         orig_bytes = apply_style(orig_bytes, self.style, self)
         # Text notes placed on the Preview (fill forms / annotate).
+        orig_bytes = apply_shapes(orig_bytes, self.shapes)
         orig_bytes = apply_text_notes(orig_bytes, self.text_notes)
         out_data = orig_bytes
         flatten_note = ""
@@ -14430,6 +15351,11 @@ class App:
                     # v1.65.1: what to do with the file is asked here rather
                     # than chosen up front by a dedicated button.
                     self._show_saved_dialog(path, text)
+                elif msg[0] == "print_ready":
+                    self._on_print_ready(msg[1])
+                elif msg[0] == "print_done":
+                    self._set_busy(False)
+                    self.status.config(text="Nothing printed.")
                 elif msg[0] == "export_done":
                     _, written = msg
                     self._set_busy(False)
