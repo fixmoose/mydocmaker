@@ -1,5 +1,34 @@
 # Changelog
 
+## v1.65.11
+- **Scanning fixed: the dialog was probing an unreachable device.** A USB
+  printer bridged by `ipp-usb` is advertised twice — as `airscan:e0:<model>`
+  (stable id) and as `escl:http://<address>:60000`, where the address is
+  whichever one was advertised at probe time. On this machine it alternated
+  between `172.17.0.1` (the docker0 bridge, reachable) and an IPv6
+  link-local `fe80::…` with no scope id, which cannot be reached at all.
+  `show_scan_dialog()` probed `devices[0]`, so when that was the link-local
+  URL `scanner_capabilities()` returned empty — and because the source row was
+  built only `if sources:`, the "Paper from: the glass / the feeder" choice
+  silently vanished, then the scan itself failed against the dead endpoint.
+  Both reported symptoms, one cause.
+  - New `dedupe_scanner_devices()` collapses one physical scanner reported by
+    several backends (verified 2 → 1) and prefers the `airscan:` id. Two
+    genuinely different scanners are still listed separately.
+  - If the chosen entry doesn't answer, the remaining entries are tried before
+    giving up.
+  - The glass/feeder choice is **always** offered now, since practically every
+    scanner with a feeder accepts those two source names whether or not it
+    advertises them.
+- Verified against the real Brother DCP-L2640DW: capabilities
+  `modes [Color, Gray]`, `resolutions [100, 200, 300, 600]`,
+  `sources [Flatbed, ADF]`; a flatbed page scanned in 13.4 s, 850x1169 px at
+  100 dpi, **mode RGB** — confirming the colour fix from 1.65.7 holds and the
+  device is no longer falling back to Lineart.
+- Regression suite grew a `scan` group (11 checks) covering de-duplication,
+  the empty-capabilities case that hid the source row, and the no-scanner
+  message. It stubs the hardware, so no scan is ever triggered by a test.
+
 ## v1.65.10
 - **The Add-text pointer shows what a click will do.** A crosshair cannot
   answer "is this the top, middle or bottom of my text?" — the answer is the

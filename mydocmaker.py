@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.10"
+APP_VERSION = "1.65.11"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -162,6 +162,18 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.11": [
+        "Scanning is fixed. Your printer is offered to the system twice — "
+        "once under a web address that changes every time it is asked, and "
+        "once under a stable name. The app was picking the changeable one, "
+        "which was sometimes unreachable; when that happened it could not "
+        "read what the scanner supports, so the 'Paper from: the glass / the "
+        "feeder' choice disappeared altogether and scanning then failed. The "
+        "app now picks the reliable entry, lists the same machine once "
+        "instead of twice, and always offers the glass and the feeder even "
+        "if the scanner does not answer. Tested on the Brother DCP-L2640DW: "
+        "a colour page off the glass in 13 seconds.",
+    ],
     "1.65.10": [
         "Adding text now shows you where the text will go before you click. "
         "The old crosshair gave no clue whether that point was the top, "
@@ -2554,6 +2566,33 @@ def scanner_devices(timeout=25):
     except Exception:
         pass
     return out
+
+
+def dedupe_scanner_devices(devices):
+    """Collapse the same physical scanner reported by several backends.
+
+    A USB printer bridged by ipp-usb shows up at least twice — once as
+    `escl:http://.../` and once as `airscan:...` — with the model name in
+    both. Offering the same machine twice invites picking the entry whose
+    options differ from the one whose capabilities were read."""
+    seen = {}
+    for dev_id, name in devices:
+        # "ip=..." runs to the end of the line and lists several addresses,
+        # so it must be cut wholesale, not one token at a time.
+        model = re.sub(r"ip=.*$", " ", name)
+        model = re.sub(r"\b(eSCL|USB|platen|adf|scanner)\b", " ", model,
+                       flags=re.I)
+        model = re.sub(r"[^A-Za-z0-9]+", " ", model).strip().lower()
+        key = model or dev_id
+        # Prefer airscan: its device id is stable, whereas an `escl:` URL is
+        # whichever address was advertised at probe time — including an IPv6
+        # link-local with no scope id, which cannot be reached at all. That
+        # unreachable entry is what made capability detection come back empty
+        # and the "Paper from:" row vanish.
+        rank = 0 if dev_id.startswith("airscan:") else 1
+        if key not in seen or rank < seen[key][0]:
+            seen[key] = (rank, dev_id, name)
+    return [(d, n) for _r, d, n in seen.values()] or list(devices)
 
 
 def scanner_capabilities(device=None, timeout=30):
@@ -13518,7 +13557,16 @@ class App:
                 "then try again. (SANE is installed — this is about the "
                 "device, not the software.)")
             return
+        devices = dedupe_scanner_devices(devices)
         caps = scanner_capabilities(devices[0][0])
+        if not (caps["modes"] or caps["sources"]):
+            # The chosen entry didn't answer. Try the others before giving up,
+            # so one unreachable URL can't disable the whole dialog.
+            for alt_id, _alt_name in devices[1:]:
+                alt = scanner_capabilities(alt_id)
+                if alt["modes"] or alt["sources"]:
+                    caps = alt
+                    break
 
         self._ensure_ui_ready()
         win = tk.Toplevel(self.root)
@@ -13564,18 +13612,21 @@ class App:
                      values=[f"{r} dpi" for r in res_list]
                      ).grid(row=2, column=1, sticky="w", padx=(8, 0))
 
-        sources = caps["sources"] or []
-        src_var = tk.StringVar(value=sources[0] if sources else "")
-        if sources:
-            ttk.Label(grid, text="Paper from:").grid(row=3, column=0,
-                                                     sticky="w", pady=3)
-            srow = ttk.Frame(grid)
-            srow.grid(row=3, column=1, sticky="w", padx=(8, 0))
-            label_for = {"Flatbed": "The glass", "ADF": "The feeder (a stack)"}
-            for sname in sources:
-                ttk.Radiobutton(srow, text=label_for.get(sname, sname),
-                                value=sname, variable=src_var
-                                ).pack(side="left", padx=(0, 10))
+        # Always offer the glass and the feeder. Previously this row only
+        # appeared when the probe advertised sources, so a device that failed
+        # to answer left no way to choose at all — and nearly every scanner
+        # with a feeder accepts these two names regardless.
+        sources = caps["sources"] or ["Flatbed", "ADF"]
+        src_var = tk.StringVar(value=sources[0])
+        ttk.Label(grid, text="Paper from:").grid(row=3, column=0,
+                                                 sticky="w", pady=3)
+        srow = ttk.Frame(grid)
+        srow.grid(row=3, column=1, sticky="w", padx=(8, 0))
+        label_for = {"Flatbed": "The glass", "ADF": "The feeder (a stack)"}
+        for sname in sources:
+            ttk.Radiobutton(srow, text=label_for.get(sname, sname),
+                            value=sname, variable=src_var
+                            ).pack(side="left", padx=(0, 10))
 
         note = ttk.Label(win, foreground="#555", wraplength=430,
                          justify="left",

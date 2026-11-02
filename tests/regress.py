@@ -606,9 +606,98 @@ def note_metrics_for(size):
                                 "size": size, "bold": False, "italic": False})
 
 
+def g_scan():
+    """Scan dialog. No hardware is touched: devices and capabilities are
+    stubbed, and run_scan is replaced so nothing is ever scanned."""
+    real_devs = M.scanner_devices
+    real_caps = M.scanner_capabilities
+    real_run = M.run_scan
+    scans = []
+    M.run_scan = lambda **k: (scans.append(k) or ([], "stubbed"))
+    try:
+        # 1. dedupe: one physical scanner behind two backends
+        pair = [("escl:http://fe80::746c:c6c1:735:7a98:60000",
+                 "Brother DCP-L2640DW (USB) platen,adf scanner"),
+                ("airscan:e0:Brother DCP-L2640DW (USB)",
+                 "eSCL Brother DCP-L2640DW (USB) ip=127.0.0.1, 172.17.0.1,"
+                 " 192.168.0.110")]
+        dd = M.dedupe_scanner_devices(pair)
+        check("scan", "duplicates collapse to one", len(dd) == 1,
+              str([d for d, _ in dd]))
+        check("scan", "prefers the stable airscan id",
+              dd and dd[0][0].startswith("airscan:"),
+              str(dd[0][0]) if dd else "none")
+        check("scan", "a single device is left alone",
+              len(M.dedupe_scanner_devices(pair[:1])) == 1)
+        check("scan", "genuinely different scanners both kept",
+              len(M.dedupe_scanner_devices(
+                  [("airscan:a:Brother DCP-L2640DW", "Brother DCP-L2640DW"),
+                   ("airscan:b:Canon LiDE 400", "Canon LiDE 400")])) == 2)
+
+        # 2. the failure that hid the source row: capabilities come back
+        #    empty because the probed URL is unreachable
+        M.scanner_devices = lambda *a, **k: list(pair)
+        M.scanner_capabilities = lambda *a, **k: {
+            "modes": [], "resolutions": [], "sources": []}
+        h = Harness([])
+        try:
+            h.app.show_scan_dialog()
+            h.settle(12)
+            tops = [w for w in h.root.winfo_children()
+                    if isinstance(w, tk.Toplevel)]
+            check("scan", "dialog opens with empty capabilities",
+                  len(tops) == 1, str(len(tops)))
+            if tops:
+                radios = []
+
+                def walk(w):
+                    for c in w.winfo_children():
+                        if c.winfo_class() in ("TRadiobutton", "Radiobutton"):
+                            radios.append(c)
+                        walk(c)
+                walk(tops[-1])
+                vals = sorted(str(r.cget("value")) for r in radios)
+                check("scan", "source row still offered", len(radios) == 2,
+                      f"{len(radios)} radios")
+                check("scan", "offers glass and feeder",
+                      vals == ["ADF", "Flatbed"], str(vals))
+                labels = sorted(str(r.cget("text")) for r in radios)
+                check("scan", "sources are in plain words",
+                      labels == ["The feeder (a stack)", "The glass"],
+                      str(labels))
+                try:
+                    tops[-1].grab_release()
+                except Exception:
+                    pass
+                tops[-1].destroy()
+        finally:
+            h.close()
+
+        # 3. no scanner at all -> a message, not a traceback
+        M.scanner_devices = lambda *a, **k: []
+        DIALOGS.clear()
+        h = Harness([])
+        try:
+            h.app.show_scan_dialog()
+            h.settle(6)
+            check("scan", "no scanner is explained",
+                  any("No scanner found" in str(m[2]) for m in DIALOGS),
+                  str(DIALOGS))
+            check("scan", "no dialog left open",
+                  not [w for w in h.root.winfo_children()
+                       if isinstance(w, tk.Toplevel)])
+        finally:
+            h.close()
+        check("scan", "nothing was ever scanned", not scans, str(scans))
+    finally:
+        M.scanner_devices = real_devs
+        M.scanner_capabilities = real_caps
+        M.run_scan = real_run
+
+
 GROUPS = {"startup": g_startup, "notes": g_notes, "shapes": g_shapes,
           "crop": g_crop, "project": g_project, "print": g_print,
-          "guards": g_guards, "ghost": g_ghost, "tabs": g_tabs}
+          "guards": g_guards, "ghost": g_ghost, "scan": g_scan, "tabs": g_tabs}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(GROUPS)
