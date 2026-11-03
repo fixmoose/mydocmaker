@@ -101,18 +101,43 @@ jobs:
             echo "TK_LIBRARY=$WORK/prefix/lib/tk8.6"
           } >> "$GITHUB_ENV"
 
+      # Headless check: CI runners have no $DISPLAY, so tkinter.Tk() cannot be
+      # used here. tkinter.Tcl() needs no display, and the Tk side is verified
+      # by resolving the libtk that _tkinter actually links against under the
+      # LD_LIBRARY_PATH set above and reading its version string.
       - name: Confirm the new Tcl/Tk is what Python loads (Linux)
         if: startsWith(matrix.os, 'ubuntu')
         run: |
           python - <<'EOF'
-          import tkinter, sys
-          r = tkinter.Tk()
-          pl = r.tk.call("info", "patchlevel")
-          print("tcl/tk patchlevel:", pl)
-          r.destroy()
-          parts = [int(x) for x in pl.split(".")]
-          if parts < [8, 6, 16]:
-              sys.exit(f"expected >= 8.6.16, got {pl} - the tkError.c fix is missing")
+          import _tkinter, re, subprocess, sys, tkinter
+
+          need = (8, 6, 16)
+
+          tcl_pl = tkinter.Tcl().call("info", "patchlevel")
+          print("tcl patchlevel:", tcl_pl)
+          if tuple(int(x) for x in tcl_pl.split(".")) < need:
+              sys.exit(f"Tcl is {tcl_pl}, need >= 8.6.16")
+
+          ldd = subprocess.run(["ldd", _tkinter.__file__],
+                               capture_output=True, text=True).stdout
+          m = re.search(r"libtk8\.6\.so\S*\s+=>\s+(\S+)", ldd)
+          if not m:
+              sys.exit("could not resolve libtk from:\n" + ldd)
+          libtk = m.group(1)
+          print("libtk resolved to:", libtk)
+
+          out = subprocess.run(["strings", libtk],
+                               capture_output=True, text=True).stdout
+          found = sorted({v for v in out.splitlines()
+                          if re.fullmatch(r"8\.6\.\d+", v)},
+                         key=lambda v: tuple(int(x) for x in v.split(".")))
+          print("libtk version strings:", found)
+          if not found:
+              sys.exit(f"no version string in {libtk}")
+          if tuple(int(x) for x in found[-1].split(".")) < need:
+              sys.exit(f"libtk is {found[-1]} ({libtk}), need >= 8.6.16 - "
+                       "the tkError.c fix [f52986] would be missing")
+          print("OK: Tcl/Tk >= 8.6.16 is what this build will bundle")
           EOF
 
       # Convert the source PNG icon into platform-native formats so
