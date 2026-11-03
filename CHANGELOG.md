@@ -1,5 +1,61 @@
 # Changelog
 
+## v1.65.13
+- **The crash on Create PDF after scanning was a bug in Tcl/Tk, not in this
+  app.** Three feeder pages then Create PDF killed the process with a
+  segfault and no Python traceback. The cause is in `generic/tkError.c` of
+  Tcl/Tk **8.6.12**, which Ubuntu 22.04 ships and which the Linux bundle
+  therefore carried:
+  ```c
+  errorPtr->lastRequest = (unsigned) -1;              /* 8.6.12: 4 bytes ... */
+  int lastSerial = LastKnownRequestProcessed(display); /* ... and a truncated serial */
+  ```
+  `lastRequest` is an `unsigned long`. The "handler is still active" sentinel
+  is written as 32 bits (`0x00000000FFFFFFFF`), so the later guard
+  `lastRequest != (unsigned long) -1` never recognises it, and `lastSerial`
+  is truncated through a signed `int`. `Tk_DeleteErrorHandler()`'s cleanup
+  loop then `ckfree()`s X error handlers that are still live. The freed block
+  is recycled, a 4-byte write lands where its `nextPtr` was, and the next
+  `_XReply()` walks the handler list and frees a wild pointer. Upstream bug
+  [f52986], fixed in **8.6.16** (Dec 2024), which also adds
+  `errorPtr->errorProc = NULL` so a deleted handler can no longer be called
+  back into.
+  - The Linux build now compiles Tcl/Tk 8.6.16 from source with pinned
+    SHA-256 checksums and bundles that, instead of inheriting the runner's
+    8.6.12. A guard step fails the build if Python loads anything older.
+  - **Measured on Pop!_OS 22.04**, the real three-page 300 dpi feeder scan
+    followed by Create PDF, 160 runs in all:
+
+    | Tcl/Tk | crashes | runs |
+    |---|---|---|
+    | 8.6.12 | 11 | 80 |
+    | 8.6.16 | **0** | 80 |
+
+    Fisher's exact test, two-tailed: **p = 0.00068**.
+  - Diagnosis evidence, for the record: the faulting instruction was a 4-byte
+    store (`mov %eax,(%r12)`); both captured bad pointers had their low 32
+    bits replaced by `1` with the high half intact (`0x1f00000001`,
+    `0x555500000001`); valgrind reported exactly one invalid write, inside
+    `libtk8.6`; and the native stack was
+    `free` ← `_XReply` ← `XSync` ← `Tk_DeleteErrorHandler` — the function
+    named in the upstream bug.
+  - Not claimed fixed: the Windows and macOS bundles use the Tcl/Tk that
+    ships with Python itself, which has not been checked against 8.6.16.
+- **Settings no longer reset themselves.** `save_session_state()` rebuilt
+  `state.json` from an allowlist of keys to carry over, so any preference not
+  named in that tuple was silently dropped on the next save. `dnd_enabled`
+  was one of them — the Settings → Stability toggle for drag-and-drop reset
+  itself to on, which mattered because that toggle was the documented
+  workaround for the crash above. It now starts from what is on disk and
+  overwrites only the session fields, so a preference added later survives
+  because it is not a session field, not because someone remembered to edit a
+  list. New `prefs` regression group (5 checks), including one asserting that
+  an unlisted future preference survives.
+- Regression suite: 120 checks (was 107), across `startup, prefs, notes,
+  shapes, crop, project, print, guards, ghost, scan, reentry, tabs`. Note
+  that the suite sets `MYDOCMAKER_NO_DND=1`, so it cannot by itself say
+  anything about crashes that depend on drag-and-drop being loaded.
+
 ## v1.65.12
 - **Fixed the crash on Create PDF after scanning.** Scanning three pages and
   then pressing Create PDF segfaulted. The journal caught it dying inside Tk

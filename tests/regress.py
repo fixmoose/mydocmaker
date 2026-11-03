@@ -824,7 +824,62 @@ def g_reentry():
         M.run_scan = real_run
 
 
-GROUPS = {"startup": g_startup, "notes": g_notes, "shapes": g_shapes,
+def g_prefs():
+    """Preferences must survive a session save.
+
+    save_session_state() used to rebuild state.json from an allowlist of keys
+    to carry over, so any preference not named in that tuple was silently
+    dropped. `dnd_enabled` was one — and that toggle is the only known way out
+    of the tkdnd segfault, so the escape hatch reset itself to "on" at the
+    next save. It now preserves every key it does not own.
+    """
+    import json as _json
+    real_home = os.environ.get("XDG_CONFIG_HOME")
+    sandbox = tempfile.mkdtemp(prefix="mydocmaker_prefs_")
+    os.environ["XDG_CONFIG_HOME"] = sandbox
+    try:
+        sf = M._state_file()
+        os.makedirs(os.path.dirname(sf), exist_ok=True)
+        M._set_pref("dnd_enabled", False)
+        M._set_pref("archive_folder", "/tmp/arch")
+        M._set_pref("a_pref_added_later", 42)
+
+        class FakeItem:
+            kind, value, label = "file", "/x.pdf", "x"
+            size_bytes, flat_pages_est = 1, 1
+
+        M.save_session_state([FakeItem()], page_mode="letter", flatten=True)
+        after = _json.load(open(sf))
+
+        check("prefs", "dnd_enabled survives a session save",
+              after.get("dnd_enabled") is False,
+              repr(after.get("dnd_enabled", "<dropped>")))
+        check("prefs", "archive_folder survives",
+              after.get("archive_folder") == "/tmp/arch",
+              repr(after.get("archive_folder", "<dropped>")))
+        # The real point: a preference nobody listed anywhere is still kept.
+        check("prefs", "an unlisted future pref survives",
+              after.get("a_pref_added_later") == 42,
+              repr(after.get("a_pref_added_later", "<dropped>")))
+        check("prefs", "session fields are still written",
+              len(after.get("items", [])) == 1
+              and after.get("page_mode") == "letter"
+              and after.get("flatten") is True, str(after)[:160])
+
+        # And it must round-trip: a second save does not lose it either.
+        M.save_session_state([FakeItem()])
+        again = _json.load(open(sf))
+        check("prefs", "survives a second save too",
+              again.get("dnd_enabled") is False,
+              repr(again.get("dnd_enabled", "<dropped>")))
+    finally:
+        if real_home is None:
+            os.environ.pop("XDG_CONFIG_HOME", None)
+        else:
+            os.environ["XDG_CONFIG_HOME"] = real_home
+
+
+GROUPS = {"startup": g_startup, "prefs": g_prefs, "notes": g_notes, "shapes": g_shapes,
           "crop": g_crop, "project": g_project, "print": g_print,
           "guards": g_guards, "ghost": g_ghost, "scan": g_scan,
           "reentry": g_reentry, "tabs": g_tabs}

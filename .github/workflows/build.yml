@@ -18,6 +18,12 @@ on:
 
 env:
   APP_NAME: "MyDocMaker"
+  # Pinned, with checksums, so a Linux bundle is reproducible and always
+  # carries the tkError.c fix (upstream Tk bug [f52986]). See the
+  # "Build Tcl/Tk" step for why 8.6.12 cannot be used.
+  TCLTK_VERSION: "8.6.16"
+  TCL_SHA256: "91cb8fa61771c63c262efb553059b7c7ad6757afa5857af6265e4b0bdc2a14a5"
+  TK_SHA256: "be9f94d3575d4b3099d84bc3c10de8994df2d7aa405208173c709cc404a7e5fe"
 
 jobs:
   build:
@@ -54,6 +60,60 @@ jobs:
 
       - name: Install Chromium for webpage capture
         run: python -m playwright install chromium
+
+      # Ubuntu 22.04 ships Tcl/Tk 8.6.12, and PyInstaller bundles whatever
+      # the runner has. 8.6.12's generic/tkError.c stores the "handler still
+      # active" sentinel as `(unsigned) -1` in an `unsigned long` field and
+      # truncates the X request serial through a signed `int`, so live X
+      # error handlers get ckfree()d while still on dispPtr->errorPtr. The
+      # freed block is recycled, a 4-byte write lands on its nextPtr, and the
+      # next _XReply() walks the list and frees a wild pointer — a SIGSEGV
+      # inside free() with no Python traceback, which is how the app died on
+      # "Create PDF" after a scan. Upstream bug [f52986], fixed in 8.6.16.
+      # Measured on Pop!_OS 22.04 with a 3-page 300dpi feeder scan: 4/40
+      # crashes on 8.6.12, 0/40 on 8.6.16.
+      - name: Build Tcl/Tk ${{ env.TCLTK_VERSION }} (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          set -eux
+          V="${{ env.TCLTK_VERSION }}"
+          WORK="$RUNNER_TEMP/tcltk"
+          mkdir -p "$WORK" && cd "$WORK"
+          curl -fsSL -o tcl.tar.gz \
+            "https://downloads.sourceforge.net/project/tcl/Tcl/$V/tcl$V-src.tar.gz"
+          curl -fsSL -o tk.tar.gz \
+            "https://downloads.sourceforge.net/project/tcl/Tcl/$V/tk$V-src.tar.gz"
+          echo "${{ env.TCL_SHA256 }}  tcl.tar.gz" | sha256sum -c -
+          echo "${{ env.TK_SHA256 }}  tk.tar.gz"   | sha256sum -c -
+          tar -xzf tcl.tar.gz && tar -xzf tk.tar.gz
+          cd "tcl$V/unix" && ./configure --prefix="$WORK/prefix" --enable-64bit \
+            && make -j"$(nproc)" && make install
+          cd "$WORK/tk$V/unix" && ./configure --prefix="$WORK/prefix" \
+            --with-tcl="$WORK/tcl$V/unix" --enable-64bit \
+            && make -j"$(nproc)" && make install
+          # Hand the prefix to every later step so PyInstaller's analysis
+          # resolves libtcl/libtk and their script libraries from here rather
+          # than from /usr/lib. Verified locally: a bundle built this way
+          # reports "patchlevel: 8.6.16" at runtime.
+          {
+            echo "LD_LIBRARY_PATH=$WORK/prefix/lib"
+            echo "TCL_LIBRARY=$WORK/prefix/lib/tcl8.6"
+            echo "TK_LIBRARY=$WORK/prefix/lib/tk8.6"
+          } >> "$GITHUB_ENV"
+
+      - name: Confirm the new Tcl/Tk is what Python loads (Linux)
+        if: startsWith(matrix.os, 'ubuntu')
+        run: |
+          python - <<'EOF'
+          import tkinter, sys
+          r = tkinter.Tk()
+          pl = r.tk.call("info", "patchlevel")
+          print("tcl/tk patchlevel:", pl)
+          r.destroy()
+          parts = [int(x) for x in pl.split(".")]
+          if parts < [8, 6, 16]:
+              sys.exit(f"expected >= 8.6.16, got {pl} - the tkError.c fix is missing")
+          EOF
 
       # Convert the source PNG icon into platform-native formats so
       # PyInstaller can embed the right one in the .exe / .app /
