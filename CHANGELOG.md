@@ -1,5 +1,47 @@
 # Changelog
 
+## v1.65.12
+- **Fixed the crash on Create PDF after scanning.** Scanning three pages and
+  then pressing Create PDF segfaulted. The journal caught it dying inside Tk
+  while constructing the first `ttk.Button` of the Create dialog
+  (`_ask_create_options`) — a crash in Tk's C code, so the app simply vanished
+  with no Python traceback on screen. Two re-entrancy holes, both on that
+  exact path:
+  - `show_scan_dialog()` waited for the scan with
+    `while t.is_alive(): win.update()`. `update()` re-enters Tk's event loop
+    from inside a button callback, so queued page renders ran under the
+    suspended frame and their `PhotoImage`s were created and freed mid-stack.
+    Replaced with `win.after(80, poll)`, scheduled by the one real mainloop:
+    no nesting, and the dialog stays responsive. Cancel is now disabled during
+    a scan, and the poller tolerates the dialog being closed mid-scan.
+  - The `_modal_depth` guard added in 1.64 — which suspends queue processing
+    while a dialog is open, precisely so a finishing render cannot destroy
+    canvas widgets while a dialog's widgets are being built — only ever
+    covered `_poll_queue()`. The preview debounce, the two `<Configure>`
+    handlers, the Order thumbnail grid and the Style sample each run on their
+    own `after()` chain and none of them checked it, so a render landing
+    mid-dialog could still pull the canvas out from under a widget under
+    construction. New `App.ui_frozen()` is checked by
+    `PreviewTab._rebuild_now()`, `PreviewTab._render_all_pages()`,
+    `OrderTab.refresh()` and `StyleTab._draw_preview()`; `App._thaw_ui()`
+    issues the missed repaint once the last dialog closes, so nothing is left
+    stale.
+- **`Splash.set()` had the same bug, on every startup.** It repainted with a
+  full `update()`, and the last two messages are set *after* `App(root)` is
+  built — so every launch re-entered the event loop with the render threads
+  and `after()` handlers already live. It now uses `update_idletasks()`, which
+  repaints the label without running user callbacks or timers. The splash
+  constructor keeps its one `update()`: that runs before `App()` exists, so
+  there is nothing to re-enter, and the first map/expose needs more than idle
+  tasks to paint. This is the most likely explanation for the intermittent
+  segfault-at-startup that had been open for several versions.
+- Regression suite grew a `reentry` group (8 checks): a static scan proving no
+  `update()` spin loop remains anywhere and that exactly one full `update()`
+  is left in the file (the splash's first paint), plus behavioural checks that
+  pressing Scan returns without blocking, that the result arrives via
+  `after()`, that the buttons re-enable, and that closing the dialog mid-scan
+  does not raise.
+
 ## v1.65.11
 - **Scanning fixed: the dialog was probing an unreachable device.** A USB
   printer bridged by `ipp-usb` is advertised twice — as `airscan:e0:<model>`

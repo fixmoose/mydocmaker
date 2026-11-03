@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.11"
+APP_VERSION = "1.65.12"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -162,6 +162,17 @@ TAB_EDITOR = "Editor"
 # shows the bullets for APP_VERSION. Keep this in sync with CHANGELOG.md when
 # you tag a release — the in-app reader is the user-facing surface.
 WHATS_NEW = {
+    "1.65.12": [
+        "Fixed the crash when you pressed Create PDF after scanning. While "
+        "it waited for the scanner the app kept the window alive in a way "
+        "that let page rendering run in the middle of other work — so the "
+        "next window it opened was built on ground that had already shifted, "
+        "and it closed itself without a word. Waiting is now done properly, "
+        "and no page redraw can start while a window is being opened.",
+        "The same mistake was in the startup screen, where it ran on every "
+        "single launch. That is the likeliest cause of the occasional "
+        "disappear-on-startup, which should now be gone too.",
+    ],
     "1.65.11": [
         "Scanning is fixed. Your printer is offered to the system twice — "
         "once under a web address that changes every time it is asked, and "
@@ -7777,6 +7788,18 @@ class PreviewTab:
             self._rebuild_now()
 
     def _rebuild_now(self):
+        if self.app.ui_frozen():
+            # A dialog is on top. Come back when it has gone — see
+            # App.ui_frozen().
+            self._dirty = True
+            if self._debounce_id is not None:
+                try:
+                    self.app.root.after_cancel(self._debounce_id)
+                except tk.TclError:
+                    pass
+            self._debounce_id = self.app.root.after(
+                150, self._rebuild_if_visible_or_dirty)
+            return
         if not FLATTEN_OK:
             # pypdfium2 missing — preview can't render pages.
             self._set_placeholder(
@@ -8157,6 +8180,8 @@ class PreviewTab:
         Page geometry comes from the page sizes (cheap), so the layout and
         scrollbars are exact immediately, and only pages actually in view get
         rasterised. Scrolling fills in the rest."""
+        if self.app.ui_frozen():
+            return                      # see App.ui_frozen()
         if self._combined_pdf is None or self._page_count == 0:
             return
         if not PIL_TK_OK:
@@ -9681,6 +9706,8 @@ class OrderTab:
     # ---- build the grid ---------------------------------------------------
     def refresh(self):
         """Re-assemble the native page set and rebuild the thumbnail grid."""
+        if self.app.ui_frozen():
+            return                      # see App.ui_frozen()
         self._clear()
         # Sheets drag only makes sense under 2-up; gray it out otherwise.
         if self._is_nup():
@@ -10413,6 +10440,8 @@ class StyleTab:
         Only the first page, at thumbnail size — enough to judge a watermark
         or a header, cheap enough to redo as you drag a slider."""
         self._prev_after = None
+        if self.app.ui_frozen():
+            return                      # see App.ui_frozen()
         cv = getattr(self, "prev_canvas", None)
         if cv is None:
             return
@@ -11861,6 +11890,9 @@ class Splash:
             sh = self.win.winfo_screenheight()
             w, h = self.win.winfo_width(), self.win.winfo_height()
             self.win.geometry(f"+{(sw - w) // 2}+{(sh - h) // 3}")
+            # Safe to use the full update() here and only here: this runs
+            # before App() exists, so there is nothing queued to re-enter,
+            # and the first map/expose needs more than idle tasks to paint.
             self.win.update()
         except Exception:
             self.win = None
@@ -11870,7 +11902,13 @@ class Splash:
             return
         try:
             self.msg.config(text=text)
-            self.win.update()
+            # update_idletasks, NOT update: by the time the later messages are
+            # set the App exists, with render threads and after() handlers
+            # queued. A full update() would run them re-entrantly and corrupt
+            # Tk's heap (same fault that killed Create PDF after a scan). The
+            # window is already mapped here, so a label repaint is an idle
+            # task and this is all the painting it needs.
+            self.win.update_idletasks()
         except tk.TclError:
             self.win = None
 
@@ -13652,13 +13690,15 @@ class App:
 
         done_btn = ttk.Button(row, text="Add 0 pages", command=finish)
         scan_btn = ttk.Button(row, text="Scan")
+        cancel_btn = ttk.Button(row, text="Cancel", command=win.destroy)
 
         def set_busy(busy, msg=None):
-            for b in (scan_btn, done_btn):
+            # Cancel is disabled too: the dialog must not be torn down while
+            # scanimage still holds the device.
+            for b in (scan_btn, done_btn, cancel_btn):
                 b.state(["disabled"] if busy else ["!disabled"])
             if msg:
                 count_lbl.config(text=msg)
-            win.update_idletasks()
 
         def do_scan():
             dev = devices[[d[1] for d in devices].index(dev_var.get())][0]
@@ -13678,25 +13718,43 @@ class App:
 
             t = threading.Thread(target=worker, daemon=True)
             t.start()
-            while t.is_alive():         # keep the dialog responsive
-                win.update()
-                time.sleep(0.05)
-            set_busy(False)
-            if result.get("err") and not result.get("paths"):
-                count_lbl.config(text=f"Scan failed: {result['err']}",
-                                 foreground="#a30000")
-                return
-            collected.extend(result.get("paths") or [])
-            count_lbl.config(
-                text=f"{len(collected)} page(s) scanned. Press Scan again for "
-                     f"another, or add them.", foreground="#0a5a16")
-            done_btn.config(text=f"Add {len(collected)} page"
-                                 f"{'' if len(collected) == 1 else 's'}")
+
+            # Wait by handing control back to the event loop, never by
+            # re-entering it. The old loop spun on win.update(), which runs
+            # Tk's event loop again from inside this callback: queued page
+            # renders fired under the suspended frame, their PhotoImages were
+            # created and freed mid-stack, and Tk's allocator was left
+            # corrupted. The app then died at the next widget it built
+            # anywhere else - reliably the first ttk.Button in Create PDF.
+            # after() is scheduled by the one real mainloop, so the dialog
+            # stays responsive with no nesting.
+            def poll():
+                try:
+                    if not win.winfo_exists():
+                        return
+                except tk.TclError:
+                    return              # dialog gone; nothing to update
+                if t.is_alive():
+                    win.after(80, poll)
+                    return
+                set_busy(False)
+                if result.get("err") and not result.get("paths"):
+                    count_lbl.config(text=f"Scan failed: {result['err']}",
+                                     foreground="#a30000")
+                    return
+                collected.extend(result.get("paths") or [])
+                count_lbl.config(
+                    text=f"{len(collected)} page(s) scanned. Press Scan again "
+                         f"for another, or add them.", foreground="#0a5a16")
+                done_btn.config(text=f"Add {len(collected)} page"
+                                     f"{'' if len(collected) == 1 else 's'}")
+
+            win.after(80, poll)
 
         scan_btn.config(command=do_scan)
         scan_btn.pack(side="left")
         done_btn.pack(side="left", padx=(8, 0))
-        ttk.Button(row, text="Cancel", command=win.destroy).pack(side="right")
+        cancel_btn.pack(side="right")
         win.update_idletasks()
         win.grab_set()
         scan_btn.focus_set()
@@ -15418,6 +15476,18 @@ class App:
         except tk.TclError:
             pass
 
+    def ui_frozen(self):
+        """True while a dialog is open or its widgets are being built.
+
+        Rebuilding a tab destroys and recreates canvas items and the
+        PhotoImages behind them. Doing that while a dialog's widgets are under
+        construction — or from inside the nested event loop a dialog waits in
+        — segfaults Tk. `_poll_queue` has stood aside since 1.64, but the
+        debounce and <Configure> after() chains had not, so a render finishing
+        mid-dialog could still pull the canvas out from under a widget being
+        created. Callers reschedule instead of redrawing; nothing is lost."""
+        return self._modal_depth > 0
+
     def _begin_modal(self, win):
         """Suspend queue processing for this dialog's entire lifetime.
 
@@ -15433,8 +15503,29 @@ class App:
             if not released["done"]:
                 released["done"] = True
                 self._modal_depth = max(0, self._modal_depth - 1)
+                if self._modal_depth == 0:
+                    # after() so the catch-up lands once this Toplevel is
+                    # really gone, not midway through its own teardown.
+                    self.root.after(60, self._thaw_ui)
 
         win.bind("<Destroy>", _release, add="+")
+
+    def _thaw_ui(self):
+        """Redraw whatever stood aside while a dialog was up.
+
+        ui_frozen() makes the rebuild chains skip rather than queue, so
+        something has to ask for the missed repaint. Cheap: the preview goes
+        through its normal debounce, and the other two only redraw what is
+        actually on screen."""
+        if self._modal_depth > 0:
+            return
+        try:
+            self.preview.invalidate()
+            if self._tab_is(TAB_ORDER):
+                self.order_tab.refresh()
+            self.style_tab._draw_preview()
+        except (tk.TclError, AttributeError):
+            pass
 
     def _poll_queue(self):
         # While a modal dialog is open we are inside a NESTED event loop

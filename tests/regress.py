@@ -12,6 +12,7 @@ between groups.
 """
 import io
 import os
+import re
 import sys
 import time
 import tempfile
@@ -695,9 +696,138 @@ def g_scan():
         M.run_scan = real_run
 
 
+def g_reentry():
+    """The crash behind "scanned 3 pages, then Create PDF died".
+
+    Pressing Scan used to block in `while t.is_alive(): win.update()`, which
+    re-enters Tk's event loop from inside a callback. Queued renders ran under
+    the suspended frame, PhotoImages were freed mid-stack, and the next widget
+    built anywhere in the app segfaulted. These checks pin the wait to after().
+    """
+    src = open(os.path.join(APP_DIR, "mydocmaker.py")).read()
+
+    # 1. static: no wait loop anywhere may drive the event loop itself.
+    spin = re.findall(r"while[^\n]*:\n(?:[^\n]*\n){0,4}?[^\n]*\.update\(\)",
+                      src)
+    check("reentry", "no update() spin loop in the source", not spin,
+          str(spin)[:200])
+
+    # 2. static: the only full update() left is the splash's first paint,
+    #    which runs before App() exists and so has nothing to re-enter.
+    bare = [ln.strip() for ln in src.splitlines()
+            if re.search(r"(?<!_idletasks)\.update\(\)\s*$", ln)]
+    check("reentry", "exactly one full update() remains", len(bare) == 1,
+          str(bare))
+    set_body = src.split("    def set(self, text):")[1].split("def ")[0]
+    check("reentry", "Splash.set repaints via idle tasks only",
+          "update_idletasks()" in set_body and ".update()" not in set_body,
+          set_body.strip()[:160])
+
+    # 3. behavioural: Scan must hand control straight back, finish through
+    #    after(), and survive the dialog being destroyed mid-scan.
+    real_devs, real_caps, real_run = (M.scanner_devices,
+                                      M.scanner_capabilities, M.run_scan)
+    pair = [("airscan:e0:Stub", "Stub scanner")]
+    M.scanner_devices = lambda *a, **k: list(pair)
+    M.scanner_capabilities = lambda *a, **k: {
+        "modes": ["Color"], "resolutions": [300], "sources": ["Flatbed"]}
+
+    def slow_scan(**k):
+        time.sleep(0.4)
+        return (["/nonexistent/stub-page.png"], None)
+    M.run_scan = slow_scan
+
+    def scan_button(top):
+        found = []
+
+        def walk(w):
+            for c in w.winfo_children():
+                if c.winfo_class() in ("TButton", "Button") and \
+                        str(c.cget("text")) == "Scan":
+                    found.append(c)
+                walk(c)
+        walk(top)
+        return found[0] if found else None
+
+    try:
+        h = Harness([])
+        try:
+            h.app.show_scan_dialog()
+            h.settle(10)
+            top = [w for w in h.root.winfo_children()
+                   if isinstance(w, tk.Toplevel)][-1]
+            btn = scan_button(top)
+            check("reentry", "Scan button found", btn is not None)
+            if btn is not None:
+                t0 = time.time()
+                btn.invoke()
+                elapsed = time.time() - t0
+                # The 0.4s scan must NOT have been waited out inside invoke().
+                check("reentry", "Scan returns without blocking",
+                      elapsed < 0.2, f"{elapsed:.3f}s in invoke()")
+                for _ in range(120):          # let after() land the result
+                    h.root.update()
+                    time.sleep(0.012)
+                    if not btn.instate(["disabled"]):
+                        break
+                labels = []
+
+                def walk_lbl(w):
+                    for c in w.winfo_children():
+                        if c.winfo_class() in ("TLabel", "Label"):
+                            labels.append(str(c.cget("text")))
+                        walk_lbl(c)
+                walk_lbl(top)
+                check("reentry", "result arrived via after()",
+                      any("1 page(s) scanned" in t for t in labels),
+                      str(labels)[:200])
+                check("reentry", "buttons re-enabled after the scan",
+                      not btn.instate(["disabled"]))
+            try:
+                top.grab_release()
+            except Exception:
+                pass
+            top.destroy()
+        finally:
+            h.close()
+
+        # 4. closing the dialog mid-scan must not raise from the poller.
+        h = Harness([])
+        try:
+            h.app.show_scan_dialog()
+            h.settle(10)
+            top = [w for w in h.root.winfo_children()
+                   if isinstance(w, tk.Toplevel)][-1]
+            btn = scan_button(top)
+            if btn is not None:
+                btn.invoke()
+                h.settle(4)
+                try:
+                    top.grab_release()
+                except Exception:
+                    pass
+                top.destroy()                 # pulled away while scanning
+                err = None
+                try:
+                    for _ in range(80):
+                        h.root.update()
+                        time.sleep(0.012)
+                except tk.TclError as e:
+                    err = e
+                check("reentry", "closing mid-scan is survivable", err is None,
+                      str(err))
+        finally:
+            h.close()
+    finally:
+        M.scanner_devices = real_devs
+        M.scanner_capabilities = real_caps
+        M.run_scan = real_run
+
+
 GROUPS = {"startup": g_startup, "notes": g_notes, "shapes": g_shapes,
           "crop": g_crop, "project": g_project, "print": g_print,
-          "guards": g_guards, "ghost": g_ghost, "scan": g_scan, "tabs": g_tabs}
+          "guards": g_guards, "ghost": g_ghost, "scan": g_scan,
+          "reentry": g_reentry, "tabs": g_tabs}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(GROUPS)
