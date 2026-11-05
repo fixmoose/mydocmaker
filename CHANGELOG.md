@@ -1,5 +1,40 @@
 # Changelog
 
+## v1.65.15
+- **Fixed: every font and glyph icon in the Linux build was wrong in v1.65.13
+  and v1.65.14.** A regression introduced by the Tcl/Tk 8.6.16 bundling in
+  v1.65.13, and entirely self-inflicted.
+  - Tk's `configure` falls back to core X11 bitmap fonts **silently** when the
+    Xft / fontconfig / FreeType development headers are absent. The CI step
+    that built Tcl/Tk 8.6.16 from source never installed them, so the bundled
+    `libtk8.6.so` was linked against none of `libXft`, `libfontconfig`,
+    `libfreetype` or `libXrender`. Measured on the shipped `.deb`:
+
+    | | shipped 8.6.16 | system 8.6.12 |
+    |---|---|---|
+    | `TkDefaultFont` | `gothic`, size 9 | `DejaVu Sans`, size 10 |
+    | font families visible | **20** | 1680 |
+
+    The 20 were the core X11 bitmaps — `clean`, `fixed`, `clearlyu`. Every
+    `"Helvetica"` the app asks for fell back to one of those, and the 56
+    glyph icons in the UI (`✓ ✎ ⟳ ⚙ 🔒 ▲ ▼ ● ◀ ▶ ✗`) drew as missing-glyph
+    boxes — they measured the same width as `A`, which is the giveaway.
+  - The build now installs `libxft-dev`, `libfontconfig1-dev`,
+    `libfreetype6-dev`, `libxrender-dev`, `libx11-dev` and `libxext-dev`
+    before configuring, and passes `--enable-xft` explicitly.
+  - **The guard step was the real failure.** It checked the Tcl/Tk *version*
+    and nothing else, so it waved through a Tk that reported 8.6.16 while
+    being unable to see a single system font. It now also requires the
+    resolved `libtk` to be linked against `libXft`, `libfontconfig` and
+    `libfreetype`, and fails the build with that diagnosis if not. Verified
+    against both the broken shipped library (fails) and an Xft-linked one
+    (passes).
+  - Lesson recorded because it generalises: when a build step swaps out a
+    dependency, checking the version it reports is not checking that it
+    works. The crash fix in v1.65.13 was real and is unaffected — the
+    `tkError.c` bug is still fixed, this was only about how that Tk was
+    configured.
+
 ## v1.65.14
 - **Fixed: right-click "Add to MyDocMaker" could do nothing at all.** The
   file manager entry shells out to `mydocmaker <paths>`, and a second

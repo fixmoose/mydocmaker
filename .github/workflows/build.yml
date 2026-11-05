@@ -86,10 +86,21 @@ jobs:
           echo "${{ env.TCL_SHA256 }}  tcl.tar.gz" | sha256sum -c -
           echo "${{ env.TK_SHA256 }}  tk.tar.gz"   | sha256sum -c -
           tar -xzf tcl.tar.gz && tar -xzf tk.tar.gz
+          # Tk's configure silently falls back to core X11 bitmap fonts if the
+          # Xft/fontconfig/FreeType headers are missing. v1.65.13 and v1.65.14
+          # shipped exactly that: the bundled Tk could see 20 font families
+          # instead of 1680, TkDefaultFont resolved to "gothic" at size 9, and
+          # every ✓ ✎ ⟳ ⚙ glyph in the UI rendered as a missing-glyph box.
+          # These headers are what make the difference, so install them before
+          # configuring, and let the guard step below fail the build if the
+          # result still is not linked against Xft.
+          sudo apt-get update
+          sudo apt-get install -y libxft-dev libfontconfig1-dev \
+            libfreetype6-dev libxrender-dev libx11-dev libxext-dev
           cd "tcl$V/unix" && ./configure --prefix="$WORK/prefix" --enable-64bit \
             && make -j"$(nproc)" && make install
           cd "$WORK/tk$V/unix" && ./configure --prefix="$WORK/prefix" \
-            --with-tcl="$WORK/tcl$V/unix" --enable-64bit \
+            --with-tcl="$WORK/tcl$V/unix" --enable-64bit --enable-xft \
             && make -j"$(nproc)" && make install
           # Hand the prefix to every later step so PyInstaller's analysis
           # resolves libtcl/libtk and their script libraries from here rather
@@ -137,7 +148,27 @@ jobs:
           if tuple(int(x) for x in found[-1].split(".")) < need:
               sys.exit(f"libtk is {found[-1]} ({libtk}), need >= 8.6.16 - "
                        "the tkError.c fix [f52986] would be missing")
-          print("OK: Tcl/Tk >= 8.6.16 is what this build will bundle")
+
+          # Version alone is not enough, and shipping on that assumption is
+          # what broke every font and glyph icon in v1.65.13/v1.65.14. A Tk
+          # built without the Xft headers still reports 8.6.16; it just
+          # cannot see a single system font. Require the real font stack.
+          libs = subprocess.run(["ldd", libtk],
+                                capture_output=True, text=True).stdout
+          print("libtk links:\n" + libs)
+          missing = [n for n in ("libXft", "libfontconfig", "libfreetype")
+                     if n not in libs]
+          if missing:
+              sys.exit(
+                  f"libtk ({libtk}) is not linked against {', '.join(missing)} "
+                  "- it was built without the Xft headers, so it would fall "
+                  "back to core X11 bitmap fonts: ~20 font families, "
+                  "TkDefaultFont 'gothic', and every glyph icon in the UI "
+                  "drawn as a missing-glyph box. Install libxft-dev, "
+                  "libfontconfig1-dev and libfreetype6-dev before configuring.")
+
+          print("OK: Tcl/Tk >= 8.6.16 with Xft/fontconfig/FreeType is what "
+                "this build will bundle")
           EOF
 
       # Convert the source PNG icon into platform-native formats so
