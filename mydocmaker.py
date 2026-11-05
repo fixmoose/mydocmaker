@@ -148,7 +148,7 @@ def _dbg(stage):
 
 
 APP_NAME = "MyDocMaker"
-APP_VERSION = "1.65.13"
+APP_VERSION = "1.65.14"
 
 # Notebook tab labels. Kept as constants so the "which tab is open?" checks
 # can never drift from the text shown on the tab itself.
@@ -2730,6 +2730,17 @@ def _print_with_default_printer(path, error_queue=None):
 # ---------------------------------------------------------------------------
 IPC_HOST = "127.0.0.1"
 IPC_TIMEOUT = 0.4
+# How long to wait for the running instance to prove its UI thread is alive.
+# Generous on purpose: a busy-but-healthy instance (first Order-tab build, a
+# big render) can hold that thread for a couple of seconds, and timing out on
+# one of those would open a duplicate window instead of handing off.
+IPC_ACK_TIMEOUT = 6.0
+IPC_ACK_WAIT = 5.0
+# Proves the far end is actually us and not whatever else grabbed the port.
+IPC_MAGIC = "mydocmaker-ipc-1"
+# A UI thread that has not come round in this long is treated as stuck. The
+# poller ticks every 120ms, so this is comfortably clear of normal jitter.
+IPC_UI_STALE_AFTER = 1.5
 
 
 def _ipc_port():
@@ -2745,19 +2756,65 @@ IPC_PORT = _ipc_port()
 
 
 def send_paths_to_existing(paths):
-    """Try to deliver paths to a running instance. True on success."""
+    """Try to deliver paths to a running instance. True only once that
+    instance has confirmed it actually took them.
+
+    A bare connect+send used to count as success, which turned this into a
+    black hole two different ways. IPC_PORT sits in the ephemeral range
+    (49152+), so any unrelated process can be holding it; and an instance
+    whose UI thread has wedged still accepts on its IPC thread while never
+    draining the queue. In both cases the files were handed to nothing, we
+    exited silently, and no window ever appeared -- which is exactly what
+    "Add to MyDocMaker" looked like from the file manager.
+
+    So the receiver now has to answer, and the answer has to come from the
+    far side of the work queue (see the ipc_paths handler). No answer means
+    no live instance, and the caller falls through to opening its own
+    window."""
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.settimeout(IPC_TIMEOUT)
             s.connect((IPC_HOST, IPC_PORT))
             s.sendall((json.dumps({"paths": paths}) + "\n").encode())
-        return True
-    except OSError:
+            s.settimeout(IPC_ACK_TIMEOUT)
+            buf = bytearray()
+            while b"\n" not in buf and len(buf) < 4096:
+                chunk = s.recv(256)
+                if not chunk:
+                    break
+                buf.extend(chunk)
+        reply = json.loads(buf.decode("utf-8", "replace").strip() or "{}")
+        return reply.get("ok") is True and reply.get("app") == IPC_MAGIC
+    except (OSError, ValueError):
         return False
 
 
-def start_ipc_server(on_paths):
+def _ui_is_alive(is_alive):
+    """Poll `is_alive` until it says yes, or IPC_ACK_WAIT runs out.
+
+    Polling rather than asking once, because a perfectly healthy instance
+    can be mid-render or sitting in a modal dialog's nested event loop when
+    the hand-off arrives. Only a thread that never comes back is dead."""
+    if is_alive is None:
+        return True
+    deadline = time.monotonic() + IPC_ACK_WAIT
+    while True:
+        try:
+            if is_alive():
+                return True
+        except Exception:
+            return False
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
+def start_ipc_server(on_paths, is_alive=None):
     """Bind the IPC port and forward incoming path lists to `on_paths`.
+
+    `is_alive`, if given, must report whether the UI thread is still
+    running; we only answer a sender once it does, because that answer is
+    what tells them they reached a real, live MyDocMaker.
     Returns the server socket on success, or None if the port was unavailable
     (in which case single-instance behavior degrades gracefully)."""
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -2790,6 +2847,18 @@ def start_ipc_server(on_paths):
                 paths = [p for p in msg.get("paths", []) if isinstance(p, str)]
                 if paths:
                     on_paths(paths)
+                    # Answer only once the UI thread has shown a sign of
+                    # life. Answering unconditionally from here would
+                    # re-create the black hole: this thread keeps accepting
+                    # perfectly well long after the window behind it has
+                    # stopped responding. Note the queue already has the
+                    # paths by now, so a slow instance still gets them --
+                    # we are deciding what to tell the sender, not whether
+                    # to deliver.
+                    if _ui_is_alive(is_alive):
+                        conn.sendall(
+                            (json.dumps({"ok": True, "app": IPC_MAGIC})
+                             + "\n").encode())
             except OSError:
                 pass
             finally:
@@ -12429,13 +12498,18 @@ class App:
         self._refresh_archive_button()
 
         # Poll the worker queue so background threads can update the UI safely.
+        # The poller also stamps a heartbeat, which is how the IPC thread
+        # tells a live instance from one whose UI has stopped turning over.
+        self._ui_heartbeat = time.monotonic()
         self.root.after(120, self._poll_queue)
 
         # Receive file paths from a second invocation (right-click "Open With"
         # while this window is already running). The IPC thread can't touch
         # Tk directly, so it posts to the same queue the build worker uses.
         self._ipc_socket = start_ipc_server(
-            lambda paths: self.work_queue.put(("ipc_paths", paths))
+            lambda paths: self.work_queue.put(("ipc_paths", paths)),
+            is_alive=lambda: (
+                time.monotonic() - self._ui_heartbeat) < IPC_UI_STALE_AFTER,
         )
 
         # Background render worker — turns Items into PDF bytes off the UI
@@ -15541,6 +15615,46 @@ class App:
         except (tk.TclError, AttributeError):
             pass
 
+    def _present_window(self):
+        """Bring this window to the front, for real.
+
+        `deiconify()` does not restore a minimized window under Mutter
+        (GNOME / Pop!_OS). Measured against WM_STATE on Pop!_OS 22.04:
+        deiconify() alone, deiconify() + lift() + focus_force(), the same
+        plus an -topmost toggle, and wm_state("normal") ALL leave the window
+        Iconic. The window manager answers the request by setting
+        _NET_WM_STATE_DEMANDS_ATTENTION instead — a flashing taskbar entry
+        and nothing more. That is exactly how right-clicking
+        "Add to MyDocMaker" could look like it did nothing: the files went
+        to a minimized instance that was never allowed to come back.
+
+        Withdrawing and mapping again does restore it. It is plain Tk, needs
+        no wmctrl/xdotool, and was measured to keep both the window position
+        and the maximized state, and to leave the position untouched on a
+        window that was not minimized.
+
+        Note the deliberate use of update_idletasks() and not update():
+        this runs from the queue poller, inside the event loop, and a full
+        update() there re-enters it — the re-entrancy that used to segfault
+        Tk while widgets were being built.
+        """
+        try:
+            self.root.withdraw()
+            self.root.update_idletasks()
+            self.root.deiconify()
+            self.root.attributes("-topmost", True)
+            self.root.lift()
+            self.root.focus_force()
+            self.root.after(300, self._drop_topmost)
+        except tk.TclError:
+            pass
+
+    def _drop_topmost(self):
+        try:
+            self.root.attributes("-topmost", False)
+        except tk.TclError:
+            pass
+
     def _poll_queue(self):
         # While a modal dialog is open we are inside a NESTED event loop
         # (wait_window). Handling queue messages there re-enters the UI:
@@ -15552,6 +15666,10 @@ class App:
         # were still finishing their render. Messages simply wait; nothing is
         # dropped, and they are picked up on the next tick after the dialog
         # closes.
+        # Stamp first, and before the modal early-return: being inside a
+        # dialog's nested event loop means busy, not dead, and a hand-off
+        # arriving then must still be told it reached a live instance.
+        self._ui_heartbeat = time.monotonic()
         if self._modal_depth > 0:
             self.root.after(120, self._poll_queue)
             return
@@ -15706,9 +15824,7 @@ class App:
                 elif msg[0] == "ipc_paths":
                     self.add_paths(msg[1])
                     # Bring the window forward so the user sees the new items.
-                    self.root.deiconify()
-                    self.root.lift()
-                    self.root.focus_force()
+                    self._present_window()
                 elif msg[0] == "ready_for_signing":
                     self._open_sign_dialog(
                         msg[1], msg[2] if len(msg) > 2 else "")

@@ -1,5 +1,59 @@
 # Changelog
 
+## v1.65.14
+- **Fixed: right-click "Add to MyDocMaker" could do nothing at all.** The
+  file manager entry shells out to `mydocmaker <paths>`, and a second
+  invocation hands its files to the instance already running, then exits.
+  Two separate faults in that path.
+  - **The window never came forward.** `deiconify()` does not restore a
+    minimized window under Mutter (GNOME / Pop!_OS). Measured against
+    `WM_STATE` on Pop!_OS 22.04: `deiconify()` alone, `deiconify()` +
+    `lift()` + `focus_force()`, the same plus an `-topmost` toggle, and
+    `wm_state("normal")` **all** leave the window `Iconic`. The window
+    manager answers by setting `_NET_WM_STATE_DEMANDS_ATTENTION` instead —
+    a flashing taskbar entry and nothing more. The files were added
+    correctly and invisibly. This is what the reported fault actually was:
+    an instance left running from an earlier version held the port,
+    minimized, on another monitor, so every right-click fed files into a
+    window that was never allowed to reappear. Raising now withdraws the
+    window and maps it again, which does restore it — plain Tk, no
+    dependency on `wmctrl`/`xdotool`, and measured to preserve both the
+    window position and the maximized state, and to leave the position
+    untouched on a window that was not minimized. It flushes with
+    `update_idletasks()` rather than `update()`, because this runs from
+    inside the event loop and a full `update()` there is the re-entrancy
+    that used to segfault Tk mid-widget-build. Applies to every hand-off,
+    including the scanner's.
+    - Also worth recording because it cost a wrong fix first: Tk's own
+      `root.state()` keeps answering `"normal"` for a window Mutter has
+      genuinely iconified. A check written against `state()` passes on a
+      window that was never minimized, which is why the regression check
+      reads `WM_STATE` from X instead.
+  - **The hand-off trusted a bare TCP connect** — latent, but the same
+    symptom when it fires. `send_paths_to_existing()` reported success as
+    soon as `connect()` + `sendall()` returned, which proves nothing about
+    who is listening. The port is derived from the username into the range
+    49152+, which is the *ephemeral* range, so an unrelated process can
+    legitimately hold it; and an instance whose UI thread has stopped
+    turning over still accepts connections on its separate IPC thread. In
+    both cases the paths went nowhere, the new process exited silently, and
+    there was no window and no error. The receiver must now answer with a
+    known marker, and it only answers once its UI thread has shown a sign
+    of life.
+  - That liveness check is a heartbeat stamped by the queue poller, not a
+    per-message acknowledgement, and the stamp happens *before* the poller's
+    modal-dialog early-return. Busy is not dead: an instance mid-render or
+    sitting in a dialog's nested event loop must still win the hand-off, or
+    every slow moment would open a duplicate window. The probe polls for up
+    to 5s before giving up, and the paths are queued either way — the
+    heartbeat decides only what the sender is told.
+  - 18 regression checks added (`ipc` group): refusal when nothing is
+    listening, when a foreign process answers on the port, and when the UI
+    thread never comes round; acceptance for a live instance and for a
+    busy-but-alive one; that a stuck instance is still handed the paths;
+    and — read from X, not from Tk — that a really-minimized window is
+    really restored, raised, and not left pinned on top.
+
 ## v1.65.13
 - **The crash on Create PDF after scanning was a bug in Tcl/Tk, not in this
   app.** Three feeder pages then Create PDF killed the process with a

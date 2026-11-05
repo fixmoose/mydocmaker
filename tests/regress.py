@@ -879,10 +879,216 @@ def g_prefs():
             os.environ["XDG_CONFIG_HOME"] = real_home
 
 
+def g_ipc():
+    """The single-instance hand-off must only claim success when a live
+    instance really took the files.
+
+    The file manager's "Add to MyDocMaker" shells out to `mydocmaker <paths>`
+    and relies on this: a second invocation hands its paths to the first and
+    exits. It used to count a bare TCP connect as delivery, so two situations
+    ate the files and opened nothing at all —
+      * an instance whose UI thread had stopped turning over (its IPC thread
+        keeps accepting long after the window stops draining the queue), and
+      * any unrelated process holding the port, which sits in the ephemeral
+        range 49152+ and so is genuinely up for grabs.
+    Both are tested here with a port of their own; the user's own running
+    instance is never contacted.
+
+    The other half matters just as much: a *busy* instance — mid-render, or
+    sitting in a modal dialog's nested event loop — must still win the
+    hand-off, or every slow moment would open a duplicate window.
+    """
+    import socket as _socket
+    import threading as _threading
+
+    base = 53771
+    real_port, real_ack, real_wait = (M.IPC_PORT, M.IPC_ACK_TIMEOUT,
+                                      M.IPC_ACK_WAIT)
+    M.IPC_ACK_TIMEOUT, M.IPC_ACK_WAIT = 2.5, 2.0
+    sockets = []
+    try:
+        # 1. nobody home -> refuse, so the caller opens its own window.
+        M.IPC_PORT = base
+        check("ipc", "no listener -> hand-off refused",
+              M.send_paths_to_existing(["/etc/hostname"]) is False)
+
+        # 2. a stranger on our port that answers with the right shape but
+        #    not our marker. Must not be mistaken for an instance.
+        M.IPC_PORT = base + 1
+        other = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM)
+        other.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+        other.bind((M.IPC_HOST, M.IPC_PORT))
+        other.listen(5)
+        sockets.append(other)
+
+        def _accept_and_babble():
+            while True:
+                try:
+                    c, _ = other.accept()
+                except OSError:
+                    return
+                try:
+                    c.recv(4096)
+                    c.sendall(b'{"ok": true}\n')
+                    c.close()
+                except OSError:
+                    pass
+
+        _threading.Thread(target=_accept_and_babble, daemon=True).start()
+        check("ipc", "foreign listener on our port -> hand-off refused",
+              M.send_paths_to_existing(["/etc/hostname"]) is False)
+
+        # 3. the bug: a real instance whose UI thread never comes round.
+        #    It still receives the paths — we are deciding what to tell the
+        #    sender, not whether to deliver — but must not be acknowledged.
+        M.IPC_PORT = base + 2
+        got_dead = []
+        srv_dead = M.start_ipc_server(got_dead.append, is_alive=lambda: False)
+        sockets.append(srv_dead)
+        t0 = time.time()
+        refused = M.send_paths_to_existing(["/etc/hostname"]) is False
+        elapsed = time.time() - t0
+        check("ipc", "stuck UI thread -> hand-off refused", refused)
+        check("ipc", "stuck instance was really contacted",
+              got_dead == [["/etc/hostname"]], repr(got_dead))
+        check("ipc", "refusal is prompt, under 4s", elapsed < 4.0,
+              f"{elapsed:.1f}s")
+
+        # 4. a live instance.
+        M.IPC_PORT = base + 3
+        got = []
+        srv = M.start_ipc_server(got.append, is_alive=lambda: True)
+        sockets.append(srv)
+        check("ipc", "server binds", srv is not None)
+        check("ipc", "live instance -> hand-off accepted",
+              M.send_paths_to_existing(["/etc/hostname"]) is True)
+        check("ipc", "live instance received the paths",
+              got == [["/etc/hostname"]], repr(got))
+
+        # 5. busy but alive still wins it. This is the modal-dialog and
+        #    mid-render case: _poll_queue stamps its heartbeat before the
+        #    modal early-return precisely so this keeps working.
+        M.IPC_PORT = base + 4
+        woke = {"at": time.monotonic() + 0.8}
+        srv2 = M.start_ipc_server(
+            lambda paths: None,
+            is_alive=lambda: time.monotonic() >= woke["at"])
+        sockets.append(srv2)
+        check("ipc", "busy-but-alive instance -> hand-off accepted",
+              M.send_paths_to_existing(["/etc/hostname"]) is True)
+
+        # 6. the shape of the fix, so it cannot quietly regress.
+        src = io.open(os.path.join(APP_DIR, "mydocmaker.py"),
+                      encoding="utf-8").read()
+        check("ipc", "sender verifies the marker, not just the connect",
+              'reply.get("app") == IPC_MAGIC' in src)
+        check("ipc", "server answers only via the liveness probe",
+              "if _ui_is_alive(is_alive):" in src)
+        check("ipc", "heartbeat is stamped before the modal early-return",
+              re.search(r"self\._ui_heartbeat = time\.monotonic\(\)\s*\n"
+                        r"\s*if self\._modal_depth > 0:", src) is not None)
+        check("ipc", "hand-off raises via _present_window",
+              "self._present_window()" in src)
+
+        # 7. and the raise has to survive focus-stealing prevention: a window
+        #    the user minimized must actually come back, not just flash in
+        #    the taskbar. Borrow the real method onto a bare root so this
+        #    costs one small window instead of a full App boot.
+        class _Shim:
+            _present_window = M.App._present_window
+            _drop_topmost = M.App._drop_topmost
+
+            def __init__(self, root):
+                self.root = root
+
+        # The oracle here has to be X, not Tk. Under Mutter, tk's own
+        # root.state() keeps answering "normal" for a window the window
+        # manager has genuinely iconified — so asking Tk would make this
+        # check pass on a window that was never minimized. WM_STATE is what
+        # the real diagnosis was made from, so read that.
+        import shutil as _shutil
+        import subprocess as _subprocess
+
+        have_x_tools = bool(_shutil.which("xdotool")
+                            and _shutil.which("xprop"))
+
+        def _wm_window(title):
+            out = _subprocess.run(["xdotool", "search", "--name", title],
+                                  capture_output=True, text=True).stdout.split()
+            return out[-1] if out else None
+
+        def _is_iconic(win):
+            if not win:
+                return False
+            out = _subprocess.run(["xprop", "-id", win, "WM_STATE"],
+                                  capture_output=True, text=True).stdout
+            return "Iconic" in out
+
+        def _pump_until(root, pred, timeout=4.0):
+            t = time.time()
+            while not pred() and time.time() - t < timeout:
+                root.update()
+                time.sleep(0.03)
+            return pred()
+
+        title = "MyDocMaker raise test 7f3a"
+        root = tk.Tk()
+        try:
+            root.title(title)
+            root.geometry("300x140+60+60")
+            root.update()
+            _pump_until(root, lambda: _wm_window(title) is not None)
+            win = _wm_window(title)
+            check("ipc", "test window is managed by the window manager",
+                  win is not None)
+
+            if not have_x_tools or win is None:
+                # Never silently claim coverage we did not get.
+                check("ipc", "SKIPPED: no xdotool/xprop, raise untested",
+                      False, "install xdotool and xprop to cover this")
+            else:
+                root.iconify()
+                check("ipc", "window really is minimized at the X level",
+                      _pump_until(root, lambda: _is_iconic(win)),
+                      "WM_STATE never went Iconic")
+
+                _Shim(root)._present_window()
+                # Read -topmost before the 300ms drop can fire: pump only a
+                # few milliseconds here, or this check tests nothing.
+                for _ in range(3):
+                    root.update()
+                    time.sleep(0.01)
+                check("ipc", "it is raised above others for the moment",
+                      bool(root.attributes("-topmost")))
+
+                # The point of the whole fix: deiconify + lift + focus_force
+                # alone leaves this Iconic and only sets DEMANDS_ATTENTION.
+                check("ipc", "_present_window really un-minimizes it",
+                      _pump_until(root, lambda: not _is_iconic(win)),
+                      "still Iconic")
+                check("ipc", "-topmost is dropped again",
+                      _pump_until(root,
+                                  lambda: not root.attributes("-topmost"),
+                                  timeout=2.0))
+        finally:
+            try:
+                root.destroy()
+            except tk.TclError:
+                pass
+    finally:
+        M.IPC_PORT, M.IPC_ACK_TIMEOUT, M.IPC_ACK_WAIT = (
+            real_port, real_ack, real_wait)
+        for s_ in sockets:
+            try:
+                s_.close()
+            except OSError:
+                pass
+
+
 GROUPS = {"startup": g_startup, "prefs": g_prefs, "notes": g_notes, "shapes": g_shapes,
           "crop": g_crop, "project": g_project, "print": g_print,
           "guards": g_guards, "ghost": g_ghost, "scan": g_scan,
-          "reentry": g_reentry, "tabs": g_tabs}
+          "reentry": g_reentry, "ipc": g_ipc, "tabs": g_tabs}
 
 if __name__ == "__main__":
     want = sys.argv[1:] or list(GROUPS)
